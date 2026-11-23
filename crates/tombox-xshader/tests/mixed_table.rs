@@ -91,3 +91,36 @@ fn store_to_srv_range_is_an_error() {
     let r = translate(&shader(&words, uav_then_srv()));
     assert!(matches!(&r, Err(e) if e.contains("SRV range")), "{:?}", r.map(|t| t.hlsl));
 }
+
+#[test]
+fn implicit_sampler_heap_uses_the_root_constant_index() {
+    let mut root = uav_then_srv();
+    let RootParamKind::Table(ranges) = &mut root.params[0].kind else { unreachable!() };
+    ranges.remove(0);
+    root.params.push(RootParam {
+        visibility: 0,
+        kind: RootParamKind::Constants { register: 10, space: 0, num32: 2 },
+    });
+    root.flags = 0x800;
+    let words = [
+        0xbe82_0309, // s_mov_b32 s2, s9       root sampler index
+        0xbe89_0380, // s_mov_b32 s9, 0
+        0xbe98_030b, // s_mov_b32 s24, s11     implicit heap pointer
+        0xbe99_0380, // s_mov_b32 s25, 0
+        0xf40c_0104, 0xfa00_0000, // s_load_dwordx8 s4, s[8:9], 0
+        0x8f00_8402, // s_lshl_b32 s0, s2, 4
+        0xf408_000c, 0x0000_0000, // s_load_dwordx4 s0, s[24:25], s0
+        0xbf8c_c07f,
+        0x7e02_02f0, 0x7e04_02f0, // v_mov_b32 v1/v2, 0.5
+        0xf080_0f08, 0x0001_0401, // image_sample v4, v1, s4, s0
+        0xf800_180f, 0x0706_0504, 0xbf81_0000,
+    ];
+    let t = translate(&shader(&words, root.clone())).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert!(t.hlsl.contains("s9 = tb_rc1_0;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("SamplerDescriptorHeap[NonUniformResourceIndex(tb_bi0 / 16u)]"), "{}", t.hlsl);
+    assert_eq!(t.profile, "ps_6_6");
+    compile("direct sampler heap", &t.hlsl, t.profile);
+
+    root.flags = 0;
+    assert!(matches!(translate(&shader(&words, root)), Err(e) if e.contains("s11 is not a root parameter")));
+}
