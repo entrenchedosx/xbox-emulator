@@ -16,7 +16,7 @@ pub(crate) const MEM_RESERVE_PLACEHOLDER: u32 = 0x4_0000;
 pub(crate) const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
 pub(crate) const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
 const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
-const SEC_COMMIT: u32 = 0x800_0000;
+const SEC_RESERVE: u32 = 0x400_0000;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const MEM_DECOMMIT: u32 = 0x4000;
 const ERROR_INVALID_ADDRESS: u32 = 487;
@@ -264,7 +264,9 @@ pub fn allocate(n: usize) -> Option<Vec<u64>> {
         return Some(Vec::new());
     }
     let bytes = (n as u64).checked_mul(PAGE as u64)?;
-    let h = unsafe { CreateFileMappingW(usize::MAX, core::ptr::null(), PAGE_EXECUTE_READWRITE | SEC_COMMIT, (bytes >> 32) as u32, bytes as u32, core::ptr::null()) };
+    // PFNs name offsets in one shared section. Reserve the backing here and
+    // commit it when a view first makes those offsets accessible to the title.
+    let h = unsafe { CreateFileMappingW(usize::MAX, core::ptr::null(), PAGE_EXECUTE_READWRITE | SEC_RESERVE, (bytes >> 32) as u32, bytes as u32, core::ptr::null()) };
     if h == 0 {
         return None;
     }
@@ -416,6 +418,21 @@ unsafe fn unmap_view(s: &mut State, va: usize) -> bool {
     true
 }
 
+unsafe fn map_committed_view(section: usize, va: usize, offset: u64, size: usize, protect: u32) -> bool {
+    let process = GetCurrentProcess();
+    let view = MapViewOfFile3(section, process, va as *mut c_void, offset, size, MEM_REPLACE_PLACEHOLDER, protect, core::ptr::null_mut(), 0);
+    if view.is_null() {
+        return false;
+    }
+    if !VirtualAlloc(view, size, MEM_COMMIT, protect).is_null() {
+        return true;
+    }
+    let error = GetLastError();
+    UnmapViewOfFile2(process, view, MEM_PRESERVE_PLACEHOLDER);
+    SetLastError(error);
+    false
+}
+
 unsafe fn map_page(s: &mut State, va: usize, pfn: Option<u64>) -> bool {
     if try_map_page(s, va, pfn) {
         return true;
@@ -468,8 +485,7 @@ unsafe fn try_map_page(s: &mut State, va: usize, pfn: Option<u64>) -> bool {
         return false;
     }
     let h = s.sections[&sid].handle;
-    let p = MapViewOfFile3(h, GetCurrentProcess(), va as *mut c_void, off, PAGE, MEM_REPLACE_PLACEHOLDER, protect, core::ptr::null_mut(), 0);
-    if p as usize != va {
+    if !map_committed_view(h, va, off, PAGE, protect) {
         return false;
     }
     s.views.insert(va, pfn);
@@ -698,6 +714,41 @@ mod freeze_tests {
     extern "system" {
         fn HeapLock(heap: *mut c_void) -> i32;
         fn HeapUnlock(heap: *mut c_void) -> i32;
+    }
+
+    #[test]
+    fn a_large_physical_pool_commits_only_mapped_offsets_and_preserves_aliases() {
+        let _guard = map_test_guard();
+        let count = 99_776;
+        let mut n = count;
+        let mut pfns = vec![0; count];
+        assert_eq!(unsafe { crate::virt::XMemAllocatePhysicalPages(0x380, &mut n, pfns.as_mut_ptr()) }, 1);
+        assert_eq!(n, count);
+        let last = pfns.last_mut().unwrap();
+        let (handle, offset) = with(|s| {
+            let (sid, offset) = s.pfns[last];
+            (s.sections[&sid].handle, offset)
+        });
+        unsafe {
+            let process = GetCurrentProcess();
+            let probe = MapViewOfFile3(handle, process, core::ptr::null_mut(), offset, PAGE, 0, PAGE_READWRITE, core::ptr::null_mut(), 0);
+            assert!(!probe.is_null());
+            let state = query(probe as usize).unwrap().state;
+            assert_ne!(UnmapViewOfFile2(process, probe, 0), 0);
+            assert_eq!(state, MEM_RESERVE);
+
+            let a = reserve_placeholder(0, PAGE);
+            let b = reserve_placeholder(0, PAGE);
+            assert!(!a.is_null() && !b.is_null());
+            assert_eq!(crate::virt::XMemMapPhysicalPages(a, 1, last), a);
+            assert_eq!(query(a as usize).unwrap().state, MEM_COMMIT);
+            a.cast::<u32>().write(0xabcd_ef01);
+            assert_eq!(crate::virt::XMemMapPhysicalPages(b, 1, last), b);
+            assert_eq!(b.cast::<u32>().read(), 0xabcd_ef01);
+            assert_eq!(release_region(a as usize, 0), Some(1));
+            assert_eq!(release_region(b as usize, 0), Some(1));
+            assert_eq!(crate::virt::XMemFreePhysicalPages(count, pfns.as_mut_ptr()), 1);
+        }
     }
 
     /// Nothing may allocate or free while the world is frozen: a suspended thread may own the lock of the

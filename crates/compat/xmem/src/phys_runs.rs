@@ -134,12 +134,10 @@ pub(super) unsafe fn try_map_run(s: &mut State, run: &[(usize, Option<u64>)]) ->
         return false;
     }
     let h = s.sections[&sid].handle;
-    let p = MapViewOfFile3(h, GetCurrentProcess(), lo as *mut c_void, off, hi - lo, MEM_REPLACE_PLACEHOLDER, protect, core::ptr::null_mut(), 0);
-    if p as usize != lo {
-        if !p.is_null() {
-            UnmapViewOfFile2(GetCurrentProcess(), p, MEM_PRESERVE_PLACEHOLDER);
-        }
+    if !map_committed_view(h, lo, off, hi - lo, protect) {
+        let error = GetLastError();
         split(lo, hi - lo);
+        SetLastError(error);
         return false;
     }
     for &(va, pfn) in run {
