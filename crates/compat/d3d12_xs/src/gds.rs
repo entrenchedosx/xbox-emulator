@@ -83,6 +83,13 @@ pub fn append_plan(params: &[u8], flags: u32) -> Option<(Vec<u8>, u32)> {
 }
 
 pub unsafe fn patch_root_signature(blob: *const u8, len: usize) -> Option<(Vec<u8>, u32)> {
+    unsafe { patch_with(blob, len, 1, "gds", &append_plan) }
+}
+
+/// Append root parameters to a serialized root signature. `plan(params, flags)` returns
+/// the new parameter bytes (`added` parameters on top of `params`) and the index of the
+/// first appended one, or None when there is no room.
+pub unsafe fn patch_with(blob: *const u8, len: usize, added: u32, tag: &str, plan: &dyn Fn(&[u8], u32) -> Option<(Vec<u8>, u32)>) -> Option<(Vec<u8>, u32)> {
     if blob.is_null() || len == 0 {
         return None;
     }
@@ -104,10 +111,10 @@ pub unsafe fn patch_root_signature(blob: *const u8, len: usize) -> Option<(Vec<u
         let n = u32_at(&vd, 8) as usize;
         let pp = u64::from_le_bytes(vd[16..24].try_into().unwrap()) as *const u8;
         let params = if n == 0 || pp.is_null() { Vec::new() } else { unsafe { core::slice::from_raw_parts(pp, n * PARAM_SIZE) }.to_vec() };
-        match append_plan(&params, u32_at(&vd, 40)) {
+        match plan(&params, u32_at(&vd, 40)) {
             Some((np, idx)) => {
                 let mut nd = vd.clone();
-                nd[8..12].copy_from_slice(&((n + 1) as u32).to_le_bytes());
+                nd[8..12].copy_from_slice(&((n + added as usize) as u32).to_le_bytes());
                 nd[16..24].copy_from_slice(&(np.as_ptr() as u64).to_le_bytes());
                 let ser: unsafe extern "system" fn(*const u8, *mut *mut c_void, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(ser) };
                 let (mut b, mut e): (*mut c_void, *mut c_void) = (core::ptr::null_mut(), core::ptr::null_mut());
@@ -117,7 +124,7 @@ pub unsafe fn patch_root_signature(blob: *const u8, len: usize) -> Option<(Vec<u
                     let size: unsafe extern "system" fn(*mut c_void) -> usize = unsafe { core::mem::transmute(vslot(b, 4)) };
                     out = Some((unsafe { core::slice::from_raw_parts(ptr(b), size(b)) }.to_vec(), idx));
                 } else if once(8) {
-                    record("d3d12_xs", "gds", &format!("re-serializing a root signature with the GDS parameter FAILED hr={hr:#010x}"));
+                    record("d3d12_xs", tag, &format!("re-serializing a root signature with the {tag} parameters FAILED hr={hr:#010x}"));
                 }
                 for o in [b, e] {
                     if !o.is_null() {
@@ -128,7 +135,7 @@ pub unsafe fn patch_root_signature(blob: *const u8, len: usize) -> Option<(Vec<u
             }
             None => {
                 if once(8) {
-                    record("d3d12_xs", "gds", &format!("root signature uses {} DWORDs (or is local); no room for the 2-DWORD GDS root UAV", root_cost(&params)));
+                    record("d3d12_xs", tag, &format!("root signature uses {} DWORDs (or is local); no room for the {tag} root parameters", root_cost(&params)));
                 }
             }
         }

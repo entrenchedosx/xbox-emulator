@@ -69,16 +69,45 @@ fn find_in(levels: &[BTreeMap<u64, Entry>], a: u64) -> Option<(Entry, u64)> {
         .map(|e| crate::placed_offset::true_entry(e, a))
 }
 
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Bumped on every insertion; lets a consumer that derives something from the
+/// registry (see `global_bind`) tell cheaply whether it changed.
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
+}
+
 pub fn insert(e: Entry) {
     if e.len != 0 {
+        GENERATION.fetch_add(1, Ordering::Relaxed);
         with(|t| insert_into(&mut t.ranges, e));
     }
 }
 
 pub fn insert_cpu(e: Entry) {
     if e.len != 0 {
+        GENERATION.fetch_add(1, Ordering::Relaxed);
         with(|t| insert_into(&mut t.cpu, e));
     }
+}
+
+/// Every registered buffer range, one entry per resource (its largest range), largest
+/// first. Texture ranges and synthetic texture addresses are excluded.
+pub fn buffers_by_size() -> Vec<Entry> {
+    with(|t| {
+        let mut by_res: HashMap<usize, Entry> = HashMap::new();
+        for m in &t.ranges {
+            for e in m.values().filter(|e| e.buffer && e.len != 0 && e.start < SYNTHETIC_TEXTURE_BASE) {
+                let slot = by_res.entry(e.res).or_insert(*e);
+                if e.len > slot.len {
+                    *slot = *e;
+                }
+            }
+        }
+        let mut v: Vec<Entry> = by_res.into_values().collect();
+        v.sort_by(|a, b| b.len.cmp(&a.len).then(a.start.cmp(&b.start)));
+        v
+    })
 }
 
 pub fn lookup(va: u64) -> Option<(Entry, u64)> {

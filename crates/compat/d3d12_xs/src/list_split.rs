@@ -333,6 +333,7 @@ unsafe extern "system" fn h_reset(this: *mut c_void, alloc: *mut c_void, pso: *m
             if s == this as usize && crate::cl2_state::is_open(this) {
                 let close: unsafe extern "system" fn(*mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(this, SLOT_CLOSE)) };
                 unsafe { crate::gds::on_close(this) };
+                unsafe { crate::global_bind::on_close(this) };
                 unsafe { close(this) };
                 crate::cl2_state::mark_closed(this);
             }

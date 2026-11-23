@@ -1348,26 +1348,30 @@ unsafe extern "system" fn real_create_root_signature(real: *mut c_void, mask: u3
     let sent = core::cell::RefCell::new(Vec::<u8>::new());
     let mut gds = unsafe { crate::gds::patch_root_signature(blob, len) };
     let (gb, gl) = gds.as_ref().map_or((blob, len), |(b, _)| (b.as_ptr(), b.len()));
+    // The global-memory parameters go on top of whatever GDS added.
+    let mut glob = unsafe { crate::global_bind::patch_root_signature(gb, gl) };
+    let (gb, gl) = glob.as_ref().map_or((gb, gl), |(b, _)| (b.as_ptr(), b.len()));
     let cen = unsafe {
         crate::centroid_bind::create(gb, gl, &|b, l| {
             *sent.borrow_mut() = copy(b, l);
             f(real, mask, b, l, riid, ppv)
         }, ppv)
     };
-    let mut hr = match (&cen, &gds) {
-        (Some(hr), _) => *hr,
-        (None, Some((b, _))) => {
+    let mut hr = match (&cen, &glob, &gds) {
+        (Some(hr), _, _) => *hr,
+        (None, Some((b, _)), _) | (None, None, Some((b, _))) => {
             *sent.borrow_mut() = b.clone();
             unsafe { f(real, mask, b.as_ptr(), b.len(), riid, ppv) }
         }
-        (None, None) => {
+        (None, None, None) => {
             *sent.borrow_mut() = copy(blob, len);
             unsafe { f(real, mask, blob, len, riid, ppv) }
         }
     };
-    if hr < 0 && gds.is_some() {
-        record("d3d12_xs", "gds", &format!("root signature with the GDS parameter rejected hr={hr:#010x}; created without GDS"));
+    if hr < 0 && (gds.is_some() || glob.is_some()) {
+        record("d3d12_xs", "gds", &format!("root signature with the GDS/global-memory parameters rejected hr={hr:#010x}; created without them"));
         gds = None;
+        glob = None;
         *sent.borrow_mut() = copy(blob, len);
         hr = unsafe { f(real, mask, blob, len, riid, ppv) };
     }
@@ -1379,6 +1383,10 @@ unsafe extern "system" fn real_create_root_signature(real: *mut c_void, mask: u3
     }
     if hr >= 0 && !ppv.is_null() {
         if let Some((_, idx)) = gds { crate::gds::note_root_signature(unsafe { *ppv }, idx) }
+        match glob {
+            Some((_, idx)) => crate::global_bind::note_root_signature(unsafe { *ppv }, idx),
+            None => crate::global_bind::forget(unsafe { *ppv }),
+        }
         if cen.is_none() { crate::centroid_bind::forget(unsafe { *ppv }) }
     }
     if hr >= 0 && !ppv.is_null() && !blob.is_null() && len != 0 {
@@ -1386,6 +1394,37 @@ unsafe extern "system" fn real_create_root_signature(real: *mut c_void, mask: u3
     }
     hr
 }
+/// `CreateRootSignature` on the wrapper vtable (slot 16): what the title and the console
+/// libraries it hosts (the BVH builder) actually call. Appends the global-memory ABI
+/// parameters (see `global_bind`) so translated shaders that address memory by 64-bit
+/// GPU VA can be bound. When the real device's table is already patched (capture modes)
+/// that hook applies every ABI patch itself, so this defers to it.
+unsafe extern "system" fn create_root_signature_abi(this: *mut DeviceWrapper, mask: u32, blob: *const u8, len: usize, riid: *const Guid, ppv: *mut *mut c_void) -> i32 {
+    let real = unsafe { (*this).real };
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(16)) };
+    if real_orig(16) != 0 {
+        return unsafe { f(real, mask, blob, len, riid, ppv) };
+    }
+    let mut glob = unsafe { crate::global_bind::patch_root_signature(blob, len) };
+    let mut hr = match &glob {
+        Some((b, _)) => unsafe { f(real, mask, b.as_ptr(), b.len(), riid, ppv) },
+        None => unsafe { f(real, mask, blob, len, riid, ppv) },
+    };
+    if hr < 0 && glob.is_some() {
+        record("d3d12_xs", "global", &format!("root signature with the global-memory parameters rejected hr={hr:#010x}; created without them"));
+        glob = None;
+        hr = unsafe { f(real, mask, blob, len, riid, ppv) };
+    }
+    if hr >= 0 && !ppv.is_null() && unsafe { !(*ppv).is_null() } {
+        match glob {
+            Some((_, idx)) => crate::global_bind::note_root_signature(unsafe { *ppv }, idx),
+            None => crate::global_bind::forget(unsafe { *ppv }),
+        }
+    }
+    hr
+}
+
 unsafe extern "system" fn real_create_cbv(real: *mut c_void, pdesc: *const u8, dest: usize) {
     if !pdesc.is_null() {
         let va = unsafe { core::ptr::read_unaligned(pdesc as *const u64) };
@@ -2342,6 +2381,7 @@ pub(crate) fn vtable() -> *const usize {
         v[48] = create_command_queue_x as usize; // CreateCommandQueueX
         v[9] = create_command_allocator_x as usize;
         v[8] = create_command_queue_x as usize; // PC-slot CreateCommandQueue: same desc; needs the Xbox-sized queue vtable too
+        v[16] = create_root_signature_abi as usize; // CreateRootSignature + global-memory ABI parameters
         v[15] = get_descriptor_increment as usize; // GetDescriptorHandleIncrementSize
         v[25] = get_resource_alloc_info as usize; // GetResourceAllocationInfo (null-safe)
         v[17] = create_cbv as usize; // CreateConstantBufferView (256-align size)
