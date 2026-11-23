@@ -216,6 +216,57 @@ pub unsafe extern "system" fn XGComputeOptimalSwizzleMode(dim: u32, format: u32,
     optimal_swizzle(code, format, width, height, depth, samples, bind & 0x20 != 0, bind & 0x80 != 0, misc >> 27 & 1 != 0)
 }
 
+/// `XGSuggestSwizzleMode(desc, flags)` — the Series X|S swizzle suggestion. Retail titles
+/// import this next to `XGCreateTextureComputer`; `game_scarlett_master.exe` does, and the
+/// loader refuses the process (`0xC0000139`, STATUS_ENTRYPOINT_NOT_FOUND) without it.
+///
+/// Shape, from the title's own call sites (RVA 0xc4b3ce and 0x4eccca2, reached through the
+/// `jmp [IAT]` thunk at 0x5f3ff50): the descriptor is in RCX, RDX is 0, and the result is
+/// consumed as the mode for the resource being laid out. The console library itself is in
+/// no dump we hold, so the *meaning* of the arguments is inferred from that usage: this
+/// reads the same `XG_TEXTURE_DESC` block `XGCreateTextureComputer` consumes and answers
+/// with the mode this crate's own swizzle rules pick for it — the identical rules
+/// `XGComputeOptimalSwizzleMode` exposes, not a fixed value.
+#[no_mangle]
+pub unsafe extern "system" fn XGSuggestSwizzleMode(desc: *const u8, flags: u32) -> u32 {
+    console!("XGSuggestSwizzleMode", fn(*const u8, u32) -> u32, desc, flags);
+    if desc.is_null() {
+        record(M, "XGSuggestSwizzleMode", "null descriptor: linear (0)");
+        return 0;
+    }
+    let d = layout::Tex2DDesc::read(desc);
+    // A depth/stencil plane is tiled the same way the depth-stencil suggestion tiles it.
+    if d.bind_flags & 0x40 != 0 {
+        return 0x18;
+    }
+    // D3D12_RESOURCE_DIMENSION: 3 = TEXTURE2D. A texture with no height is a 1D resource,
+    // which the console keeps linear (mode 0).
+    if d.height <= 1 {
+        record(M, "XGSuggestSwizzleMode", "height <= 1: linear (0)");
+        return 0;
+    }
+    let mode = optimal_swizzle(
+        3,
+        d.format,
+        d.width as u64,
+        d.height,
+        1,
+        d.sample_count.max(1),
+        d.bind_flags & 0x20 != 0,
+        d.bind_flags & 0x80 != 0,
+        d.misc_flags >> 27 & 1 != 0,
+    );
+    record(
+        M,
+        "XGSuggestSwizzleMode",
+        &format!(
+            "{}x{} fmt {} samples {} bind {:#x} -> mode {mode}",
+            d.width, d.height, d.format, d.sample_count, d.bind_flags
+        ),
+    );
+    mode
+}
+
 #[no_mangle]
 pub unsafe extern "system" fn XGComputeOptimalDepthStencilSwizzleMode(a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize, a8: usize, stencil: *mut u32) -> u32 {
     console!("XGComputeOptimalDepthStencilSwizzleMode", fn(usize, usize, usize, usize, usize, usize, usize, usize, *mut u32) -> u32, a1, a2, a3, a4, a5, a6, a7, a8, stencil);
@@ -620,6 +671,36 @@ mod tests {
         assert_eq!(optimal_swizzle(3, 28, 512, 512, 1, 1, false, true, false), 27);
         assert_eq!(optimal_swizzle(3, 28, 256, 256, 1, 1, false, false, true), 10);
         assert_eq!(optimal_swizzle(2, 28, 256, 1, 1, 1, false, false, false), 0);
+    }
+
+    #[test]
+    fn suggest_swizzle_mode_follows_the_descriptor() {
+        unsafe {
+            // A 2D colour texture gets the same mode the published rules give it, so the
+            // answer tracks the descriptor instead of being a constant.
+            let mut d = layout::Tex2DDesc { width: 256, height: 256, format: 28, sample_count: 1, ..Default::default() };
+            let p = &mut d as *mut layout::Tex2DDesc as *const u8;
+            assert_eq!(XGSuggestSwizzleMode(p, 0), 5);
+            // Bind 0x20 = render target, 0x80 = UAV: both select the tiled family.
+            d.bind_flags = 0x20;
+            assert_eq!(XGSuggestSwizzleMode(p, 0), 27);
+            d.bind_flags = 0x80;
+            d.width = 128;
+            d.height = 128;
+            assert_eq!(XGSuggestSwizzleMode(p, 0), 21);
+            // A 256x256 UAV texture is past the small-texture threshold again.
+            d.width = 256;
+            d.height = 256;
+            assert_eq!(XGSuggestSwizzleMode(p, 0), 27);
+            // Depth/stencil planes keep the depth-stencil tiling.
+            d.bind_flags = 0x40;
+            assert_eq!(XGSuggestSwizzleMode(p, 0), 0x18);
+            // A 1D resource (height <= 1) stays linear, and a null descriptor is linear.
+            d.bind_flags = 0;
+            d.height = 1;
+            assert_eq!(XGSuggestSwizzleMode(p, 0), 0);
+            assert_eq!(XGSuggestSwizzleMode(core::ptr::null(), 0), 0);
+        }
     }
 
     #[test]

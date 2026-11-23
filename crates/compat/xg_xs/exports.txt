@@ -21,3 +21,4 @@
 21 XGTerminateLibrary implemented
 22 XGValidateDepthStencilSwizzleMode implemented
 23 XGValidateDescriptor implemented
+24 XGSuggestSwizzleMode implemented | Series X|S swizzle suggestion; descriptor shape inferred from the title's call sites (0xc4b3ce, 0x4eccca2), mode from the same rules as XGComputeOptimalSwizzleMode
