@@ -660,6 +660,8 @@ struct Emitter<'a> {
 const OP_WAVE_REDUCE: u32 = 0x7ff0;
 
 const BINDLESS: u32 = 0x8000_0000;
+const RESOURCE_HEAP_DIRECTLY_INDEXED: u32 = 0x400;
+const SAMPLER_HEAP_DIRECTLY_INDEXED: u32 = 0x800;
 
 const OP_WAVE_SCAN: u32 = 0x7ff1;
 
@@ -1621,11 +1623,31 @@ impl<'a> Emitter<'a> {
         psv_image_dim_ms(p.kind, dim, msaa_dim_on())
     }
 
+    fn direct_sampler_heap(&self, index: u32) -> bool {
+        let Some(root) = &self.ex.root_sig else { return false };
+        let Some(&(table, _)) = self.bl.get(index as usize) else { return false };
+        if self.ex.stage != Stage::Pixel || self.dg().is_some()
+            || root.flags & (RESOURCE_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED)
+                != SAMPLER_HEAP_DIRECTLY_INDEXED
+        {
+            return false;
+        }
+        // In this pixel ABI, the sole implicit heap pointer immediately follows the
+        // packed root arguments. S_LOAD takes a byte offset into 16-byte samplers.
+        let base = self.user_base();
+        table as usize >= base && self.root_param_at(table, base).is_none()
+            && (table as usize == base || self.root_param_at(table - 1, base).is_some())
+    }
+
     fn decl(&self, used: &mut Vec<(String, u8, usize)>, ty: &str, name: &str, slot: Binding, class: char, range_type: u32, stride: u32) -> Result<String, String> {
         let n = match slot {
             Binding::Static(register) => return Ok(format!("{ty} {name} : register({});\n", register.hlsl(class))),
             Binding::Indexed(n) => n,
         };
+        if range_type == 3 && self.direct_sampler_heap(n) {
+            // Heap samplers are typed where the sample instruction uses them.
+            return Ok(String::new());
+        }
         let (table, _) = *self.bl.get(n as usize).ok_or("bindless: unknown load")?;
         let (p, _) = self.root_param_at(table, self.user_base()).ok_or_else(|| format!("bindless: s{table} is not a root parameter"))?;
         let Some(crate::meta::RootParamKind::Table(ranges)) = self.ex.root_sig.as_ref().and_then(|r| r.params.get(p)).map(|x| &x.kind) else {
@@ -2638,6 +2660,11 @@ impl<'a> Emitter<'a> {
                                 Some(slot) => slot,
                                 None => self.bind_id(*stable, *off, 16)?,
                             };
+                            if let Binding::Indexed(index) = sslot {
+                                if self.direct_sampler_heap(index) {
+                                    self.sm6_minor = self.sm6_minor.max(6);
+                                }
+                            }
                             // Depth-compare variants (opcode bit 3) need a comparison sampler.
                             if ins.op & 8 != 0 {
                                 self.samp_cmp.insert(sslot);
@@ -6705,7 +6732,17 @@ impl<'a> Emitter<'a> {
             format!("float{ncoord}({})", coords.join(", "))
         };
         let tex = format!("tex{tslot}");
-        let smp = if cmp { format!("scmp{sslot}") } else { format!("samp{sslot}") };
+        let smp = match sslot {
+            Binding::Indexed(index) if self.direct_sampler_heap(index) => {
+                let name = format!("tb_heap_sampler{}", self.tmp);
+                self.tmp += 1;
+                let ty = if cmp { "SamplerComparisonState" } else { "SamplerState" };
+                self.line(&format!("{ty} {name} = SamplerDescriptorHeap[NonUniformResourceIndex(tb_bi{index} / 16u)];"));
+                name
+            }
+            _ if cmp => format!("scmp{sslot}"),
+            _ => format!("samp{sslot}"),
+        };
         let zero_off = if noff == 1 { "0".to_string() } else { format!("int{}({})", noff.max(1), vec!["0"; noff.max(1)].join(", ")) };
         // Optional trailing ", offset[, clamp]" arguments.
         let tail = |offset: &Option<String>, clamp: &Option<String>| -> Result<String, String> {
