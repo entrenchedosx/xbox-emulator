@@ -68,6 +68,7 @@ fn main() {
     let mut trace_mode = false; // --trace: exebp logs regs+caller and CONTINUES (log-and-continue)
     let mut trace_limit: u64 = 40;
     let mut watch_rvas: Vec<u64> = Vec::new();
+    let mut bp_rvas: Vec<u64> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
     let mut it = args[2..].iter();
     while let Some(a) = it.next() {
@@ -75,6 +76,10 @@ fn main() {
             if let Some(v) = it.next() { exebp_rva = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap_or(0); }
         } else if a == "--trace" {
             trace_mode = true;
+        } else if a == "--bp" {
+            if let Some(v) = it.next() {
+                if let Ok(r) = u64::from_str_radix(v.trim_start_matches("0x"), 16) { bp_rvas.push(r); }
+            }
         } else if a == "--watch" {
             if let Some(v) = it.next() {
                 if let Ok(r) = u64::from_str_radix(v.trim_start_matches("0x"), 16) { watch_rvas.push(r); }
@@ -156,6 +161,9 @@ fn main() {
     // the engine later dereferences, without depending on absolute addresses.
     let mut watch_addrs: Vec<u64> = Vec::new();
     let mut watch_hits: u64 = 0;
+    // --bp <rva> (repeatable): log-and-continue breakpoints used to find which branch runs.
+    let mut bps: Vec<(u64, u64, u8)> = Vec::new(); // rva, addr, original byte
+    let mut bp_replant = false;
 
     // MDBG_COM=1: log COM/WinRT activation at combase's entry points. The point is
     // to read the class name and IID the title actually asks for rather than
@@ -244,6 +252,15 @@ fn main() {
                     arm_watch(hproc, evt.tid, &watch_addrs);
                     eprintln!("[WATCH] write watchpoint on {} address(es), main thread armed", watch_addrs.len());
                 }
+                for rva in &bp_rvas {
+                    let a = base + rva;
+                    let mut ob = [0u8; 1]; let mut got = 0usize;
+                    unsafe { ReadProcessMemory(hproc, a as *const c_void, ob.as_mut_ptr(), 1, &mut got); }
+                    let cc = [0xCCu8]; let mut wr = 0usize;
+                    let ok = unsafe { WriteProcessMemory(hproc, a as *mut c_void, cc.as_ptr(), 1, &mut wr) };
+                    if ok != 0 && wr == 1 { bps.push((*rva, a, ob[0])); }
+                    eprintln!("[BP] rva 0x{rva:x} planted={}", ok != 0 && wr == 1);
+                }
             }
             6 => { // LOAD_DLL: hFile(0), lpBaseOfDll(8)
                 let hfile = rd_u64(&evt.u, 0) as HANDLE;
@@ -318,6 +335,13 @@ fn main() {
                         unsafe { WriteProcessMemory(hproc, exebp_addr as *mut c_void, cc.as_ptr(), 1, &mut wr); }
                         exebp_replant_pending = false;
                     }
+                    if bp_replant {
+                        for (_, a, _) in &bps {
+                            let cc = [0xCCu8]; let mut wr = 0usize;
+                            unsafe { WriteProcessMemory(hproc, *a as *mut c_void, cc.as_ptr(), 1, &mut wr); }
+                        }
+                        bp_replant = false;
+                    }
                     if com_replant {
                         for (_, a, _) in &com_hooks {
                             let cc = [0xCCu8]; let mut wr = 0usize;
@@ -353,6 +377,12 @@ fn main() {
                     let _ = &xgr_base;
                     capture_exit(hproc, evt.tid, exe_base, exe_size, &modules);
                     unsafe { TerminateProcess(hproc, 1); }
+                    status = DBG_CONTINUE;
+                } else if ecode == 0x80000003 && bps.iter().any(|b| b.1 == addr) {
+                    let (rva, orig) = { let b = bps.iter().find(|b| b.1 == addr).unwrap(); (b.0, b.2) };
+                    bp_hit(hproc, evt.tid, rva);
+                    step_over(hproc, evt.tid, addr, orig);
+                    bp_replant = true;
                     status = DBG_CONTINUE;
                 } else if ecode == 0x80000003 && com_hooks.iter().any(|h| h.1 == addr) {
                     let (name, orig) = { let h = com_hooks.iter().find(|h| h.1 == addr).unwrap(); (h.0.clone(), h.2) };
@@ -1266,6 +1296,22 @@ mod tests {
 // Per-thread debug registers: a write to any watched address raises
 // EXCEPTION_SINGLE_STEP (0x80000004) with Dr6 marking the slot. Addresses are
 // passed as RVAs and rebased per process, so ASLR does not matter.
+
+// Log-and-continue breakpoint hit: registers plus the frame's return address.
+fn bp_hit(hproc: HANDLE, tid: u32, rva: u64) {
+    let h = unsafe { OpenThread(0x48, 0, tid) };
+    if h == 0 { return; }
+    let mut ctx = Ctx([0u8; 1256]);
+    ctx.0[0x30..0x34].copy_from_slice(&0x0010_0003u32.to_le_bytes());
+    if unsafe { GetThreadContext(h, ctx.0.as_mut_ptr()) } == 0 { unsafe { CloseHandle(h); } return; }
+    let rsp = rd_u64(&ctx.0, 0x98);
+    let (rax, rcx, rdx, r8, r9) =
+        (rd_u64(&ctx.0, 0x78), rd_u64(&ctx.0, 0x80), rd_u64(&ctx.0, 0x88), rd_u64(&ctx.0, 0xB8), rd_u64(&ctx.0, 0xC0));
+    unsafe { CloseHandle(h); }
+    eprintln!("[BPHIT] rva=0x{rva:x} rax=0x{rax:x} rcx=0x{rcx:x} rdx=0x{rdx:x} r8=0x{r8:x} r9=0x{r9:x} ret=0x{:x}",
+        read_u64(hproc, rsp).unwrap_or(0));
+}
+
 fn arm_watch(hproc: HANDLE, tid: u32, addrs: &[u64]) {
     let h = unsafe { OpenThread(0x58, 0, tid) };
     if h == 0 { return; }
