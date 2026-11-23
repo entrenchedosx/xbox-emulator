@@ -57,8 +57,48 @@ struct Frozen {
     _ctx: Box<Context>,
 }
 
+/// `TOMBOX_XMEM_FREEZE_TRACE=1`: report every freeze and thaw through OutputDebugString.
+/// Written from a stack buffer on purpose: while the world is frozen the thread that
+/// owns the process heap lock may be one of the suspended ones, so anything that
+/// allocates (the normal logger, `format!`) can deadlock right where it is needed.
+fn freeze_trace(what: &str, a: usize, b: usize) {
+    static ON: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    let mut on = ON.load(core::sync::atomic::Ordering::Relaxed);
+    if on == 0 {
+        on = if crate::sys::env_trimmed_is(b"TOMBOX_XMEM_FREEZE_TRACE\0", b"1") == Some(true) { 2 } else { 1 };
+        ON.store(on, core::sync::atomic::Ordering::Relaxed);
+    }
+    if on != 2 {
+        return;
+    }
+    use core::fmt::Write;
+    struct Buf([u8; 200], usize);
+    impl Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let n = s.len().min(self.0.len() - 1 - self.1);
+            self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.1 += n;
+            Ok(())
+        }
+    }
+    let mut buf = Buf([0u8; 200], 0);
+    let _ = write!(buf, "[xmem freeze] tid={} {what} {a} {b}", unsafe { GetCurrentThreadId() });
+    unsafe { OutputDebugStringA(buf.0.as_ptr()) };
+}
+
+thread_local! {
+    static FREEZES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// How many times this thread has suspended every other thread (see `Frozen`).
+pub fn freezes_on_this_thread() -> usize {
+    FREEZES.with(|c| c.get())
+}
+
 impl Frozen {
     fn new() -> Self {
+        FREEZES.with(|c| c.set(c.get() + 1));
+        freeze_trace("new: enter", 0, 0);
         let mut ids = Vec::with_capacity(256);
         unsafe {
             let snap = CreateToolhelp32Snapshot(4, 0);
@@ -74,9 +114,11 @@ impl Frozen {
                 }
                 CloseHandle(snap);
             }
+            freeze_trace("new: threads listed", ids.len(), 0);
             let handles: Vec<usize> = ids.iter().map(|&t| OpenThread(0x2 | 0x8, 0, t)).filter(|&h| h != 0).collect();
             let mut f = Frozen { suspended: vec![false; handles.len()], handles, _ctx: Box::new(Context([0u8; 0x4d0])) };
             let ctx = f._ctx.0.as_mut_ptr();
+            freeze_trace("new: suspending", f.handles.len(), 0);
             for i in 0..f.handles.len() {
                 if SuspendThread(f.handles[i]) != u32::MAX {
                     f.suspended[i] = true;
@@ -84,6 +126,7 @@ impl Frozen {
                     GetThreadContext(f.handles[i], ctx);
                 }
             }
+            freeze_trace("new: frozen", f.suspended.iter().filter(|s| **s).count(), f.handles.len());
             f
         }
     }
@@ -91,6 +134,7 @@ impl Frozen {
 
 impl Drop for Frozen {
     fn drop(&mut self) {
+        freeze_trace("drop: thawing", self.suspended.iter().filter(|s| **s).count(), self.handles.len());
         for i in 0..self.handles.len() {
             unsafe {
                 if self.suspended[i] {
@@ -560,11 +604,30 @@ pub fn reserve_placeholder(base: usize, len: usize) -> *mut c_void {
     })
 }
 
-/// Turn the placeholder `[base, base + len)` into an ordinary private
-/// reservation. The range must match the placeholder exactly.
-pub fn replace_placeholder(base: usize, len: usize, protect: u32) -> *mut c_void {
-    serialized(|| unsafe {
-        VirtualAlloc2(GetCurrentProcess(), base as *mut c_void, len, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, protect, core::ptr::null_mut(), 0)
+/// Take ownership of the title's placeholder `[base, base + len)` as it is. The console
+/// calls this "replace the placeholder with a reservation"; on the PC the physical
+/// pages are mapped straight into a placeholder, so there is nothing to replace.
+/// Converting a plain reservation instead (`adopt`) means freeing it and re-reserving
+/// it as a placeholder with every other thread suspended, which can deadlock against
+/// whichever suspended thread holds the process heap lock (a title thread inside
+/// `HeapAlloc`, a debugger-held exception dispatch); the title already hands over the
+/// state `adopt` works to create, so none of that is needed.
+///
+/// The range must be exactly one placeholder (reserved, private, `PAGE_NOACCESS`).
+pub fn own_placeholder(base: usize, len: usize, protect: u32) -> Result<(), u32> {
+    with(|s| {
+        if let Some(b) = region_of(s, base) {
+            return if b == base && s.regions[&b].size == len { Ok(()) } else { Err(ERROR_INVALID_ADDRESS) };
+        }
+        let m = query(base).ok_or(ERROR_INVALID_ADDRESS)?;
+        let exact = m.base == base && m.region_size == len;
+        if m.state != MEM_RESERVE || m.kind != MEM_PRIVATE || m.alloc_protect != PAGE_NOACCESS || !exact {
+            return Err(ERROR_INVALID_PARAMETER);
+        }
+        let protect = if protect & 0xff == PAGE_NOACCESS { PAGE_READWRITE } else { protect };
+        s.regions.insert(base, Region { size: len, protect, split: false });
+        crate::hooks::install_vfree_hook();
+        Ok(())
     })
 }
 

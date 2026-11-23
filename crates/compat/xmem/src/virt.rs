@@ -112,13 +112,12 @@ fn placeholder_alloc(address: *mut c_void, size: usize, alloc_type: u32, attribu
         return invalid("replacing a placeholder needs its address");
     }
     let wp = win_protect(protect);
-    let p = crate::phys::replace_placeholder(base, len, wp);
-    if p.is_null() {
-        let err = unsafe { GetLastError() };
-        record(M, "XMemVirtualAlloc", &format!("replace placeholder {base:#x}+{len:#x} type={alloc_type:#x} prot={protect:#x}->{wp:#x} attrs={attributes:#x} -> NULL (err={err})"));
+    if let Err(err) = crate::phys::own_placeholder(base, len, wp) {
+        record(M, "XMemVirtualAlloc", &format!("replace placeholder {base:#x}+{len:#x} type={alloc_type:#x} prot={protect:#x}->{wp:#x} attrs={attributes:#x}: not exactly one placeholder -> NULL (err={err})"));
         unsafe { SetLastError(err) };
-        return p;
+        return core::ptr::null_mut();
     }
+    let p = base as *mut c_void;
     if alloc_type & MEM_COMMIT != 0 {
         // The console accepts reserve+commit in one call; Windows wants the
         // commit as a second step on the now-ordinary reservation.
@@ -534,11 +533,15 @@ mod tests {
         let mut pfns = [0u64; 6];
         assert_eq!(unsafe { XMemAllocatePhysicalPages(XMEM_64K_PAGES as u64, &mut n, pfns.as_mut_ptr()) }, 1);
         let mut used = 0usize;
+        let freezes_before = crate::phys::freezes_on_this_thread();
         for (&start, &sz) in starts.iter().zip(sizes.iter()) {
             let pages = sz / XMEM_PAGE;
             assert_eq!(unsafe { XMemMapPhysicalPages(start as *mut c_void, pages, pfns.as_mut_ptr().add(used)) } as usize, start);
             used += pages;
         }
+        // The title's pieces are placeholders already, so mapping them must not suspend every
+        // other thread (the freeze can deadlock against a suspended thread that owns the heap).
+        assert_eq!(crate::phys::freezes_on_this_thread(), freezes_before, "mapping the title's placeholders froze the world");
         unsafe {
             *(base as *mut u32) = 0xa1;
             *((base + total - 4) as *mut u32) = 0xb2;

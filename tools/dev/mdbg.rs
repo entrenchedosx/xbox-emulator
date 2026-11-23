@@ -828,7 +828,14 @@ fn capture_probe(hproc: HANDLE, tid: u32, xgr_base: u64) {
 fn dump_thread(hproc: HANDLE, tid: u32, modules: &BTreeMap<u64, String>) {
     let hthread = unsafe { OpenThread(0x0002 | 0x0008 | 0x0040, 0, tid) };
     if hthread == 0 { return; }
-    let suspended = unsafe { SuspendThread(hthread) } != u32::MAX;
+    let before = unsafe { SuspendThread(hthread) };
+    let suspended = before != u32::MAX;
+    // SuspendThread returns the previous suspend count: a thread that was already suspended
+    // by something else (a freeze-the-world routine, a crash handler) shows up here. It is
+    // the usual owner of a lock everything else is stuck behind.
+    if suspended && before > 0 {
+        eprintln!("[HANG] tid={} was ALREADY SUSPENDED (count {} before this dump)", tid, before);
+    }
     let mut ctx = Ctx([0u8; 1256]);
     ctx.0[0x30..0x34].copy_from_slice(&0x0010_0003u32.to_le_bytes());
     let got_ctx = unsafe { GetThreadContext(hthread, ctx.0.as_mut_ptr()) } != 0;
