@@ -474,14 +474,25 @@ fn ds_swizzle_rotate_and_fft_compute() {
 }
 
 #[test]
-fn ds_permute_with_lds_is_refused() {
-    let mut b = perm_body(1, 0, 0);
-    b.extend_from_slice(&ds(0x0d, 0, 1, 2, 0, 0));
-    b.extend_from_slice(&ds(0xb3, 0, 16, 2, 0, 10));
-    let w = cs_prog(&b, &[10]);
-    let e = match translate(&cs_extract(&w, T)) {
-        Ok(_) => panic!("permute with LDS translated"),
-        Err(e) => e,
-    };
-    assert!(e.contains("groupshared"), "{e}");
+fn ds_permute_and_bpermute_preserve_live_lds_across_half_waves() {
+    let stride = T * 4;
+    let mut body = perm_body(1, 1, 0);
+    for (band, value) in [(0, 2), (1, 4), (2, 0)] {
+        body.extend_from_slice(&ds(0x0d, band * stride, 1, value, 0, 0));
+    }
+    let scatter = ds(0xb2, 0, 16, 2, 0, 10);
+    body.extend_from_slice(&scatter);
+    body.extend_from_slice(&ds(0xb3, 0, 16, 4, 0, 11));
+    // Read a neighbour's values from every part of LDS borrowed by the exchange.
+    for band in 0..3 {
+        body.extend_from_slice(&ds(0x36, band * stride, 3, 0, 0, 12 + band));
+    }
+    let case = cc("ds_permute_b32", scatter, body, &[10, 11, 12, 13, 14], &|t| {
+        let half = t & !31;
+        let previous = half | (t.wrapping_sub(1) & 31);
+        let next = half | ((t + 1) & 31);
+        let neighbour = t ^ 1;
+        vec![dv(previous), ev(next), dv(neighbour), ev(neighbour), neighbour]
+    });
+    run_cs_cases("ds_permute_with_lds", &[case]);
 }

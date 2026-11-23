@@ -60,9 +60,19 @@ pub(super) fn split_wide_lds(ins: &Insn) -> Result<Vec<Insn>, String> {
 }
 
 impl Emitter<'_> {
-    fn cs_threads(&self) -> (u32, u32, u32) {
+    pub(super) fn cs_threads(&self) -> (u32, u32, u32) {
         let p = self.ex.isa_preamble;
+        if p[1..].iter().all(|&n| n == 0) {
+            return self.ex.psv_numthreads.map(|[x, y, z]| (x, y, z)).unwrap_or((1, 1, 1));
+        }
         (p[1].max(1), p[2].max(1), p[3].max(1))
+    }
+
+    fn xlane_threads(&self) -> Result<(u32, u32, u32), String> {
+        let (x, y, z) = self.cs_threads();
+        let plane = x.checked_mul(y).ok_or("invalid group dimensions for DS lane exchange")?;
+        let n = plane.checked_mul(z).filter(|n| (1..=1024).contains(n)).ok_or("invalid group size for DS lane exchange")?;
+        Ok((x, plane, n))
     }
 
     pub(super) fn one_wave_lds(&self) -> bool {
@@ -85,11 +95,16 @@ impl Emitter<'_> {
             return Ok(None);
         }
         if self.uses_lds {
-            return Err("ds_permute/ds_bpermute in a compute shader that also uses LDS: the 32-lane exchange needs groupshared space beyond the 32 KiB LDS mirror".into());
+            if self.ex.stage != crate::Stage::Compute {
+                return Err("DS lane exchange with LDS requires a compute workgroup".into());
+            }
+            // The existing LDS mirror already uses the full 32 KiB groupshared budget.
+            // Borrow its first three words per thread for the exchange and restore them
+            // before any lane resumes translating LDS accesses.
+            return Ok(Some("#define TB_XL_GS 1\n#define TB_XL_SAVE_LDS 1\n#define tb_xl tb_lds".into()));
         }
-        let (x, y, z) = self.cs_threads();
-        let n = x * y * z;
-        Ok(Some(format!("#define TB_XL_GS 1\ngroupshared uint tb_xl[{n}];\ngroupshared uint tb_xm[{n}];\ngroupshared uint tb_xa[{n}];")))
+        let (_, _, n) = self.xlane_threads()?;
+        Ok(Some(format!("#define TB_XL_GS 1\ngroupshared uint tb_xl[{}];", 3 * n)))
     }
 
     pub(super) fn emit_lds_wrxchg2(&mut self, ins: &Insn) -> Result<(), String> {
@@ -153,24 +168,35 @@ impl Emitter<'_> {
         }
         let shared = self.is_cs && self.brace_depth == 0 && self.loop_depth == 0;
         if shared {
-            let (x, y, z) = self.cs_threads();
-            let n = x * y * z;
+            let (x, plane, n) = self.xlane_threads()?;
+            let active = 2 * n;
             self.line("#ifdef TB_XL_GS");
-            self.line(&format!("{{ uint t{t}f = gtid.x + gtid.y * {x}u + gtid.z * {}u; uint t{t}g = t{t}f & ~31u; uint t{t}j = t{t}f & 31u;", x * y));
+            self.line(&format!("{{ uint t{t}f = gtid.x + gtid.y * {x}u + gtid.z * {plane}u; uint t{t}g = t{t}f & ~31u; uint t{t}j = t{t}f & 31u;"));
             if swizzle {
                 self.line(&format!("t{t}m = {};", source_lane(format!("t{t}j"))));
             }
             self.line("GroupMemoryBarrierWithGroupSync();");
-            self.line(&format!("tb_xl[t{t}f] = t{t}d; tb_xm[t{t}f] = t{t}m; tb_xa[t{t}f] = exec_lo & 1u;"));
+            self.line("#ifdef TB_XL_SAVE_LDS");
+            self.line(&format!("uint t{t}sd = tb_xl[t{t}f]; uint t{t}sm = tb_xl[t{t}f + {n}u]; uint t{t}sa = tb_xl[t{t}f + {active}u];"));
+            self.line("#endif");
+            self.line(&format!("tb_xl[t{t}f] = t{t}d; tb_xl[t{t}f + {n}u] = t{t}m; tb_xl[t{t}f + {active}u] = exec_lo & 1u;"));
             self.line("GroupMemoryBarrierWithGroupSync();");
             if back {
-                self.line(&format!("uint t{t}i = t{t}g + t{t}m; t{t} = (t{t}i < {n}u && tb_xa[min(t{t}i, {}u)] != 0u) ? tb_xl[min(t{t}i, {}u)] : 0u; }}", n - 1, n - 1));
+                self.line(&format!("uint t{t}i = t{t}g + t{t}m; uint t{t}q = min(t{t}i, {}u); t{t} = (t{t}i < {n}u && tb_xl[t{t}q + {active}u] != 0u) ? tb_xl[t{t}q] : 0u;", n - 1));
             } else {
                 self.line(&format!(
-                    "t{t} = 0u; for (uint t{t}k = 0u; t{t}k < 32u; t{t}k++) {{ uint t{t}i = min(t{t}g + t{t}k, {}u); if (t{t}g + t{t}k < {n}u && tb_xa[t{t}i] != 0u && tb_xm[t{t}i] == t{t}j) t{t} = tb_xl[t{t}i]; }} }}",
+                    "t{t} = 0u; for (uint t{t}k = 0u; t{t}k < 32u; t{t}k++) {{ uint t{t}i = min(t{t}g + t{t}k, {}u); if (t{t}g + t{t}k < {n}u && tb_xl[t{t}i + {active}u] != 0u && tb_xl[t{t}i + {n}u] == t{t}j) t{t} = tb_xl[t{t}i]; }}",
                     n - 1
                 ));
             }
+            // Retire the exchange reads before restoring LDS, then make the original
+            // values visible to every lane that can access those addresses.
+            self.line("#ifdef TB_XL_SAVE_LDS");
+            self.line("GroupMemoryBarrierWithGroupSync();");
+            self.line(&format!("tb_xl[t{t}f] = t{t}sd; tb_xl[t{t}f + {n}u] = t{t}sm; tb_xl[t{t}f + {active}u] = t{t}sa;"));
+            self.line("GroupMemoryBarrierWithGroupSync();");
+            self.line("#endif");
+            self.line("}");
             self.line("#else");
         }
         self.line(&format!("{{ uint t{t}l = WaveGetLaneIndex(); uint t{t}g = t{t}l & ~31u;"));

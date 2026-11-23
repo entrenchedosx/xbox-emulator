@@ -1059,16 +1059,16 @@ fn every_32_bit_global_atomic_gets_its_own_operation_and_compiles() {
 
 #[test]
 fn unmodelled_global_atomics_are_refused_with_a_reason() {
-    // 64-bit forms need Int64 atomics on the window buffers; csub's rule is not modelled.
-    for (op, why) in [(0x52u32, "64-bit"), (0x5f, "64-bit"), (0x34, "not modelled")] {
+    // The 64-bit forms need Int64 atomics. Conditional subtract is absent on gfx1013.
+    for (op, why) in [(0x52u32, "64-bit"), (0x5f, "64-bit"), (0x34, "unsupported")] {
         let err = atomic_cs(&[global_atomic(op, true, 3, 5, 7, 0)]).err().unwrap_or_else(|| panic!("op {op:#x} must not translate"));
-        assert!(err.contains(why) || err.contains("not lowered"), "{err}");
+        assert!(err.contains(why), "{err}");
     }
     // scratch segment
     let mut scratch = global_atomic(0x32, true, 3, 5, 7, 0);
     scratch[0] = (scratch[0] & !(3 << 14)) | (1 << 14);
     let err = atomic_cs(&[scratch]).err().expect("scratch atomics are refused");
-    assert!(err.contains("scratch"), "{err}");
+    assert!(err.contains("unsupported encoding") && err.contains("flat<0x32>"), "{err}");
 }
 
 #[test]
