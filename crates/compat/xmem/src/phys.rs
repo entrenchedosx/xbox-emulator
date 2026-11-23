@@ -12,9 +12,9 @@ const M: &str = "xmem";
 pub use compat_common::physical_pages::PAGE_BYTES as PAGE;
 
 const MEM_PRIVATE: u32 = 0x2_0000;
-const MEM_RESERVE_PLACEHOLDER: u32 = 0x4_0000;
-const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
-const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
+pub(crate) const MEM_RESERVE_PLACEHOLDER: u32 = 0x4_0000;
+pub(crate) const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
+pub(crate) const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
 const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
 const SEC_COMMIT: u32 = 0x800_0000;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
@@ -545,6 +545,26 @@ pub fn decommit_owned(addr: usize, size: usize) -> Option<i32> {
             }
         }
         Some(1)
+    })
+}
+
+/// Reserve address space as a placeholder (`MEM_RESERVE | MEM_RESERVE_PLACEHOLDER`,
+/// `PAGE_NOACCESS`). The console kernel shares the Windows 10 placeholder
+/// protocol, and a title that asks for a placeholder goes on to split it with
+/// `VirtualFree(.., MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)`, which the PC
+/// kernel only accepts on a real placeholder - a plain reservation is refused
+/// with ERROR_INVALID_PARAMETER.
+pub fn reserve_placeholder(base: usize, len: usize) -> *mut c_void {
+    serialized(|| unsafe {
+        VirtualAlloc2(GetCurrentProcess(), base as *mut c_void, len, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, core::ptr::null_mut(), 0)
+    })
+}
+
+/// Turn the placeholder `[base, base + len)` into an ordinary private
+/// reservation. The range must match the placeholder exactly.
+pub fn replace_placeholder(base: usize, len: usize, protect: u32) -> *mut c_void {
+    serialized(|| unsafe {
+        VirtualAlloc2(GetCurrentProcess(), base as *mut c_void, len, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, protect, core::ptr::null_mut(), 0)
     })
 }
 

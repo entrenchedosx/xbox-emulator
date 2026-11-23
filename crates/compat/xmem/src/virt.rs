@@ -55,6 +55,9 @@ pub extern "system" fn XMemVirtualAlloc(
     attributes: u64,
     protect: u32,
 ) -> *mut c_void {
+    if alloc_type & (PH_RESERVE | PH_REPLACE) != 0 {
+        return placeholder_alloc(address, size, alloc_type, attributes, protect);
+    }
     let gran = page_granularity(alloc_type);
     let (base, len) = round_range(address as usize, size, gran);
     let wt = win_alloc_type(alloc_type);
@@ -63,6 +66,65 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     let range = if base == 0 { None } else { Some((base, base + len)) };
     crate::title_acct::track_commit(range, || virtual_alloc_inner(address, size, alloc_type, attributes, protect) as usize) as *mut c_void
+}
+
+const PH_RESERVE: u32 = crate::phys::MEM_RESERVE_PLACEHOLDER;
+const PH_REPLACE: u32 = crate::phys::MEM_REPLACE_PLACEHOLDER;
+
+/// The console allocator speaks the Windows 10 placeholder protocol, and the
+/// title drives it directly: reserve a placeholder (`MEM_RESERVE |
+/// MEM_RESERVE_PLACEHOLDER`), split it with `VirtualFree(.., MEM_RELEASE |
+/// MEM_PRESERVE_PLACEHOLDER)`, then turn each piece into an ordinary
+/// reservation (`MEM_RESERVE | MEM_REPLACE_PLACEHOLDER`) before backing it with
+/// `XMemMapPhysicalPages`. Masking the placeholder bits off (as the plain path
+/// does) hands the title a normal reservation, and its first split then fails
+/// inside the kernel.
+fn placeholder_alloc(address: *mut c_void, size: usize, alloc_type: u32, attributes: u64, protect: u32) -> *mut c_void {
+    let invalid = |why: &str| -> *mut c_void {
+        // Log first: the logger's file I/O overwrites the thread's last error,
+        // and the caller reads it straight after this returns.
+        record(M, "XMemVirtualAlloc", &format!("addr={address:p} size={size:#x} type={alloc_type:#x} prot={protect:#x}: {why} -> NULL"));
+        unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+        core::ptr::null_mut()
+    };
+    // Windows takes exactly one placeholder operation, always with MEM_RESERVE.
+    if alloc_type & PH_RESERVE != 0 && alloc_type & PH_REPLACE != 0 {
+        return invalid("MEM_RESERVE_PLACEHOLDER and MEM_REPLACE_PLACEHOLDER together");
+    }
+    if alloc_type & MEM_RESERVE == 0 {
+        return invalid("a placeholder operation needs MEM_RESERVE");
+    }
+    let gran = page_granularity(alloc_type);
+    let (base, len) = round_range(address as usize, size, gran);
+    if alloc_type & PH_RESERVE != 0 {
+        if alloc_type & MEM_COMMIT != 0 {
+            return invalid("a placeholder cannot be committed");
+        }
+        let p = crate::phys::reserve_placeholder(base, len);
+        if p.is_null() {
+            let err = unsafe { GetLastError() };
+            record(M, "XMemVirtualAlloc", &format!("placeholder reserve addr={address:p} size={size:#x} type={alloc_type:#x} -> NULL (err={err})"));
+            unsafe { SetLastError(err) };
+        }
+        return p;
+    }
+    if base == 0 {
+        return invalid("replacing a placeholder needs its address");
+    }
+    let wp = win_protect(protect);
+    let p = crate::phys::replace_placeholder(base, len, wp);
+    if p.is_null() {
+        let err = unsafe { GetLastError() };
+        record(M, "XMemVirtualAlloc", &format!("replace placeholder {base:#x}+{len:#x} type={alloc_type:#x} prot={protect:#x}->{wp:#x} attrs={attributes:#x} -> NULL (err={err})"));
+        unsafe { SetLastError(err) };
+        return p;
+    }
+    if alloc_type & MEM_COMMIT != 0 {
+        // The console accepts reserve+commit in one call; Windows wants the
+        // commit as a second step on the now-ordinary reservation.
+        return XMemVirtualAlloc(base as *mut c_void, len, alloc_type & !(PH_REPLACE | MEM_RESERVE), attributes, protect);
+    }
+    p
 }
 
 fn virtual_alloc_inner(address: *mut c_void, size: usize, alloc_type: u32, attributes: u64, protect: u32) -> *mut c_void {
@@ -432,6 +494,104 @@ mod tests {
         for i in 0..4 {
             assert_eq!(crate::phys::released(va + i * XMEM_PAGE), Ok(()));
         }
+    }
+
+    fn release_via_hook(va: usize) -> i32 {
+        let vfree: unsafe extern "system" fn(usize, usize, u32) -> i32 = unsafe { core::mem::transmute(crate::hooks::vfree_wrapper()) };
+        unsafe { vfree(va, 0, MEM_RELEASE) }
+    }
+
+    /// The sequence GTA VI's console descriptor-heap setup runs at EXE+0x1E86440:
+    /// reserve a placeholder, split it piece by piece with
+    /// `VirtualFree(.., MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)`, turn every piece
+    /// into an ordinary 64K-page reservation, then back the pieces with physical
+    /// pages. Before placeholders were honoured the very first split failed, the
+    /// routine returned false, and the title's initialisation asserted.
+    #[test]
+    fn title_placeholder_reserve_split_replace_and_map() {
+        let _g = crate::phys::map_test_guard();
+        let split = crate::phys::MEM_PRESERVE_PLACEHOLDER;
+        let sizes = [2 * XMEM_PAGE, XMEM_PAGE, 3 * XMEM_PAGE];
+        let total: usize = sizes.iter().sum();
+        let base = XMemVirtualAlloc(core::ptr::null_mut(), total, MEM_RESERVE | PH_RESERVE, 7, PAGE_NOACCESS) as usize;
+        assert_ne!(base, 0, "placeholder reserve failed, err={}", unsafe { GetLastError() });
+        // Split the first two pieces off; the tail is what is left of the placeholder.
+        assert_eq!(unsafe { VirtualFree(base as *mut c_void, sizes[0], MEM_RELEASE | split) }, 1, "err={}", unsafe { GetLastError() });
+        assert_eq!(unsafe { VirtualFree((base + sizes[0]) as *mut c_void, sizes[1], MEM_RELEASE | split) }, 1, "err={}", unsafe { GetLastError() });
+        // Every piece becomes an ordinary private reservation of exactly its own size.
+        let mut starts = Vec::new();
+        let mut at = base;
+        for (i, &sz) in sizes.iter().enumerate() {
+            let got = XMemVirtualAlloc(at as *mut c_void, sz, MEM_RESERVE | PH_REPLACE | XMEM_64K_PAGES, 0x27, 0x1004);
+            assert_eq!(got as usize, at, "piece {i} replace, err={}", unsafe { GetLastError() });
+            let mut info = XMemBasicInformation::default();
+            assert_eq!(unsafe { XMemVirtualQuery(GetCurrentProcess(), at as *const c_void, &mut info) }, 1);
+            assert_eq!((info.state, info.alloc_base, info.region_size), (MEM_RESERVE, at, sz), "piece {i}");
+            starts.push(at);
+            at += sz;
+        }
+        let mut n = 6usize;
+        let mut pfns = [0u64; 6];
+        assert_eq!(unsafe { XMemAllocatePhysicalPages(XMEM_64K_PAGES as u64, &mut n, pfns.as_mut_ptr()) }, 1);
+        let mut used = 0usize;
+        for (&start, &sz) in starts.iter().zip(sizes.iter()) {
+            let pages = sz / XMEM_PAGE;
+            assert_eq!(unsafe { XMemMapPhysicalPages(start as *mut c_void, pages, pfns.as_mut_ptr().add(used)) } as usize, start);
+            used += pages;
+        }
+        unsafe {
+            *(base as *mut u32) = 0xa1;
+            *((base + total - 4) as *mut u32) = 0xb2;
+            assert_eq!(*(base as *const u32), 0xa1);
+            assert_eq!(*((base + total - 4) as *const u32), 0xb2);
+        }
+        for &start in &starts {
+            assert_eq!(release_via_hook(start), 1, "release {start:#x}");
+        }
+        for i in 0..6 {
+            assert_eq!(crate::phys::released(base + i * XMEM_PAGE), Ok(()));
+        }
+        assert_eq!(unsafe { XMemFreePhysicalPages(6, pfns.as_mut_ptr()) }, 1);
+    }
+
+    #[test]
+    fn placeholder_flags_are_validated_like_the_kernel() {
+        let bad = |t: u32, a: usize, prot: u32| {
+            unsafe { SetLastError(0) };
+            let p = XMemVirtualAlloc(a as *mut c_void, XMEM_PAGE, t, 0, prot);
+            (p.is_null(), unsafe { GetLastError() })
+        };
+        // Both placeholder operations at once, no MEM_RESERVE, a committed placeholder,
+        // and a replace without an address are all invalid.
+        assert_eq!(bad(MEM_RESERVE | PH_RESERVE | PH_REPLACE, 0, PAGE_NOACCESS), (true, ERROR_INVALID_PARAMETER));
+        assert_eq!(bad(PH_RESERVE, 0, PAGE_NOACCESS), (true, ERROR_INVALID_PARAMETER));
+        assert_eq!(bad(MEM_RESERVE | MEM_COMMIT | PH_RESERVE, 0, PAGE_NOACCESS), (true, ERROR_INVALID_PARAMETER));
+        assert_eq!(bad(MEM_RESERVE | PH_REPLACE | XMEM_64K_PAGES, 0, PAGE_READWRITE), (true, ERROR_INVALID_PARAMETER));
+        // An ordinary reservation is not a placeholder: the kernel refuses to split it
+        // (the original failure) and refuses to replace it.
+        let plain = XMemVirtualAlloc(core::ptr::null_mut(), 2 * XMEM_PAGE, MEM_RESERVE | XMEM_64K_PAGES, 0, PAGE_READWRITE) as usize;
+        assert_ne!(plain, 0);
+        assert_eq!(unsafe { VirtualFree(plain as *mut c_void, XMEM_PAGE, MEM_RELEASE | crate::phys::MEM_PRESERVE_PLACEHOLDER) }, 0);
+        assert!(bad(MEM_RESERVE | PH_REPLACE | XMEM_64K_PAGES, plain, PAGE_READWRITE).0);
+        assert_eq!(release_via_hook(plain), 1);
+    }
+
+    #[test]
+    fn replace_placeholder_with_commit_in_one_call() {
+        let split = crate::phys::MEM_PRESERVE_PLACEHOLDER;
+        let base = XMemVirtualAlloc(core::ptr::null_mut(), 2 * XMEM_PAGE, MEM_RESERVE | PH_RESERVE, 0, PAGE_NOACCESS) as usize;
+        assert_ne!(base, 0);
+        assert_eq!(unsafe { VirtualFree(base as *mut c_void, XMEM_PAGE, MEM_RELEASE | split) }, 1);
+        let a = XMemVirtualAlloc(base as *mut c_void, XMEM_PAGE, MEM_RESERVE | MEM_COMMIT | PH_REPLACE | XMEM_64K_PAGES, 0, PAGE_READWRITE);
+        assert_eq!(a as usize, base, "err={}", unsafe { GetLastError() });
+        unsafe { *(base as *mut u32) = 0x1234 };
+        let mut info = XMemBasicInformation::default();
+        assert_eq!(unsafe { XMemVirtualQuery(GetCurrentProcess(), base as *const c_void, &mut info) }, 1);
+        assert_eq!(info.state, MEM_COMMIT);
+        let b = XMemVirtualAlloc((base + XMEM_PAGE) as *mut c_void, XMEM_PAGE, MEM_RESERVE | PH_REPLACE | XMEM_64K_PAGES, 0, PAGE_READWRITE);
+        assert_eq!(b as usize, base + XMEM_PAGE);
+        assert_eq!(release_via_hook(base), 1);
+        assert_eq!(release_via_hook(base + XMEM_PAGE), 1);
     }
 
     #[test]
