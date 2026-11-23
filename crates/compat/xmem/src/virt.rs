@@ -242,12 +242,15 @@ pub unsafe extern "system" fn XMemAllocatePhysicalPages(flags: u64, num_pages: *
         return 0;
     }
     let n = *num_pages;
+    if n == 0 {
+        return 1;
+    }
     if (flags as u32) & XMEM_64K_PAGES == XMEM_LARGE_PAGES && n & 0x1f != 0 {
         *num_pages = 0;
         SetLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
-    if n != 0 && page_array.is_null() {
+    if page_array.is_null() {
         *num_pages = 0;
         SetLastError(ERROR_INVALID_PARAMETER);
         return 0;
@@ -255,6 +258,9 @@ pub unsafe extern "system" fn XMemAllocatePhysicalPages(flags: u64, num_pages: *
     match crate::phys::allocate(n) {
         Some(v) => {
             core::ptr::copy_nonoverlapping(v.as_ptr(), page_array, v.len());
+            if n >= 4096 {
+                record(M, "XMemAllocatePhysicalPages", &format!("flags={flags:#x} pages={n} -> first PFN {:#x}, backing reserved", v[0]));
+            }
             1
         }
         None => {
