@@ -3,17 +3,41 @@ use core::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-pub fn period() -> u64 {
-    static P: OnceLock<u64> = OnceLock::new();
-    *P.get_or_init(|| parse_period(std::env::var("TOMBOX_PRESENT_PROBE").ok().as_deref()))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Schedule {
+    Off,
+    First,
+    Every(u64),
 }
 
-pub fn parse_period(v: Option<&str>) -> u64 {
-    match v.map(str::trim) {
-        None | Some("") | Some("0") => 0,
-        Some("1") => 30,
-        Some(s) => s.parse::<u64>().unwrap_or(30).max(1),
+impl Schedule {
+    fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            None | Some("") | Some("0") => Self::Off,
+            Some("first") => Self::First,
+            Some("1") => Self::Every(30),
+            Some(s) => Self::Every(s.parse::<u64>().unwrap_or(30).max(1)),
+        }
     }
+
+    fn due(self, frame: u64) -> bool {
+        match self {
+            Self::Off => false,
+            Self::First => frame == 1,
+            Self::Every(period) => frame != 0 && frame % period == 0,
+        }
+    }
+}
+
+fn schedule() -> Schedule {
+    static SCHEDULE: OnceLock<Schedule> = OnceLock::new();
+    *SCHEDULE.get_or_init(|| {
+        Schedule::parse(std::env::var("TOMBOX_PRESENT_PROBE").ok().as_deref())
+    })
+}
+
+pub fn pending_first_frame() -> bool {
+    schedule() == Schedule::First && guard().pending.as_ref().is_some_and(|p| p.frame == 1)
 }
 
 pub fn bpp(format: u32) -> Option<usize> {
@@ -237,17 +261,13 @@ fn guard() -> std::sync::MutexGuard<'static, Probe> {
     PROBE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub fn due(n: u64, period: u64) -> bool {
-    period != 0 && n != 0 && n % period == 0
-}
-
 pub unsafe fn on_present(src: *mut c_void, plane_count: u32, planes: *const u8) {
-    let p = period();
-    if p == 0 {
+    let schedule = schedule();
+    if schedule == Schedule::Off {
         return;
     }
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
-    if !due(n, p) {
+    if !schedule.due(n) {
         return;
     }
     let mut meta = format!("planes={plane_count}");
@@ -374,13 +394,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn period_parsing() {
-        assert_eq!(parse_period(None), 0);
-        assert_eq!(parse_period(Some("0")), 0);
-        assert_eq!(parse_period(Some("1")), 30);
-        assert_eq!(parse_period(Some("5")), 5);
-        assert_eq!(parse_period(Some("x")), 30);
-        assert!(due(30, 30) && !due(31, 30) && !due(0, 30) && !due(30, 0));
+    fn probe_schedule_parsing_and_sampling() {
+        assert_eq!(Schedule::parse(None), Schedule::Off);
+        assert_eq!(Schedule::parse(Some("0")), Schedule::Off);
+        assert_eq!(Schedule::parse(Some("1")), Schedule::Every(30));
+        assert_eq!(Schedule::parse(Some("5")), Schedule::Every(5));
+        assert_eq!(Schedule::parse(Some("x")), Schedule::Every(30));
+        assert!(Schedule::Every(30).due(30));
+        assert!(!Schedule::Every(30).due(31));
+        assert!(!Schedule::Every(30).due(0));
+        assert!(!Schedule::Off.due(30));
+        let first = Schedule::parse(Some("first"));
+        assert_eq!(first, Schedule::First);
+        assert!(!first.due(0));
+        assert!(first.due(1));
+        assert!(!first.due(2));
     }
 
     #[test]
