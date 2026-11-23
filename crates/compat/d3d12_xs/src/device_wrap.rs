@@ -25,6 +25,15 @@ pub struct Guid {
     pub d4: [u8; 8],
 }
 
+/// The command-list IID the retail GTA VI build passes to the Xbox command-list
+/// create slot (read from the call: it forwards IID {C3827890-4024-474C-98CF-645B51DC4874}
+/// with type DIRECT). The host D3D12 runtime has no such interface, so it is
+/// translated to the PC graphics-list IID and the returned object is wrapped.
+pub const IID_XBOX_GRAPHICS_COMMAND_LIST: Guid = Guid {
+    d1: 0xC382_7890, d2: 0x4024, d3: 0x474C,
+    d4: [0x98, 0xCF, 0x64, 0x5B, 0x51, 0xDC, 0x48, 0x74],
+};
+
 const IID_IUNKNOWN: Guid = Guid { d1: 0, d2: 0, d3: 0, d4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
 
 /// ID3D12Device through ID3D12Device8 — all resolve to our wrapper so every
@@ -265,7 +274,16 @@ unsafe extern "system" fn create_command_list_x(
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(12)) };
     let dma = !riid.is_null() && unsafe { *riid == crate::dma_list::IID_XBOX_DMA_COMMAND_LIST };
-    let pc_riid = if dma { &crate::dma_list::IID_GRAPHICS_COMMAND_LIST as *const Guid } else { riid };
+    // The console asks for its own command-list interface IDs. The host runtime
+    // only knows the PC ones, and answering E_NOINTERFACE leaves the title with a
+    // null list it does not check. Ask the host for the PC interface instead and
+    // hand back the shim, which presents the Xbox layout.
+    let console_gfx = !riid.is_null() && unsafe { *riid == IID_XBOX_GRAPHICS_COMMAND_LIST };
+    let pc_riid = if dma || console_gfx {
+        &crate::dma_list::IID_GRAPHICS_COMMAND_LIST as *const Guid
+    } else {
+        riid
+    };
     let hr = unsafe { f(real, node_mask, list_type, alloc, init_state, pc_riid, ppv) };
     if hr == S_OK && !ppv.is_null() {
         // Hand the title a shim object (Xbox vtable layout + inert inline-buffer fields)
@@ -274,7 +292,16 @@ unsafe extern "system" fn create_command_list_x(
             *ppv = if dma { crate::dma_list::wrap(*ppv) } else { crate::cmdlist_wrap::wrap(*ppv) };
         }
     }
-    record("d3d12_xs", "CreateCommandList", &format!("nodeMask={node_mask} type={list_type} dma={dma} -> hr={hr:#010x}"));
+    // The IID matters: the host runtime only hands back a list for an IID it
+    // knows, and a console-only IID comes back as E_NOINTERFACE.
+    let riid_txt = if riid.is_null() {
+        "null".to_string()
+    } else {
+        let g = unsafe { &*riid };
+        format!("{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+            g.d1, g.d2, g.d3, g.d4[0], g.d4[1], g.d4[2], g.d4[3], g.d4[4], g.d4[5], g.d4[6], g.d4[7])
+    };
+    record("d3d12_xs", "CreateCommandList", &format!("nodeMask={node_mask} type={list_type} dma={dma} riid={riid_txt} -> hr={hr:#010x}"));
     hr
 }
 

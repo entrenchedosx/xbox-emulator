@@ -39,6 +39,7 @@ extern "system" {
     fn TerminateProcess(h: HANDLE, code: u32) -> i32;
     fn GetFinalPathNameByHandleW(h: HANDLE, buf: *mut u16, n: u32, flags: u32) -> u32;
     fn GetModuleHandleW(name: *const u16) -> HANDLE;
+    fn LoadLibraryW(name: *const u16) -> HANDLE;
     fn GetProcAddress(h: HANDLE, name: *const u8) -> *mut c_void;
     fn OpenThread(access: u32, inherit: i32, tid: u32) -> HANDLE;
     fn SuspendThread(h: HANDLE) -> u32;
@@ -145,6 +146,22 @@ fn main() {
     let mut exebp_replant_pending = false;
     let mut exebp_hits: u64 = 0;
 
+    // MDBG_COM=1: log COM/WinRT activation at combase's entry points. The point is
+    // to read the class name and IID the title actually asks for rather than
+    // guessing which Xbox interface is missing.
+    let com_on = std::env::var("MDBG_COM").ok().as_deref() == Some("1");
+    let mut com_rvas: Vec<(String, u64)> = Vec::new();
+    if com_on {
+        for sym in ["RoGetActivationFactory", "RoActivateInstance", "RoOriginateError", "CoCreateInstance"] {
+            if let Some(rva) = export_rva("combase.dll", sym) { com_rvas.push((sym.to_string(), rva)); }
+            else { eprintln!("[COM] combase!{sym} not found"); }
+        }
+        eprintln!("[COM] watching {} activation entry points", com_rvas.len());
+    }
+    let mut com_hooks: Vec<(String, u64, u8)> = Vec::new(); // name, child addr, original byte
+    let mut com_replant = false;
+    let mut com_hits: u64 = 0;
+
     // MDBG_HANGDUMP=<secs>: once, that long after launch, print a stack scan of every thread
     // (for diagnosing stalls: which threads are blocked where).
     let mut hangdump: Vec<u64> = std::env::var("MDBG_HANGDUMP").ok().map(|v| v.split([',', ' ']).filter_map(|x| x.trim().parse::<u64>().ok()).collect()).unwrap_or_default();
@@ -225,6 +242,18 @@ fn main() {
                     let ok = unsafe { WriteProcessMemory(hproc, probe_addr as *mut c_void, cc.as_ptr(), 1, &mut wr) };
                     eprintln!("[trace] xgameruntime.dll @0x{:x}; probe @0x{:x} planted={}", base, probe_addr, ok != 0 && wr == 1);
                 }
+                if com_on && name.eq_ignore_ascii_case("combase.dll") && com_hooks.is_empty() {
+                    for (sym, rva) in &com_rvas {
+                        let a = base + rva;
+                        let mut ob = [0u8; 1]; let mut got = 0usize;
+                        unsafe { ReadProcessMemory(hproc, a as *const c_void, ob.as_mut_ptr(), 1, &mut got); }
+                        let cc = [0xCCu8]; let mut wr = 0usize;
+                        let ok = unsafe { WriteProcessMemory(hproc, a as *mut c_void, cc.as_ptr(), 1, &mut wr) };
+                        let planted = ok != 0 && wr == 1;
+                        if planted { com_hooks.push((sym.clone(), a, ob[0])); }
+                        eprintln!("[COM] hook {sym} @0x{a:x} planted={planted}");
+                    }
+                }
                 modules.insert(base, name);
             }
             8 => { // OUTPUT_DEBUG_STRING: lpDebugStringData(0 u64), fUnicode(8 u16), nLen(10 u16)
@@ -265,6 +294,13 @@ fn main() {
                         unsafe { WriteProcessMemory(hproc, exebp_addr as *mut c_void, cc.as_ptr(), 1, &mut wr); }
                         exebp_replant_pending = false;
                     }
+                    if com_replant {
+                        for (_, a, _) in &com_hooks {
+                            let cc = [0xCCu8]; let mut wr = 0usize;
+                            unsafe { WriteProcessMemory(hproc, *a as *mut c_void, cc.as_ptr(), 1, &mut wr); }
+                        }
+                        com_replant = false;
+                    }
                     status = DBG_CONTINUE;
                 } else if ecode == 0x80000003 && exebp_addr != 0 && addr == exebp_addr {
                     exebp_hits += 1;
@@ -293,6 +329,13 @@ fn main() {
                     let _ = &xgr_base;
                     capture_exit(hproc, evt.tid, exe_base, exe_size, &modules);
                     unsafe { TerminateProcess(hproc, 1); }
+                    status = DBG_CONTINUE;
+                } else if ecode == 0x80000003 && com_hooks.iter().any(|h| h.1 == addr) {
+                    let (name, orig) = { let h = com_hooks.iter().find(|h| h.1 == addr).unwrap(); (h.0.clone(), h.2) };
+                    com_hits += 1;
+                    com_hit(hproc, evt.tid, &name, com_hits);
+                    step_over(hproc, evt.tid, addr, orig);
+                    com_replant = true;
                     status = DBG_CONTINUE;
                 } else if ecode == 0x80000003 && addr == sink_addr && sink_planted {
                     eprintln!("[EXIT] RtlExitUserProcess reached — capturing stack");
@@ -924,6 +967,110 @@ fn capture_exit_extra(hproc: HANDLE, tid: u32, modules: &BTreeMap<u64, String>) 
 
 fn rd_u16(u: &[u8], o: usize) -> u16 { u16::from_le_bytes([u[o],u[o+1]]) }
 fn rd_u32(u: &[u8], o: usize) -> u32 { u32::from_le_bytes([u[o],u[o+1],u[o+2],u[o+3]]) }
+// --- COM/WinRT activation tracing -------------------------------------------
+// Resolve an export's RVA in this process and reuse it on the child's copy of
+// the same DLL: same file, same layout, same RVA.
+fn export_rva(dll: &str, sym: &str) -> Option<u64> {
+    let w = wide(dll);
+    let h = unsafe { LoadLibraryW(w.as_ptr()) };
+    if h == 0 { return None; }
+    let base = unsafe { GetModuleHandleW(w.as_ptr()) } as u64;
+    if base == 0 { return None; }
+    let mut name = sym.as_bytes().to_vec();
+    name.push(0);
+    let p = unsafe { GetProcAddress(h, name.as_ptr()) } as u64;
+    if p == 0 { return None; }
+    Some(p - base)
+}
+
+fn com_hit(hproc: HANDLE, tid: u32, name: &str, n: u64) {
+    let hthread = unsafe { OpenThread(0x48, 0, tid) };
+    if hthread == 0 { return; }
+    let mut ctx = Ctx([0u8; 1256]);
+    ctx.0[0x30..0x34].copy_from_slice(&0x0010_0003u32.to_le_bytes());
+    if unsafe { GetThreadContext(hthread, ctx.0.as_mut_ptr()) } == 0 { unsafe { CloseHandle(hthread); } return; }
+    let rcx = rd_u64(&ctx.0, 0x80);
+    let rdx = rd_u64(&ctx.0, 0x88);
+    let r8 = rd_u64(&ctx.0, 0xB8);
+    let r9 = rd_u64(&ctx.0, 0xC0);
+    let rsp = rd_u64(&ctx.0, 0x98);
+    unsafe { CloseHandle(hthread); }
+    let ret = read_u64(hproc, rsp).unwrap_or(0);
+    eprintln!("[COM #{n}] {name} rcx=0x{rcx:x} rdx=0x{rdx:x} r8=0x{r8:x} r9=0x{r9:x} ret=0x{ret:x}");
+    match name {
+        "RoGetActivationFactory" | "RoGetActivationFactoryEx" => {
+            match hstring_str(hproc, rcx) {
+                Some(s) => eprintln!("[COM #{n}]   class = {s:?}"),
+                None => eprintln!("[COM #{n}]   class = <unreadable HSTRING>"),
+            }
+            eprintln!("[COM #{n}]   iid   = {}", guid_str(hproc, rdx));
+        }
+        "RoActivateInstance" => {
+            match hstring_str(hproc, rcx) {
+                Some(s) => eprintln!("[COM #{n}]   class = {s:?}"),
+                None => eprintln!("[COM #{n}]   class = <unreadable HSTRING>"),
+            }
+        }
+        "CoCreateInstance" => {
+            eprintln!("[COM #{n}]   clsid = {}", guid_str(hproc, rcx));
+            eprintln!("[COM #{n}]   iid   = {}", guid_str(hproc, r9));
+        }
+        _ => {}
+    }
+}
+
+// Restore the original instruction byte, rewind RIP onto it and set the trap
+// flag so the single-step handler can re-plant the breakpoint.
+fn step_over(hproc: HANDLE, tid: u32, addr: u64, orig: u8) {
+    let hthread = unsafe { OpenThread(0x58, 0, tid) };
+    if hthread == 0 { return; }
+    let mut ctx = Ctx([0u8; 1256]);
+    ctx.0[0x30..0x34].copy_from_slice(&0x0010_0003u32.to_le_bytes());
+    if unsafe { GetThreadContext(hthread, ctx.0.as_mut_ptr()) } == 0 { unsafe { CloseHandle(hthread); } return; }
+    let ob = [orig];
+    let mut wr = 0usize;
+    unsafe { WriteProcessMemory(hproc, addr as *mut c_void, ob.as_ptr(), 1, &mut wr); }
+    let rip = rd_u64(&ctx.0, 0xF8).wrapping_sub(1);
+    wr_u64(&mut ctx.0, 0xF8, rip);
+    let eflags = (rd_u64(&ctx.0, 0x44) as u32) | 0x100;
+    wr_u32(&mut ctx.0, 0x44, eflags);
+    unsafe { SetThreadContext(hthread, ctx.0.as_ptr()); CloseHandle(hthread); }
+}
+
+fn guid_str(hproc: HANDLE, p: u64) -> String {
+    if p < 0x10000 { return "<null>".into(); }
+    let mut b = [0u8; 16];
+    let mut got = 0usize;
+    if unsafe { ReadProcessMemory(hproc, p as *const c_void, b.as_mut_ptr(), 16, &mut got) } == 0 || got < 16 {
+        return "<unreadable>".into();
+    }
+    let d1 = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let d2 = u16::from_le_bytes([b[4], b[5]]);
+    let d3 = u16::from_le_bytes([b[6], b[7]]);
+    format!("{{{d1:08X}-{d2:04X}-{d3:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15])
+}
+
+// A Windows HSTRING points at its character buffer; the header just before it
+// holds the length as a u32 at buffer-4.
+fn hstring_str(hproc: HANDLE, p: u64) -> Option<String> {
+    if p < 0x10000 { return None; }
+    let len = read_u32(hproc, p.checked_sub(4)?)? as usize;
+    if len == 0 || len > 512 { return None; }
+    let mut buf = vec![0u8; len * 2];
+    let mut got = 0usize;
+    if unsafe { ReadProcessMemory(hproc, p as *const c_void, buf.as_mut_ptr(), buf.len(), &mut got) } == 0 { return None; }
+    let u: Vec<u16> = buf[..got].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    Some(String::from_utf16_lossy(&u))
+}
+
+fn read_u32(hproc: HANDLE, addr: u64) -> Option<u32> {
+    let mut b = [0u8; 4];
+    let mut got = 0usize;
+    if unsafe { ReadProcessMemory(hproc, addr as *const c_void, b.as_mut_ptr(), 4, &mut got) } == 0 || got < 4 { return None; }
+    Some(u32::from_le_bytes(b))
+}
+
 fn rd_u64(u: &[u8], o: usize) -> u64 { let mut b=[0u8;8]; b.copy_from_slice(&u[o..o+8]); u64::from_le_bytes(b) }
 
 fn dll_name(hfile: HANDLE) -> String {

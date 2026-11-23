@@ -28,9 +28,11 @@ extern "system" {
 }
 const PAGE_READWRITE: u32 = 0x04;
 
-/// Number of Xbox vtable slots we materialize. Max observed call is Xbox slot 50
-/// (OMSetRenderTargets); 128 leaves generous headroom.
-const N: usize = 128;
+/// Number of Xbox vtable slots we materialize. The highest slot seen from a retail
+/// title so far is 132 (a command-list call in GTA VI at EXE+0x2478b9e); 160 leaves
+/// headroom, and every slot past the mapped range gets a logging probe so an
+/// out-of-range call can never read past the table and jump to zero.
+const N: usize = 160;
 static XBOX_VT: [AtomicUsize; N] = [const { AtomicUsize::new(0) }; N];
 static BUILT: AtomicBool = AtomicBool::new(false);
 static mut REAL_VT_PTR: *const usize = core::ptr::null();
@@ -107,7 +109,7 @@ static PROBE_HITS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn probe_impl(_this: *mut c_void, a: u64, caller: usize, slot: u64) {
     let h = PROBE_HITS.fetch_add(1, Ordering::Relaxed);
-    static PER: [AtomicUsize; 128] = [const { AtomicUsize::new(0) }; 128];
+    static PER: [AtomicUsize; 160] = [const { AtomicUsize::new(0) }; 160];
     let _ = h;
     if PER[(slot as usize).min(127)].fetch_add(1, Ordering::Relaxed) < 4 {
         let base = EXE_BASE.load(Ordering::Relaxed);
@@ -193,6 +195,10 @@ make_probes!(
     (p107,107),(p108,108),(p109,109),(p110,110),(p111,111),(p112,112),(p113,113),(p114,114),(p115,115),
     (p116,116),(p117,117),(p118,118),(p119,119),(p120,120),(p121,121),(p122,122),(p123,123),(p124,124),
     (p125,125),(p126,126),(p127,127),
+(p128,128), (p129,129), (p130,130), (p131,131), (p132,132), (p133,133), (p134,134), (p135,135), (p136,136), (p137,137),
+(p138,138), (p139,139), (p140,140), (p141,141), (p142,142), (p143,143), (p144,144), (p145,145), (p146,146), (p147,147),
+(p148,148), (p149,149), (p150,150), (p151,151), (p152,152), (p153,153), (p154,154), (p155,155), (p156,156), (p157,157),
+    (p158,158),(p159,159),
 );
 
 /// ResourceBarrier (slot 26, identical on Xbox and PC) with state tracking for the

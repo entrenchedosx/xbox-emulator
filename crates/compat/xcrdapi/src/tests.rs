@@ -248,6 +248,11 @@ fn factory_identity_and_vtable_layout() {
         let bad = IID_D3D12_FENCE_PC;
         assert_eq!(DStorageGetFactory(bad.as_ptr() as *const c_void, &mut out), E_NOINTERFACE);
         assert!(out.is_null());
+        // The retail GTA VI build asks for the X2 factory ID and dereferences the
+        // result without checking the HRESULT, so refusing it crashes the title.
+        let mut x2: *mut c_void = core::ptr::null_mut();
+        assert_eq!(DStorageGetFactory(IID_FACTORY_X2.as_ptr() as *const c_void, &mut x2), S_OK);
+        assert_eq!(x2, f);
         assert_eq!(DStorageGetFactory(IID_IUNKNOWN.as_ptr() as *const c_void, &mut out), S_OK);
         assert_eq!(out, f);
         let set_dbg: unsafe extern "system" fn(*mut c_void, u32) = core::mem::transmute(slot(f, 7));
