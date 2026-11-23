@@ -724,3 +724,21 @@ fn enqueue_set_event_follows_the_requests_before_it() {
         release(q);
     }
 }
+
+#[test]
+fn close_discards_an_unsubmitted_completion_event() {
+    let f = factory();
+    unsafe {
+        let (hr, q) = create_queue1(f, QUEUE_SOURCE_MEMORY as u64, 8, PRIORITY_REALTIME, OPT_QUEUE_AUTO_SUBMIT_DISABLED);
+        assert_eq!(hr, S_OK);
+        let event = CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null());
+        assert_ne!(event, 0);
+        let set: unsafe extern "system" fn(*mut c_void, isize) = core::mem::transmute(slot(q, 12));
+        let close: unsafe extern "system" fn(*mut c_void) = core::mem::transmute(slot(q, 8));
+        set(q, event);
+        close(q);
+        assert_eq!(WaitForSingleObject(event, 0), 0x102);
+        assert_ne!(CloseHandle(event), 0);
+        release(q);
+    }
+}
