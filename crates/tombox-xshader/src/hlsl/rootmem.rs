@@ -31,6 +31,12 @@ impl Emitter<'_> {
         }
         let mut ptr: Vec<u8> = vec![0];
         for ins in &self.insns {
+            // s_setreg_* program a hardware mode register; the decoded "destination" is that
+            // register's number, not an SGPR (see the resource dataflow). Treating it as a write
+            // to s0 dropped the root pointer and hid every root-memory read from this check.
+            if ins.enc == Enc::Sopk && ins.mnemonic.starts_with("s_setreg") {
+                continue;
+            }
             match ins.enc {
                 Enc::Smem if ins.op <= 4 => {
                     if sgpr(ins.src.first()).is_some_and(|b| ptr.contains(&b)) {
@@ -65,7 +71,7 @@ impl Emitter<'_> {
         (table as usize) < self.user_base() && self.rootmem()
     }
 
-    fn rm_param(&self, dword: u32) -> Option<(usize, u32)> {
+    pub(super) fn rm_param(&self, dword: u32) -> Option<(usize, u32)> {
         if self.dg().is_some() {
             return self.dg_mem(dword);
         }
@@ -84,7 +90,7 @@ impl Emitter<'_> {
         None
     }
 
-    fn rm_kind_of(&self, p: usize) -> Option<&RootParamKind> {
+    pub(super) fn rm_kind_of(&self, p: usize) -> Option<&RootParamKind> {
         self.ex.root_sig.as_ref()?.params.get(p).map(|x| &x.kind)
     }
 
@@ -160,6 +166,9 @@ impl Emitter<'_> {
             ins.src.iter().any(|o| matches!(o, Opnd::Sgpr(n) if (*n as u32..*n as u32 + span).contains(&r)))
         };
         let writes = |ins: &Insn| {
+            if ins.enc == Enc::Sopk && ins.mnemonic.starts_with("s_setreg") {
+                return false;
+            }
             let extra = match ins.enc {
                 Enc::Smem if ins.op <= 4 => (1u32 << ins.op) - 1,
                 _ if ins.mnemonic.ends_with("_b64") => 1,

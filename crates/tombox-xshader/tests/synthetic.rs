@@ -766,3 +766,331 @@ fn image_atomic_64bit_emits_uint64_uav_and_sm66() {
         tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile ps_6_6");
     }
 }
+
+// ---- scalar loads through a 64-bit address held in SGPRs (global memory) -------------------
+//
+// Compute shaders in the console XboxBvhBuilder library receive a pointer in root constants,
+// form `(value << 8) | 12` in SGPRs and `s_load` through it. The address is a run-time value;
+// the load is a read of global memory and goes through the TbGlobal window table.
+
+const S_WAITCNT: u32 = 0xbf8c_c07f;
+/// `s_mov_b32 s2, s0`: the user-data pointer copied before it is used as a root-table base.
+const S_MOV_S2_S0: u32 = 0xbe82_0300;
+
+fn constants(num32: u32) -> RootSig {
+    RootSig {
+        version: 2,
+        flags: 0,
+        params: vec![RootParam { visibility: 0, kind: RootParamKind::Constants { register: 0, space: 0, num32 } }],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    }
+}
+
+fn uav_descriptor() -> RootSig {
+    RootSig {
+        version: 2,
+        flags: 0,
+        params: vec![RootParam { visibility: 0, kind: RootParamKind::Descriptor { kind: 4, register: 0, space: 0 } }],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    }
+}
+
+fn scalar_cs(words: &[u32], root: RootSig) -> Result<tombox_xshader::hlsl::Translated, String> {
+    let mut ex = shader(Stage::Compute, words, vec![], vec![], Some(root));
+    ex.isa_preamble = [0, 1, 1, 1];
+    (ex.has_input_sig, ex.has_output_sig) = (false, false);
+    translate(&ex)
+}
+
+/// The shape found in the failing shaders: root constants s6:s7 are a "pointer or immediate";
+/// a non-zero s7 is an address >> 8, and the dword at offset 12 of that block is read.
+fn pointer_from_root_constants() -> Vec<u32> {
+    vec![
+        S_MOV_S2_S0,
+        0xf404_0181, 0xfa00_0000, // s_load_dwordx2 s6, s2 [0x0]   (root constants)
+        S_WAITCNT,
+        0xbe84_0307,              // s_mov_b32 s4, s7
+        0xbe85_0380,              // s_mov_b32 s5, 0
+        0x8f84_8804,              // s_lshl_b64 s[4:5], s[4:5], 8
+        0x8804_8c04,              // s_or_b32 s4, s4, 12
+        0xf400_0102, 0xfa00_0000, // s_load_dword s4, s[4:5] [0x0]
+        S_WAITCNT,
+        S_ENDPGM,
+    ]
+}
+
+#[test]
+fn scalar_load_through_an_address_built_from_root_constants_reads_global_memory() {
+    let t = scalar_cs(&pointer_from_root_constants(), constants(2)).expect("translates");
+    assert!(t.needs_global, "the TbGlobal window table must be requested");
+    let h = &t.hlsl;
+    // the address is the SGPR pair, aligned down to a dword like the hardware does
+    assert!(h.contains("tb_gva(s4, s5, 0u, 0); ") && h.contains(".x &= 0xfffffffcu;"), "{h}");
+    assert!(h.contains("tb_gload("), "{h}");
+    // the root constant really is a value in the shader, not a symbol
+    assert!(h.contains("tb_rc0_1"), "{h}");
+    // and the window helpers are declared, with their fault record
+    assert!(h.contains("tb_gfault") && h.contains("uint tb_gmem_load("), "{h}");
+}
+
+#[test]
+fn multi_dword_scalar_load_reads_consecutive_dwords_at_the_immediate_offset() {
+    let words = [
+        S_MOV_S2_S0,
+        0xf404_0201, 0xfa00_0000, // s_load_dwordx2 s8, s2 [0x0]
+        S_WAITCNT,
+        0xf408_0304, 0xfa00_0010, // s_load_dwordx4 s12, s[8:9] [0x10]
+        S_WAITCNT,
+        S_ENDPGM,
+    ];
+    let t = scalar_cs(&words, constants(2)).expect("translates");
+    assert!(t.needs_global);
+    let h = &t.hlsl;
+    assert!(h.contains("tb_gva(s8, s9, 0u, 16)"), "base is the root-constant pair, offset the immediate: {h}");
+    for k in [4, 8, 12] {
+        assert!(h.contains(&format!(", {k}u, 0)")), "dword at +{k}: {h}");
+    }
+    for r in ["s12", "s13", "s14", "s15"] {
+        assert!(h.contains(&format!("{r} = g")), "{r} receives a loaded dword: {h}");
+    }
+}
+
+#[test]
+fn register_offset_of_a_scalar_load_is_added_to_the_address() {
+    let words = [
+        S_MOV_S2_S0,
+        0xf408_0201, 0xfa00_0000, // s_load_dwordx4 s8, s2 [0x0]  (four root constants)
+        S_WAITCNT,
+        0xf400_0104, 0x1600_0004, // s_load_dword s4, s[8:9], s11 [0x4]
+        S_WAITCNT,
+        S_ENDPGM,
+    ];
+    let t = scalar_cs(&words, constants(4)).expect("translates");
+    assert!(t.hlsl.contains("tb_gva(s8, s9, s11, 4)"), "{}", t.hlsl);
+}
+
+/// An address taken from a root *descriptor* is a buffer binding, not a number: the shader has
+/// no value for it, so reading memory through it would read address zero. Refuse, say why.
+#[test]
+fn address_from_a_root_descriptor_is_refused_not_read_as_zero() {
+    let err = scalar_cs(&pointer_from_root_constants(), uav_descriptor()).err().expect("must not translate");
+    assert!(err.contains("s_load") && err.contains("not a value the shader holds at run time"), "{err}");
+}
+
+/// A copy of the root-table pointer is still a table pointer (the table path reads root memory
+/// through it). An address *computed* from it is neither a table pointer nor a value the shader
+/// has: the pointer's numeric value is never materialised.
+#[test]
+fn address_computed_from_the_user_data_pointer_is_refused() {
+    let words = [
+        0x8004_9000, // s_add_u32 s4, s0, 16   (arithmetic on the root-table pointer)
+        0xbe85_0380, // s_mov_b32 s5, 0
+        0xf400_0102, 0xfa00_0000, // s_load_dword s4, s[4:5] [0x0]
+        S_WAITCNT,
+        S_ENDPGM,
+    ];
+    let err = scalar_cs(&words, constants(2)).err().expect("must not translate");
+    assert!(err.contains("not a value the shader holds at run time"), "{err}");
+}
+
+#[test]
+fn a_copy_of_the_user_data_pointer_is_still_a_root_table_read() {
+    let words = [
+        0xbe84_0300, // s_mov_b32 s4, s0
+        0xbe85_0381, // s_mov_b32 s5, 1
+        0xf400_0102, 0xfa00_0000, // s_load_dword s4, s[4:5] [0x0]: root-memory dword 0
+        S_WAITCNT,
+        S_ENDPGM,
+    ];
+    let t = scalar_cs(&words, constants(2)).expect("a table-pointer copy translates through the root table");
+    assert!(!t.needs_global, "this is not a global-memory read: {}", t.hlsl);
+}
+
+#[test]
+fn register_offset_from_a_user_pointer_is_refused() {
+    let words = [
+        S_MOV_S2_S0,
+        0xf408_0201, 0xfa00_0000, // s_load_dwordx4 s8, s2 [0x0]
+        S_WAITCNT,
+        0xf400_0104, 0x0000_0004, // s_load_dword s4, s[8:9], s0 [0x4]  (soffset = the user pointer)
+        S_WAITCNT,
+        S_ENDPGM,
+    ];
+    let err = scalar_cs(&words, constants(4)).err().expect("soffset is not a value");
+    assert!(err.contains("not a value the shader holds"), "{err}");
+}
+
+#[test]
+fn s_setreg_programs_a_mode_register_and_does_not_write_the_user_pointer() {
+    // The BVH builder's shaders open with two `s_setreg_imm32_b32`. The decoder reports the
+    // hardware-register id as the "destination"; id 0 once looked like a write to s0 and made the
+    // translator forget that s[0:1] is the root-table pointer, so every root-memory read after
+    // it was mistaken for something else.
+    let words = [
+        0xba80_f814, 0x0000_0000, // s_setreg_imm32_b32 hwreg(..), 0x0   (id field 0)
+        0xba80_f815, 0x0000_0400, // s_setreg_imm32_b32 hwreg(..), 0x400
+        S_MOV_S2_S0,
+        0xf408_0401, 0xfa00_0000, // s_load_dwordx4 s16, s2 [0x0]
+        S_WAITCNT,
+        0xbe94_0310,              // s_mov_b32 s20, s16
+        0x8815_ff11, 0x0001_0000, // s_or_b32 s21, s17, 0x10000
+        0xbe96_03c1,              // s_mov_b32 s22, -1
+        0xbe97_03ff, 0x1101_4fac, // s_mov_b32 s23, 0x11014fac
+        0xe030_106c, 0x8005_0303, // buffer_load_dword v3, v3, s[20:23], 0
+        S_WAITCNT,
+        S_ENDPGM,
+    ];
+    let t = scalar_cs(&words, srv_uav_constants()).expect("translates");
+    assert!(!t.needs_global, "{}", t.hlsl);
+}
+
+#[test]
+fn scalar_global_translation_is_deterministic() {
+    let first = scalar_cs(&pointer_from_root_constants(), constants(2)).expect("translates").hlsl;
+    for _ in 0..8 {
+        assert!(scalar_cs(&pointer_from_root_constants(), constants(2)).expect("translates").hlsl == first);
+    }
+}
+
+fn srv_uav_constants() -> RootSig {
+    RootSig {
+        version: 2,
+        flags: 0,
+        params: vec![
+            RootParam { visibility: 0, kind: RootParamKind::Descriptor { kind: 3, register: 0, space: 0 } },
+            RootParam { visibility: 0, kind: RootParamKind::Descriptor { kind: 4, register: 0, space: 0 } },
+            RootParam { visibility: 0, kind: RootParamKind::Constants { register: 0, space: 0, num32: 16 } },
+        ],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    }
+}
+
+/// A buffer descriptor built from the root SRV descriptor's address pair (what the BVH builder's
+/// shaders do): `s_load_dwordx4 s16, s2 [0]` loads {SRV lo, SRV hi, UAV lo, UAV hi}.
+#[test]
+fn buffer_descriptor_built_from_a_root_srv_descriptor_binds_the_srv() {
+    let words = [
+        S_MOV_S2_S0,
+        0xf408_0401, 0xfa00_0000, // s_load_dwordx4 s16, s2 [0x0]
+        S_WAITCNT,
+        0xbe94_0310,              // s_mov_b32 s20, s16
+        0x8815_ff11, 0x0001_0000, // s_or_b32 s21, s17, 0x10000
+        0xbe96_03c1,              // s_mov_b32 s22, -1
+        0xbe97_03ff, 0x1101_4fac, // s_mov_b32 s23, 0x11014fac
+        0xe030_106c, 0x8005_0303, // buffer_load_dword v3, v3, s[20:23], 0
+        S_WAITCNT,
+        S_ENDPGM,
+    ];
+    let t = scalar_cs(&words, srv_uav_constants()).expect("translates");
+    assert!(!t.needs_global, "{}", t.hlsl);
+}
+
+/// One `global_atomic_*` instruction with a 64-bit VGPR address pair (no SADDR).
+/// dword0 = FLAT(0x37) | op << 18 | seg(2 = global) << 14 | glc << 16 | offset;
+/// dword1 = addr | data << 8 | saddr(0x7d = off) << 16 | vdst << 24.
+fn global_atomic(op: u32, glc: bool, addr: u32, data: u32, vdst: u32, off: u32) -> [u32; 2] {
+    [0xdc00_0000 | (op << 18) | (2 << 14) | ((glc as u32) << 16) | (off & 0xfff), addr | (data << 8) | (0x7d << 16) | (vdst << 24)]
+}
+
+fn atomic_cs(ops: &[[u32; 2]]) -> Result<tombox_xshader::hlsl::Translated, String> {
+    let mut words: Vec<u32> = ops.iter().flatten().copied().collect();
+    words.push(S_WAITCNT);
+    words.push(S_ENDPGM);
+    scalar_cs(&words, constants(2))
+}
+
+fn dxil_of(t: &tombox_xshader::hlsl::Translated) -> Vec<u8> {
+    tombox_xshader::dxc::compile(&t.hlsl, &tombox_xshader::dxc::profile_for(t.profile)).unwrap_or_else(|e| panic!("DXC rejected the translation: {e}\n{}", t.hlsl))
+}
+
+const GOP_FMIN: u32 = 0x3f;
+const GOP_FMAX: u32 = 0x40;
+
+/// What the bounding-box builder does: float min/max of a value into a window dword, result unused.
+#[test]
+fn global_float_min_and_max_atomics_lower_to_a_compare_and_swap_on_the_window() {
+    let t = atomic_cs(&[global_atomic(GOP_FMIN, false, 3, 5, 0, 0), global_atomic(GOP_FMAX, false, 3, 5, 0, 20)]).expect("translates");
+    assert!(t.needs_global);
+    let h = &t.hlsl;
+    assert!(h.contains("uint tb_gatom(uint2 va, uint op, uint v, uint c)"), "{h}");
+    assert!(h.contains("tb_gatom(g0, 15u, v5, 0u)") && h.contains("tb_gatom(g1, 16u, v5, 0u)"), "{h}");
+    // address = the VGPR pair at the instruction's offset
+    assert!(h.contains("tb_gva(v3, v4, 0u, 0)") && h.contains("tb_gva(v3, v4, 0u, 20)"), "{h}");
+    // GLC clear: the old value is not written back to a register
+    assert!(!h.contains("TB_WV(g0_old") && !h.contains("v0 = g0_old") && !h.contains("TB_WV(g1_old") && !h.contains("v0 = g1_old"), "{h}");
+    dxil_of(&t);
+}
+
+/// `global_atomic_add v6, v[6:7], v8, off:12 glc` then `..._sub`: both return the old value.
+#[test]
+fn global_atomic_with_glc_returns_the_previous_value() {
+    let t = atomic_cs(&[global_atomic(0x32, true, 6, 8, 6, 12), global_atomic(0x33, true, 6, 8, 6, 12)]).expect("translates");
+    let h = &t.hlsl;
+    assert!(h.contains("tb_gatom(g0, 2u, v8, 0u)") && h.contains("tb_gatom(g1, 3u, v8, 0u)"), "{h}");
+    assert!(h.contains("TB_WV(g0_old, v6)") || h.contains("v6 = g0_old"), "{h}");
+    assert!(h.contains("TB_WV(g1_old, v6)") || h.contains("v6 = g1_old"), "{h}");
+    dxil_of(&t);
+}
+
+#[test]
+fn global_compare_and_swap_passes_both_data_dwords() {
+    let t = atomic_cs(&[global_atomic(0x31, true, 2, 10, 12, 0), global_atomic(0x3e, true, 2, 10, 13, 4)]).expect("translates");
+    let h = &t.hlsl;
+    assert!(h.contains("tb_gatom(g0, 1u, v10, v11)"), "new value v10, compare v11: {h}");
+    assert!(h.contains("tb_gatom(g1, 14u, v10, v11)"), "{h}");
+    dxil_of(&t);
+}
+
+#[test]
+fn every_32_bit_global_atomic_gets_its_own_operation_and_compiles() {
+    let table: [(u32, &str); 16] = [
+        (0x30, "0u"), (0x31, "1u"), (0x32, "2u"), (0x33, "3u"), (0x35, "5u"), (0x36, "6u"), (0x37, "7u"), (0x38, "8u"),
+        (0x39, "9u"), (0x3a, "10u"), (0x3b, "11u"), (0x3c, "12u"), (0x3d, "13u"), (0x3e, "14u"), (0x3f, "15u"), (0x40, "16u"),
+    ];
+    for (op, num) in table {
+        let t = atomic_cs(&[global_atomic(op, true, 3, 5, 7, 0)]).unwrap_or_else(|e| panic!("op {op:#x}: {e}"));
+        assert!(t.hlsl.contains(&format!("tb_gatom(g0, {num}, v5,")), "op {op:#x}: {}", t.hlsl);
+        dxil_of(&t);
+    }
+}
+
+#[test]
+fn unmodelled_global_atomics_are_refused_with_a_reason() {
+    // 64-bit forms need Int64 atomics on the window buffers; csub's rule is not modelled.
+    for (op, why) in [(0x52u32, "64-bit"), (0x5f, "64-bit"), (0x34, "not modelled")] {
+        let err = atomic_cs(&[global_atomic(op, true, 3, 5, 7, 0)]).err().unwrap_or_else(|| panic!("op {op:#x} must not translate"));
+        assert!(err.contains(why) || err.contains("not lowered"), "{err}");
+    }
+    // scratch segment
+    let mut scratch = global_atomic(0x32, true, 3, 5, 7, 0);
+    scratch[0] = (scratch[0] & !(3 << 14)) | (1 << 14);
+    let err = atomic_cs(&[scratch]).err().expect("scratch atomics are refused");
+    assert!(err.contains("scratch"), "{err}");
+}
+
+#[test]
+fn atomic_helpers_are_only_present_when_an_atomic_is() {
+    let plain = [0xdc30_8000u32, 0x037d_0004, S_WAITCNT, S_ENDPGM]; // global_load_dword v3, v[4:5], off
+    let t = scalar_cs(&plain, constants(2)).expect("translates");
+    assert!(t.needs_global && !t.hlsl.contains("tb_gatom"), "{}", t.hlsl);
+    let t = atomic_cs(&[global_atomic(0x32, false, 4, 5, 0, 0)]).expect("translates");
+    assert!(t.hlsl.contains("tb_gatom_on"), "{}", t.hlsl);
+}
+
+#[test]
+fn global_atomic_translation_is_deterministic() {
+    let build = || atomic_cs(&[global_atomic(GOP_FMIN, false, 3, 5, 0, 0), global_atomic(0x32, true, 6, 8, 6, 12)]).expect("translates").hlsl;
+    let first = build();
+    for _ in 0..8 {
+        assert!(build() == first);
+    }
+}
+
+/// The scalar-memory lowering must also be valid DXIL, not just plausible HLSL.
+#[test]
+fn scalar_global_loads_compile_to_dxil() {
+    dxil_of(&scalar_cs(&pointer_from_root_constants(), constants(2)).expect("translates"));
+}

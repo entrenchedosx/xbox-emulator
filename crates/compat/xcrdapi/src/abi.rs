@@ -13,10 +13,13 @@ pub const IID_IUNKNOWN: Iid = iid(0x0000_0000, 0x0000, 0x0000, [0xc0, 0, 0, 0, 0
 pub const IID_FACTORY_X: Iid = iid(0xfb3b_54ac, 0xbf82, 0x463a, [0xb7, 0x77, 0x73, 0x19, 0x58, 0x37, 0x86, 0x4d]);
 /// The interface the retail GTA VI build asks DStorageGetFactory for (its call site
 /// loads this GUID from .rdata). The GDK documents DStorageGetFactory as returning
-/// IDStorageFactoryX2, whose reported method set is X's plus CreateQueue1; that is
-/// why this is served by the same object, whose slots 9..15 trap when called.
+/// IDStorageFactoryX2 (X, then X1's GetStats at slot 9, then X2's CreateQueue1 at slot 10);
+/// that is why this is served by the same object. Slot 9 and slots 11..15 trap when called.
 /// The GUID value itself is read from the title, not from a header we hold.
 pub const IID_FACTORY_X2: Iid = iid(0x6295_9d11, 0xd45f, 0x4884, [0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae]);
+/// What the retail title passes to `IDStorageFactoryX2::CreateQueue1` (read from its .rdata, next to the status-array
+/// IID it passes to CreateStatusArray): the GDK's `IDStorageQueueX2`, `IDStorageQueueX1` plus `Query1`.
+pub const IID_QUEUE_X2: Iid = iid(0x3c02_cb0c, 0xc050, 0x4195, [0x99, 0xa1, 0xa1, 0xce, 0x94, 0xba, 0x33, 0xc5]);
 pub const IID_FILE_X: Iid = iid(0x4370_4f9f, 0x27c6, 0x4a9f, [0x88, 0x15, 0xd1, 0x65, 0x27, 0x89, 0x4d, 0xf4]);
 pub const IID_QUEUE_X: Iid = iid(0xa3f6_649a, 0x8c2c, 0x4b3a, [0x8b, 0x6e, 0x10, 0x18, 0x6a, 0x04, 0xb9, 0xbc]);
 pub const IID_STATUS_ARRAY_X: Iid = iid(0xcd66_d752, 0x2786, 0x44f7, [0x90, 0x70, 0xe2, 0xa6, 0xfd, 0xad, 0x3f, 0x1b]);
@@ -75,6 +78,12 @@ pub const PRIORITY_REALTIME: i8 = 2;
 
 pub const XREQUEST_SIZE: usize = 0x48;
 pub const XQUEUE_DESC_SIZE: usize = 0x18;
+/// DSTORAGE_QUEUE_DESC1: the 0x18-byte DSTORAGE_QUEUE_DESC and a 64-bit DSTORAGE_QUEUE_OPTIONS.
+pub const XQUEUE_DESC1_SIZE: usize = 0x20;
+/// DSTORAGE_QUEUE_INFO1: DSTORAGE_QUEUE_DESC1, then UINT16 EmptySlotCount and UINT16 RequestCountUntilAutoSubmit.
+pub const XQUEUE_INFO1_SIZE: usize = 0x24;
+/// DSTORAGE_QUEUE_OPTIONS.AutoSubmitDisabled (bit 0); bits 1..63 are reserved and must be zero.
+pub const OPT_QUEUE_AUTO_SUBMIT_DISABLED: u64 = 1;
 pub const XQUEUE_INFO_SIZE: usize = 0x1c;
 pub const XERROR_RECORD_SIZE: usize = 0x290;
 pub const XERR_FILENAME_OFF: usize = 0x24;

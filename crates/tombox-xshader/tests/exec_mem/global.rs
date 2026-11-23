@@ -180,8 +180,17 @@ fn global_routing_and_refusals() {
     w.push(S_ENDPGM);
     let e = translate(&cs_extract(&w, 64)).err().unwrap_or_default();
     assert!(e.contains("scratch"), "{e}");
+    for (op, mnemonic, why) in [(0x52, "flat_atomic_add_x2", "64-bit"), (0x34, "flat_atomic_csub", "not modelled")] {
+        let mut p = Prog::new();
+        p.raw(&g(op, 2, 0, 1, 2, 20, 3));
+        let mut w = p.w.clone();
+        w.push(S_ENDPGM);
+        let e = translate(&cs_extract(&w, 64)).err().expect("unsupported atomic must be refused");
+        assert!(e.contains(mnemonic) && e.contains("not lowered") && e.contains(why), "{e}");
+    }
+    // an opcode that is not in the table at all is still reported as unsupported
     let mut p = Prog::new();
-    p.raw(&g(0x30, 2, 0, 1, 2, 20, 3));
+    p.raw(&g(0x45, 2, 0, 1, 2, 20, 3));
     let mut w = p.w.clone();
     w.push(S_ENDPGM);
     let e = translate(&cs_extract(&w, 64)).err().unwrap_or_default();
@@ -352,4 +361,154 @@ fn narrow_loads_at_window_end() {
         assert!(lane_values.iter().all(|&actual| actual == value));
     }
     assert_eq!(fault_of(&fault).count, 0);
+}
+
+/// `global_atomic_*` with the GLC bit as asked.
+fn ga(op: u32, glc: bool, off: i32, addr: u32, data: u32, saddr: u32, vdst: u32) -> [u32; 2] {
+    let mut w = g(op, 2, off, addr, data, saddr, vdst);
+    w[0] |= (glc as u32) << 16;
+    w
+}
+
+/// 64 lanes hit the same dwords with every 32-bit global atomic; the results are checked against
+/// what a serial execution in *some* order must give. The point is the atomicity: a lost update
+/// shows up as a wrong total, a wrong operation as a wrong value.
+fn atomic_prog() -> Vec<u32> {
+    let mut p = Prog::new();
+    p.sv(20, W0.base as u32).sv(21, (W0.base >> 32) as u32);
+    p.sv(22, W1.base as u32).sv(23, (W1.base >> 32) as u32);
+    p.raw(&[vop2(0x1a, 1, ic(2), 0)]); // v1 = t << 2
+    p.raw(&[vop2(0x25, 2, ic(1), 0)]); // v2 = t + 1
+    p.raw(&[vop1(1, 3, ic(0))]); // v3 = 0: every lane addresses the same dword
+    p.raw(&[vop2(0x25, 6, LIT, 0), 100]); // v6 = t + 100 (new value of the compare-and-swap)
+    p.raw(&[vop1(1, 7, ic(0))]); // v7 = 0 (its compare value)
+    for k in 0..4 {
+        p.raw(&[vop2(0x0b, 10 + k, LIT, 0), 0x2f5b3, vop2(0x1d, 10 + k, LIT, 10 + k), KD[k as usize]]);
+    }
+    p.raw(&[vop2(0x27, 15, LIT, 0), 20]); // v15 = t - 20
+    p.raw(&[vop1(5, 14, v(15))]); // v14 = float(t - 20)
+    p.raw(&[vop1(6, 16, v(2))]); // v16 = float(t + 1)
+    p.vv(17, 0x8000_0000); // v17 = -0.0 (compare value of the float compare-and-swap)
+    p.vv(19, 40); // bound of inc / dec
+    // window 0, all lanes on one dword each
+    p.raw(&ga(0x32, true, 0x100, 3, 2, 20, 4)); // add, returns the old value
+    p.raw(&ga(0x33, false, 0x104, 3, 2, 20, 0)); // sub
+    p.raw(&ga(0x30, true, 0x108, 3, 2, 20, 5)); // swap
+    p.raw(&ga(0x31, true, 0x10c, 3, 6, 20, 8)); // cmpswap {new v6, cmp v7}
+    p.raw(&ga(0x3c, false, 0x110, 3, 19, 20, 0)); // inc, bound 40
+    p.raw(&ga(0x3d, false, 0x114, 3, 19, 20, 0)); // dec, bound 40
+    p.raw(&ga(0x3f, false, 0x118, 3, 14, 20, 0)); // fmin
+    p.raw(&ga(0x40, false, 0x11c, 3, 14, 20, 0)); // fmax
+    p.raw(&ga(0x3e, true, 0x120, 3, 16, 20, 9)); // fcmpswap {new v16, cmp v17}
+    // window 1 (initial contents m1(k))
+    p.raw(&ga(0x36, false, 4, 3, 10, 22, 0)); // umin
+    p.raw(&ga(0x38, false, 8, 3, 11, 22, 0)); // umax
+    p.raw(&ga(0x35, false, 12, 3, 12, 22, 0)); // smin
+    p.raw(&ga(0x37, false, 16, 3, 13, 22, 0)); // smax
+    p.raw(&ga(0x39, false, 20, 3, 10, 22, 0)); // and
+    p.raw(&ga(0x3a, false, 24, 3, 11, 22, 0)); // or
+    p.raw(&ga(0x3b, false, 28, 3, 12, 22, 0)); // xor
+    // the returned values, one array per instruction
+    for (off, reg) in [(0x200, 4), (0x300, 5), (0x400, 8), (0x500, 9)] {
+        p.raw(&g(0x1c, 2, off, 1, reg, 20, 0));
+    }
+    let mut w = p.w;
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn global_atomics_are_atomic_and_correct_on_a_device() {
+    let (w0, w1, fault, hlsl) = unsafe { run(&atomic_prog()) }.unwrap_or_else(|e| panic!("{e}"));
+    let bad: std::cell::RefCell<Vec<String>> = Default::default();
+    let chk = |what: &str, got: u32, want: u32| {
+        if got != want {
+            bad.borrow_mut().push(format!("{what}: {got:#010x} want {want:#010x}"));
+        }
+    };
+    let ret = |j: usize, t: usize| w0[128 + 64 * j + t];
+    // add: the total, and the returns are exactly the running sums of one serial order
+    chk("add total", w0[64], 64 * 65 / 2);
+    let mut by_ret: Vec<(u32, u32)> = (0..64).map(|t| (ret(0, t as usize), t + 1)).collect();
+    by_ret.sort();
+    let mut run_sum = 0u32;
+    for (r, add) in &by_ret {
+        chk("add returns the running sum", *r, run_sum);
+        run_sum += add;
+    }
+    chk("sub total", w0[65], 0u32.wrapping_sub(64 * 65 / 2));
+    // swap: the 64 returns plus the final value are the initial 0 and every lane's value, once each
+    let mut seen: Vec<u32> = (0..64).map(|t| ret(1, t)).collect();
+    seen.push(w0[66]);
+    seen.sort();
+    if !seen.iter().copied().eq(0..=64) {
+        bad.borrow_mut().push(format!("swap: expected the values 0 through 64, got {seen:?}"));
+    }
+    // compare-and-swap: exactly one lane wins, everyone else sees the winner's value
+    let winner = w0[67];
+    if !(100..164).contains(&winner) {
+        bad.borrow_mut().push(format!("cmpswap final {winner:#x} is not one lane's value"));
+    }
+    chk("cmpswap winners", (0..64).filter(|&t| ret(2, t) == 0).count() as u32, 1);
+    chk("cmpswap others see the winner", (0..64).filter(|&t| ret(2, t) == winner).count() as u32, 63);
+    // inc / dec wrap at the bound: 64 steps from 0 with bound 40 (period 41)
+    chk("inc", w0[68], 64 % 41);
+    chk("dec", w0[69], (40u32 + 41 * 2 - 63) % 41);
+    // float min / max against the initial 0.0
+    chk("fmin", w0[70], (-20.0f32).to_bits());
+    chk("fmax", w0[71], 43.0f32.to_bits());
+    // float compare-and-swap: -0.0 == +0.0, so exactly one lane wins
+    let fwin = f32::from_bits(w0[72]);
+    if !(1.0..=64.0).contains(&fwin) || fwin.fract() != 0.0 {
+        bad.borrow_mut().push(format!("fcmpswap final {fwin} is not one lane's value"));
+    }
+    chk("fcmpswap winners", (0..64).filter(|&t| ret(3, t) == 0).count() as u32, 1);
+    chk("fcmpswap others see the winner", (0..64).filter(|&t| ret(3, t) == w0[72]).count() as u32, 63);
+    // bitwise and min/max against window 1's initial contents
+    let d = |k: u32| (0..64u32).map(move |t| dval(t, k));
+    chk("umin", w1[1], d(0).fold(m1(1), u32::min));
+    chk("umax", w1[2], d(1).fold(m1(2), u32::max));
+    chk("smin", w1[3], d(2).fold(m1(3) as i32, |a, x| a.min(x as i32)) as u32);
+    chk("smax", w1[4], d(3).fold(m1(4) as i32, |a, x| a.max(x as i32)) as u32);
+    chk("and", w1[5], d(0).fold(m1(5), |a, x| a & x));
+    chk("or", w1[6], d(1).fold(m1(6), |a, x| a | x));
+    chk("xor", w1[7], d(2).fold(m1(7), |a, x| a ^ x));
+    for (k, &x) in w1.iter().enumerate() {
+        if !(1..=7).contains(&k) {
+            chk(&format!("window1[{k}] untouched"), x, m1(k));
+        }
+    }
+    chk("fault count", fault_of(&fault).count, 0);
+    let bad = bad.into_inner();
+    assert!(bad.is_empty(), "{}\n{hlsl}", bad.join("\n"));
+}
+
+/// An atomic whose address is outside every window, or not dword aligned, touches nothing: it is
+/// counted in the fault record (which the binder logs) and returns 0.
+#[test]
+fn global_atomics_outside_a_window_or_misaligned_fault_without_touching_memory() {
+    let mut p = Prog::new();
+    p.sv(20, W0.base as u32).sv(21, (W0.base >> 32) as u32);
+    p.sv(24, MISS as u32).sv(25, (MISS >> 32) as u32);
+    p.raw(&[vop2(0x1a, 1, ic(2), 0)]); // v1 = t << 2
+    p.raw(&[vop1(1, 2, ic(1))]); // v2 = 1
+    p.raw(&[vop1(1, 3, ic(0))]); // v3 = 0
+    p.raw(&[vop1(1, 4, ic(2))]); // v4 = 2: a misaligned byte offset
+    p.vv(5, 0xdead_beef).vv(6, 0xdead_beef);
+    p.raw(&ga(0x32, true, 0, 3, 2, 24, 5)); // outside every window
+    p.raw(&ga(0x32, true, 0x100, 4, 2, 20, 6)); // inside window 0, but at +2
+    p.raw(&g(0x1c, 2, 0x200, 1, 5, 20, 0));
+    p.raw(&g(0x1c, 2, 0x300, 1, 6, 20, 0));
+    let mut w = p.w;
+    w.push(S_ENDPGM);
+    let (w0, w1, fault, hlsl) = unsafe { run(&w) }.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(fault_of(&fault).count, 128, "{hlsl}");
+    assert!(w0[64..70].iter().all(|&x| x == 0), "memory around the misaligned target changed: {:x?}", &w0[64..70]);
+    for t in 0..64 {
+        assert_eq!(w0[128 + t], 0, "lane {t}: the returned value of a faulting atomic is 0");
+        assert_eq!(w0[192 + t], 0, "lane {t}: misaligned");
+    }
+    for (k, &x) in w1.iter().enumerate() {
+        assert_eq!(x, m1(k));
+    }
 }

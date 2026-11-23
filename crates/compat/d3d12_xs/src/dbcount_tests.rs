@@ -517,6 +517,12 @@ fn strip_uav_writes_refuses_what_it_cannot_reproduce() {
 fn translated_pixel_shaders_with_uavs_keep_their_source() {
     let uav = tombox_xshader::dxc::compile("RWByteAddressBuffer u : register(u1); float4 main(float4 p : SV_Position) : SV_Target { u.Store(0, 1); return 1; }", "ps_6_0").expect("dxc");
     let plain = tombox_xshader::dxc::compile("float4 main() : SV_Target { return 1; }", "ps_6_0").expect("dxc");
+    // The allocator may reuse an earlier blob's address. Clear only these entries so each
+    // assertion observes what this test recorded.
+    if let Some(m) = PS_SRC.lock().unwrap().as_mut() {
+        m.remove(&(plain.as_ptr() as usize));
+        m.remove(&(uav.as_ptr() as usize));
+    }
     note_translated(&plain, b"blob", 1, &[0; 8]);
     note_translated(&uav, b"blob", 2, &[0; 8]);
     let m = PS_SRC.lock().unwrap();
