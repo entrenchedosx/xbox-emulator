@@ -3,7 +3,7 @@ use crate::request::{execute_with_intermediate, validate, Source, XRequest};
 use crate::{log, log_fatal};
 use core::ffi::c_void;
 use std::fs::File;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -624,7 +624,7 @@ pub enum Entry {
     Status { array: Arc<StatusInner>, index: u32 },
     Signal { fence: Option<PcFence>, raw: u64, value: u64 },
     /// IDStorageQueueX1::EnqueueSetEvent: a private duplicate of the title's event handle (or why none could be made).
-    SetEvent { handle: Result<isize, i32>, raw: u64 },
+    SetEvent { handle: Result<OwnedHandle, i32>, raw: u64 },
 }
 
 #[derive(Clone, Default)]
@@ -832,8 +832,7 @@ impl QueueInner {
             }
             Entry::SetEvent { handle, raw } => match handle {
                 Ok(h) => {
-                    let hr = if unsafe { SetEvent(h) } != 0 { S_OK } else { hresult_from_win32(unsafe { GetLastError() }) };
-                    unsafe { CloseHandle(h) };
+                    let hr = if unsafe { SetEvent(h.as_raw_handle() as isize) } != 0 { S_OK } else { hresult_from_win32(unsafe { GetLastError() }) };
                     if hr < 0 {
                         report("IDStorageQueueX1::EnqueueSetEvent", hr, &format!("SetEvent({raw:#x}) failed"));
                         // The runtime has no documented error-record command type for SetEvent; the signal type is the closest.
@@ -887,10 +886,10 @@ impl QueueInner {
     }
 
     pub fn enqueue(&self, e: Entry) -> Result<(), Entry> {
+        let mut st = self.state.lock().unwrap();
         if self.closed.load(Ordering::Acquire) {
             return Err(e);
         }
-        let mut st = self.state.lock().unwrap();
         if !self.auto_submit {
             // Nothing submits this queue but its owner: a full queue (one slot is always reserved to tell
             // full from empty) stalls the enqueuing thread until another thread calls Submit.
@@ -925,10 +924,10 @@ impl QueueInner {
     }
 
     pub fn submit(&self) -> bool {
+        let mut st = self.state.lock().unwrap();
         if self.closed.load(Ordering::Acquire) {
             return false;
         }
-        let mut st = self.state.lock().unwrap();
         crate::stats::on_flush(self as *const _ as usize, st.pending.len(), true, self.priority);
         Self::flush(&mut st);
         drop(st);
@@ -1323,14 +1322,15 @@ unsafe extern "system" fn queue_enqueue_set_event(this: *mut c_void, handle: isi
         report("IDStorageQueueX1::EnqueueSetEvent", E_DSTORAGE_QUEUE_CLOSED, &format!("queue '{}'", q.name));
         return;
     }
-    let dup = if handle == 0 || handle == -1 { Err(E_INVALIDARG) } else { dup_handle(handle) };
-    if let Err(hr) = dup {
-        report("IDStorageQueueX1::EnqueueSetEvent", hr, &format!("event handle {handle:#x} cannot be duplicated; the failure is recorded in the queue's error record"));
+    let dup = if handle == 0 || handle == -1 {
+        Err(E_INVALIDARG)
+    } else {
+        dup_handle(handle).map(|h| unsafe { OwnedHandle::from_raw_handle(h as *mut c_void) })
+    };
+    if let Err(hr) = &dup {
+        report("IDStorageQueueX1::EnqueueSetEvent", *hr, &format!("event handle {handle:#x} cannot be duplicated; the failure is recorded in the queue's error record"));
     }
     if q.enqueue(Entry::SetEvent { handle: dup, raw: handle as u64 }).is_err() {
-        if let Ok(h) = dup {
-            unsafe { CloseHandle(h) };
-        }
         report("IDStorageQueueX1::EnqueueSetEvent", E_DSTORAGE_QUEUE_CLOSED, &format!("queue '{}'", q.name));
     }
 }
