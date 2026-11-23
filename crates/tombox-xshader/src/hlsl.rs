@@ -882,7 +882,7 @@ fn lower_wave_reductions(insns: &mut [Insn]) -> Result<(), String> {
             continue 'red;
         }
         let res = match insns[last].dst.first() {
-            Some(Opnd::Vgpr(n)) | Some(Opnd::Sgpr(n)) => *n,
+            Some(Opnd::Sgpr(n)) => *n,
             _ => { at = first + 1; continue 'red; },
         };
         // Rewrite.
@@ -1117,9 +1117,8 @@ fn lower_lane_spills(insns: &mut [Insn]) -> Result<(), String> {
             ins.dst = vec![slot];
             ins.src = vec![value];
         } else {
-            // The destination field of v_readlane names an SGPR (decoded generically as a VGPR).
             let d = match ins.dst.first() {
-                Some(Opnd::Vgpr(n)) | Some(Opnd::Sgpr(n)) => *n,
+                Some(Opnd::Sgpr(n)) => *n,
                 other => return Err(format!("v_readlane at {at:#x}: unexpected destination {other:?}")),
             };
             let Some(Opnd::Vgpr(v)) = ins.src.first().cloned() else {
@@ -1139,8 +1138,7 @@ fn lower_lane_spills(insns: &mut [Insn]) -> Result<(), String> {
         if ins.mnemonic == "v_nop" {
             continue; // the two header words at the start of every program decode as v_nop
         }
-        let general_read = ins.enc == Enc::Vop3 && ins.op == READLANE;
-        for o in ins.dst.iter().skip(general_read as usize).chain(ins.src.iter()) {
+        for o in ins.dst.iter().chain(ins.src.iter()) {
             if let Opnd::Vgpr(v) = o {
                 if spill_vregs.contains(v) {
                     return Err(format!("v{v} is used both as a lane spill area and as a vector at {:#x}", ins.offset));
@@ -4584,15 +4582,8 @@ impl<'a> Emitter<'a> {
             let t = self.tmp;
             self.tmp += 1;
             if m == "v_readlane_b32" {
-                let sd = match d {
-                    Opnd::Vgpr(n) | Opnd::Sgpr(n) if n <= 105 => Opnd::Sgpr(n),
-                    Opnd::Vgpr(106) | Opnd::VccLo => Opnd::VccLo,
-                    Opnd::Vgpr(126) | Opnd::ExecLo => Opnd::ExecLo,
-                    Opnd::Vgpr(124) | Opnd::Null => return Ok(()),
-                    other => return Err(format!("v_readlane: destination {other:?} unsupported")),
-                };
                 self.line(&format!("uint t{t} = WaveReadLaneAt({}, {});", r(&s[0])?, self.guest_lane(&lane)));
-                return self.ws(&sd, &format!("t{t}"));
+                return self.ws(&d, &format!("t{t}"));
             }
             self.touch(&d);
             let dn = name(&d)?;

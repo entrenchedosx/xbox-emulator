@@ -157,6 +157,15 @@ impl Emitter<'_> {
 
     pub(super) fn sgpr_dead_after(&self, idx: usize, r: u32) -> bool {
         let reads = |ins: &Insn| {
+            if ins.enc == Enc::Vop3 && matches!(ins.mnemonic.as_str(), "v_cndmask_b32" | "v_readlane_b32" | "v_writelane_b32") {
+                return ins.src.iter().enumerate().any(|(i, o)| match o {
+                    Opnd::Sgpr(n) => {
+                        let width = 1 + u32::from(i == 2 && self.wave64);
+                        (*n as u32..*n as u32 + width).contains(&r)
+                    }
+                    _ => false,
+                });
+            }
             let span = match ins.enc {
                 Enc::Smem | Enc::Mubuf | Enc::Mtbuf => 4,
                 Enc::Mimg => 8,
