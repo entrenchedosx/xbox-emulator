@@ -258,6 +258,26 @@ fn chain_len(shim: *mut c_void) -> usize {
 
 #[test]
 #[ignore = "requires a D3D12 device or WARP"]
+fn hw_scarlett_queue_submit_executes_wrapped_lists() {
+    let g = gpu();
+    unsafe {
+        let out = buffer(g.dev, HEAP_READBACK, 256, 0, ST_COPY_DEST);
+        let lists = [title_list(g.dev), title_list(g.dev)];
+        for (i, list) in lists.into_iter().enumerate() {
+            call!(list, crate::cl_ext::CL_WRITE32_BOTTOM_OF_PIPE, (u64, u32, u32, u32) -> (), out.va + 4 * i as u64, (i + 1) as u32, 0, 0);
+            assert!(call!(list, X_CLOSE, () -> i32) >= 0);
+        }
+        let queue = g.a as *mut c_void;
+        assert_eq!(crate::present::scarlett_queue_submit(queue, lists.len() as u32, lists.as_ptr(), 7, 0), 0);
+        let done = fence(g.dev);
+        assert_eq!(call!(queue, 14, (*mut c_void, u64) -> i32, done, 1), 0);
+        assert!(reached(done, 1, Duration::from_secs(5)));
+        assert_eq!((rd(&out, 0), rd(&out, 4)), (1, 2));
+    }
+}
+
+#[test]
+#[ignore = "requires a D3D12 device or WARP"]
 fn hw_scarlett_memory_slots_write_and_wait() {
     use crate::cl_ext::{SCARLETT_WAIT64, SCARLETT_WRITE32_BOTTOM_OF_PIPE, SCARLETT_WRITE64_BOTTOM_OF_PIPE};
     use core::sync::atomic::{AtomicUsize, Ordering};
