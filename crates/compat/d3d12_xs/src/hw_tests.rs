@@ -149,6 +149,20 @@ fn queue_slot18_preserves_the_title_callers_eight_byte_output() {
     assert_eq!(routed, pc_desc);
 }
 
+#[test]
+fn queue_slot16_signals_the_title_fence() {
+    let g = gpu();
+    unsafe {
+        let f = fence(g.dev);
+        let vtable = *(f as *const usize);
+        let value = 0x1_0000_0042;
+        assert_eq!(crate::present::call_scarlett_slot16_signal(g.a as *mut c_void, f, value), 0);
+        assert_eq!(*(f as *const usize), vtable);
+        assert!(reached(f, value, Duration::from_secs(5)));
+        call!(f, 2, () -> u32);
+    }
+}
+
 struct Buf {
     res: usize,
     va: u64,

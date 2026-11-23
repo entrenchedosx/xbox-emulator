@@ -1005,7 +1005,9 @@ pub fn real_queue_slot(i: usize) -> usize {
 }
 
 const SCARLETT_QUEUE_FREQUENCY_RETURN: usize = 0x24841ac;
+const SCARLETT_QUEUE_SIGNAL_RETURN: usize = 0x248260e;
 static QUEUE_SLOT18_FREQUENCY_CALLER: AtomicUsize = AtomicUsize::new(0);
+static QUEUE_SLOT16_SIGNAL_CALLER: AtomicUsize = AtomicUsize::new(0);
 
 /// The Scarlett title calls queue slot 18 with a UINT64 output and uses the
 /// result as the timestamp frequency. A PC GetDesc writes 16 bytes there and
@@ -1037,6 +1039,43 @@ pub(crate) unsafe extern "system" fn call_scarlett_slot18_frequency(_queue: *mut
         "add rsp, 0x28",
         "ret",
         caller = sym QUEUE_SLOT18_FREQUENCY_CALLER, slot = sym scarlett_queue_slot18,
+    );
+}
+
+unsafe extern "system" fn scarlett_queue_signal(queue: *mut c_void, fence: *mut c_void, value: u64) -> i32 {
+    let real = crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed));
+    let signal: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> i32 = unsafe { core::mem::transmute(real) };
+    unsafe { signal(queue, fence, value) }
+}
+
+#[unsafe(naked)]
+unsafe extern "system" fn scarlett_queue_slot16() {
+    // The title's submission thread signals the fence and publishes the
+    // corresponding value to a waiter. Its fence pointer is not a frequency
+    // output parameter.
+    core::arch::naked_asm!(
+        "mov rax, [rsp]",
+        "cmp rax, [rip + {caller}]",
+        "je 2f",
+        "jmp {frequency}",
+        "2:",
+        "jmp {signal}",
+        caller = sym QUEUE_SLOT16_SIGNAL_CALLER, frequency = sym q_freq_dispatch, signal = sym scarlett_queue_signal,
+    );
+}
+
+#[cfg(test)]
+#[unsafe(naked)]
+pub(crate) unsafe extern "system" fn call_scarlett_slot16_signal(_queue: *mut c_void, _fence: *mut c_void, _value: u64) -> i32 {
+    core::arch::naked_asm!(
+        "sub rsp, 0x28",
+        "lea rax, [rip + 2f]",
+        "mov [rip + {caller}], rax",
+        "call {slot}",
+        "2:",
+        "add rsp, 0x28",
+        "ret",
+        caller = sym QUEUE_SLOT16_SIGNAL_CALLER, slot = sym scarlett_queue_slot16,
     );
 }
 
@@ -1116,10 +1155,10 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
             let size = core::ptr::read_unaligned((base + e_lfanew + 0x50) as *const u32) as usize;
             EXE_BASE.store(base, Ordering::Relaxed);
             EXE_SIZE.store(size, Ordering::Relaxed);
-            if SCARLETT_QUEUE_FREQUENCY_RETURN < size && std::env::current_exe().is_ok_and(|exe| {
-                exe.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.eq_ignore_ascii_case("game_scarlett_master.exe"))
-            }) {
+            if SCARLETT_QUEUE_FREQUENCY_RETURN < size && crate::shader_xlat::title_name_pub().eq_ignore_ascii_case("game_scarlett_master") {
                 QUEUE_SLOT18_FREQUENCY_CALLER.store(base + SCARLETT_QUEUE_FREQUENCY_RETURN, Ordering::Relaxed);
+                QUEUE_SLOT16_SIGNAL_CALLER.store(base + SCARLETT_QUEUE_SIGNAL_RETURN, Ordering::Relaxed);
+                QUEUE_VT[16].store(scarlett_queue_slot16 as *const () as usize, Ordering::Relaxed);
                 QUEUE_VT[18].store(scarlett_queue_slot18 as *const () as usize, Ordering::Relaxed);
             }
             record("d3d12_xs", "queue.vtable", "built extended queue vtable (title slot 30 = PresentX; caller-dispatched)");
