@@ -427,7 +427,8 @@ pub fn dxbc_offsets(b: &[u8]) -> Vec<usize> {
 }
 
 fn dump_native_parts(kind: &str, parts: &[&[u8]]) {
-    static N: AtomicUsize = AtomicUsize::new(0);
+    static GFX_DUMPS: AtomicUsize = AtomicUsize::new(0);
+    static COMPUTE_DUMPS: AtomicUsize = AtomicUsize::new(0);
     static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
     if cfg!(test) {
         return;
@@ -436,10 +437,13 @@ fn dump_native_parts(kind: &str, parts: &[&[u8]]) {
     if !SEEN.get_or_init(|| Mutex::new(HashSet::new())).lock().unwrap_or_else(|e| e.into_inner()).insert(key) {
         return;
     }
-    if !once(&N, 96) {
+    let count = if kind == "gfx" { &GFX_DUMPS } else { &COMPUTE_DUMPS };
+    if !once(count, 96) {
         return;
     }
-    let dir = std::env::temp_dir().join("tombox").join("psodump");
+    let dir = std::env::var_os("TOMBOX_NATIVE_PSO_DUMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("tombox").join("psodump"));
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
