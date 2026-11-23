@@ -1178,6 +1178,8 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
                 QUEUE_SLOT16_SIGNAL_CALLER.store(base + SCARLETT_QUEUE_SIGNAL_RETURN, Ordering::Relaxed);
                 QUEUE_VT[16].store(scarlett_queue_slot16 as *const () as usize, Ordering::Relaxed);
                 QUEUE_VT[18].store(scarlett_queue_slot18 as *const () as usize, Ordering::Relaxed);
+                // This queue passes the usual PresentX plane parameters at slot 32.
+                XBOX_QVT[32].store(present_x as *const () as usize, Ordering::Relaxed);
                 XBOX_QVT[35].store(scarlett_queue_submit as *const () as usize, Ordering::Relaxed);
             }
             record("d3d12_xs", "queue.vtable", "built extended queue vtable (title slot 30 = PresentX; caller-dispatched)");
