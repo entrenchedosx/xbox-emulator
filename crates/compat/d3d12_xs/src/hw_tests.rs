@@ -242,6 +242,49 @@ fn chain_len(shim: *mut c_void) -> usize {
     crate::list_split::expand(&[crate::cmdlist_wrap::unwrap(shim)]).len()
 }
 
+#[test]
+#[ignore = "requires a D3D12 device or WARP"]
+fn hw_scarlett_memory_slots_write_and_wait() {
+    use crate::cl_ext::{SCARLETT_WAIT64, SCARLETT_WRITE32_BOTTOM_OF_PIPE, SCARLETT_WRITE64_BOTTOM_OF_PIPE};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    let slots = [const { AtomicUsize::new(0) }; SCARLETT_WAIT64 + 1];
+    crate::cl_ext::install_scarlett_memory_ops(&slots);
+    let g = gpu();
+    unsafe {
+        let write32: unsafe extern "system" fn(*mut c_void, u64, u32, u32, u32) =
+            core::mem::transmute(slots[SCARLETT_WRITE32_BOTTOM_OF_PIPE].load(Ordering::Relaxed));
+        let write64: unsafe extern "system" fn(*mut c_void, u64, u64, u32, u32) =
+            core::mem::transmute(slots[SCARLETT_WRITE64_BOTTOM_OF_PIPE].load(Ordering::Relaxed));
+        let wait64: unsafe extern "system" fn(*mut c_void, u64, u32, u64, u32) =
+            core::mem::transmute(slots[SCARLETT_WAIT64].load(Ordering::Relaxed));
+
+        let flag = buffer(g.dev, HEAP_DEFAULT, 256, FLAG_UAV, ST_COMMON);
+        let out = buffer(g.dev, HEAP_READBACK, 256, 0, ST_COPY_DEST);
+        let value = 0x1234_5678_9abc_def0;
+        let waiter = title_list(g.dev);
+        let real_waiter = crate::cmdlist_wrap::unwrap(waiter);
+        write32(real_waiter, out.va, 7, 0, 0);
+        wait64(real_waiter, flag.va, FUNC_GREATER_EQUAL, value, 1);
+        call!(waiter, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), out.res, 8, flag.res, 0, 8);
+        assert!(call!(waiter, X_CLOSE, () -> i32) >= 0);
+        assert_eq!(chain_len(waiter), 2);
+        let wait_done = fence(g.dev);
+        submit(g.a, waiter, wait_done, 1);
+        assert!(!reached(wait_done, 1, Duration::from_millis(300)));
+        assert_eq!((rd(&out, 0), rd(&out, 8)), (7, 0));
+
+        let writer = title_list(g.dev);
+        write64(crate::cmdlist_wrap::unwrap(writer), flag.va, value, 0, 0);
+        assert!(call!(writer, X_CLOSE, () -> i32) >= 0);
+        let write_done = fence(g.dev);
+        submit(g.b, writer, write_done, 1);
+        assert!(reached(write_done, 1, Duration::from_secs(5)));
+        assert!(reached(wait_done, 1, Duration::from_secs(5)));
+        assert_eq!((rd(&out, 8), rd(&out, 12)), (value as u32, (value >> 32) as u32));
+    }
+}
+
 unsafe fn waiter(g: &Gpu, flag: &Buf, func: u32, value: u32, out: &Buf) -> *mut c_void {
     let w = unsafe { title_list(g.dev) };
     call!(w, crate::cl_ext::CL_WRITE32_BOTTOM_OF_PIPE, (u64, u32, u32, u32) -> (), out.va, 1, 0, 0);
