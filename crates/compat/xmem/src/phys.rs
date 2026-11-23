@@ -97,6 +97,19 @@ pub fn freezes_on_this_thread() -> usize {
 
 impl Frozen {
     fn new() -> Self {
+        let mut f = Self::prepare();
+        f.freeze();
+        f
+    }
+
+    /// Everything that needs the heap: the thread list, the handles, the buffers. Nothing is suspended yet.
+    ///
+    /// All of it has to be done, and every temporary dropped, before the first `SuspendThread`: once the world
+    /// is frozen a thread that owns the process heap lock may be one of the frozen ones, so a single `HeapAlloc`
+    /// or `HeapFree` by the freezing thread never returns. The title hit exactly that: every other thread
+    /// suspended and this one parked in RtlFreeHeap directly under `Frozen::new`, which freed its thread-id
+    /// list when the function returned.
+    fn prepare() -> Self {
         FREEZES.with(|c| c.set(c.get() + 1));
         freeze_trace("new: enter", 0, 0);
         let mut ids = Vec::with_capacity(256);
@@ -116,19 +129,27 @@ impl Frozen {
             }
             freeze_trace("new: threads listed", ids.len(), 0);
             let handles: Vec<usize> = ids.iter().map(|&t| OpenThread(0x2 | 0x8, 0, t)).filter(|&h| h != 0).collect();
-            let mut f = Frozen { suspended: vec![false; handles.len()], handles, _ctx: Box::new(Context([0u8; 0x4d0])) };
-            let ctx = f._ctx.0.as_mut_ptr();
-            freeze_trace("new: suspending", f.handles.len(), 0);
-            for i in 0..f.handles.len() {
-                if SuspendThread(f.handles[i]) != u32::MAX {
-                    f.suspended[i] = true;
+            drop(ids);
+            Frozen { suspended: vec![false; handles.len()], handles, _ctx: Box::new(Context([0u8; 0x4d0])) }
+        }
+    }
+
+    /// Suspend every other thread. Must not allocate or free: see `prepare`.
+    fn freeze(&mut self) {
+        let ctx = self._ctx.0.as_mut_ptr();
+        freeze_trace("new: suspending", self.handles.len(), 0);
+        #[cfg(test)]
+        frozen_guard::enter();
+        for i in 0..self.handles.len() {
+            unsafe {
+                if SuspendThread(self.handles[i]) != u32::MAX {
+                    self.suspended[i] = true;
                     core::ptr::write_unaligned(ctx.add(0x30) as *mut u32, 0x10_0001);
-                    GetThreadContext(f.handles[i], ctx);
+                    GetThreadContext(self.handles[i], ctx);
                 }
             }
-            freeze_trace("new: frozen", f.suspended.iter().filter(|s| **s).count(), f.handles.len());
-            f
         }
+        freeze_trace("new: frozen", self.suspended.iter().filter(|s| **s).count(), self.handles.len());
     }
 }
 
@@ -143,6 +164,8 @@ impl Drop for Frozen {
                 CloseHandle(self.handles[i]);
             }
         }
+        #[cfg(test)]
+        frozen_guard::leave();
     }
 }
 
@@ -637,4 +660,89 @@ pub fn region_extent(addr: usize) -> Option<usize> {
 
 pub fn owns(addr: usize) -> bool {
     with(|s| region_of(s, addr).is_some())
+}
+
+/// Test hooks: when the world is frozen and thawed. `thawed()` is set once every thread has been resumed (the
+/// point after which the freezing thread may use the heap again).
+#[cfg(test)]
+pub(crate) mod frozen_guard {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static THAWED: AtomicBool = AtomicBool::new(true);
+
+    pub fn enter() {
+        THAWED.store(false, Ordering::SeqCst);
+    }
+
+    /// A test that wants to observe the thaw clears the flag first.
+    pub fn arm() {
+        THAWED.store(false, Ordering::SeqCst);
+    }
+
+    pub fn leave() {
+        THAWED.store(true, Ordering::SeqCst);
+    }
+
+    pub fn thawed() -> bool {
+        THAWED.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod freeze_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn HeapLock(heap: *mut c_void) -> i32;
+        fn HeapUnlock(heap: *mut c_void) -> i32;
+    }
+
+    /// Nothing may allocate or free while the world is frozen: a suspended thread may own the lock of the
+    /// heap the emulator DLLs allocate from (`SuspendThread` does not release it), and the freezing thread
+    /// would wait for it forever. The title hit this as a hang with 71 threads suspended and the freezing
+    /// thread parked in RtlFreeHeap directly under `Frozen::new`, which freed its thread-id list at the end
+    /// of the function.
+    ///
+    /// Here a helper thread takes the heap's lock and keeps it until the world has been thawed, so the helper
+    /// is suspended while it owns the lock. Any heap use by the freezing thread in between never returns.
+    /// A regression therefore hangs this test (it suspends every thread of the process, the harness too)
+    /// instead of failing an assertion.
+    #[test]
+    fn nothing_touches_the_heap_while_the_world_is_frozen() {
+        let _guard = map_test_guard();
+        let heap = compat_common::private_heap::handle() as usize;
+        for round in 0..20 {
+            frozen_guard::arm();
+            let (go, locked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+            let (g, l, h) = (go.clone(), locked.clone(), heap);
+            // the helper must exist before `prepare` lists the threads, but must not hold the lock yet
+            let helper = std::thread::spawn(move || unsafe {
+                while !g.load(Ordering::SeqCst) {
+                    core::hint::spin_loop();
+                }
+                HeapLock(h as *mut c_void);
+                l.store(true, Ordering::SeqCst);
+                // keep the lock until the freezing thread has thawed the world (no heap use here: it is locked)
+                while !frozen_guard::thawed() {
+                    core::hint::spin_loop();
+                }
+                HeapUnlock(h as *mut c_void);
+            });
+            // everything that needs the heap is done before the helper takes its lock
+            let mut w = Frozen::prepare();
+            go.store(true, Ordering::SeqCst);
+            while !locked.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            // the helper owns the heap lock from here until it sees the thaw; it is suspended while it does
+            w.freeze();
+            assert!(!frozen_guard::thawed(), "round {round}: the world is frozen");
+            drop(w);
+            assert!(frozen_guard::thawed(), "round {round}: Drop thaws before it frees anything");
+            helper.join().unwrap();
+        }
+    }
 }

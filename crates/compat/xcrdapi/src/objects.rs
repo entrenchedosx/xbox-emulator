@@ -6,7 +6,7 @@ use std::fs::File;
 use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 #[link(name = "kernel32")]
@@ -130,8 +130,10 @@ pub struct FactoryVtbl {
     pub set_cpu_affinity: unsafe extern "system" fn(*mut c_void, u64) -> i32,
     pub set_debug_flags: unsafe extern "system" fn(*mut c_void, u32),
     pub set_staging_buffer_size: unsafe extern "system" fn(*mut c_void, u32) -> i32,
-    pub slot9: unsafe extern "system" fn(*mut c_void) -> i32,
-    pub slot10: unsafe extern "system" fn(*mut c_void) -> i32,
+    /// IDStorageFactoryX1::GetStats. Its signature is not documented anywhere this runtime can read, so it stays a trap.
+    pub get_stats: unsafe extern "system" fn(*mut c_void) -> i32,
+    /// IDStorageFactoryX2::CreateQueue1(const DSTORAGE_QUEUE_DESC1*, REFIID, void**).
+    pub create_queue1: unsafe extern "system" fn(*mut c_void, *const u8, *const c_void, *mut *mut c_void) -> i32,
     pub slot11: unsafe extern "system" fn(*mut c_void) -> i32,
     pub slot12: unsafe extern "system" fn(*mut c_void) -> i32,
     pub slot13: unsafe extern "system" fn(*mut c_void) -> i32,
@@ -144,8 +146,7 @@ pub struct FactoryObj {
     pub vtbl: &'static FactoryVtbl,
 }
 
-trap!(factory_slot9, "IDStorageFactoryX", 9);
-trap!(factory_slot10, "IDStorageFactoryX", 10);
+trap!(factory_get_stats, "IDStorageFactoryX1::GetStats (factory slot)", 9);
 trap!(factory_slot11, "IDStorageFactoryX", 11);
 trap!(factory_slot12, "IDStorageFactoryX", 12);
 trap!(factory_slot13, "IDStorageFactoryX", 13);
@@ -162,8 +163,8 @@ pub static FACTORY_VTBL: FactoryVtbl = FactoryVtbl {
     set_cpu_affinity: factory_set_cpu_affinity,
     set_debug_flags: factory_set_debug_flags,
     set_staging_buffer_size: factory_set_staging_buffer_size,
-    slot9: factory_slot9,
-    slot10: factory_slot10,
+    get_stats: factory_get_stats,
+    create_queue1: factory_create_queue1,
     slot11: factory_slot11,
     slot12: factory_slot12,
     slot13: factory_slot13,
@@ -225,6 +226,45 @@ unsafe extern "system" fn factory_create_queue(_this: *mut c_void, desc: *const 
     log(
         "IDStorageFactoryX::CreateQueue",
         &format!("type={} capacity={} priority={} name='{}' -> hr={hr:#010x} queue={:p}", q.source_type, q.capacity, q.priority, q.name, unsafe { *ppv }),
+    );
+    hr
+}
+
+/// `IDStorageFactoryX2::CreateQueue1(const DSTORAGE_QUEUE_DESC1 *desc, REFIID riid, void **ppv)`.
+///
+/// Contract, from the GDK reference and from the retail title's own call site (its desc is 0x20
+/// bytes, its riid is IDStorageQueueX2, and it passes `Options = 1`):
+/// `DSTORAGE_QUEUE_DESC1` is `DSTORAGE_QUEUE_DESC` (source type, capacity, priority, name; 0x18
+/// bytes) followed by `DSTORAGE_QUEUE_OPTIONS`, a 64-bit union whose bit 0 is `AutoSubmitDisabled`
+/// and whose other 63 bits are reserved (must be zero). The queue is otherwise the queue
+/// `CreateQueue` makes.
+unsafe extern "system" fn factory_create_queue1(_this: *mut c_void, desc: *const u8, riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    unsafe { *ppv = core::ptr::null_mut() };
+    if desc.is_null() {
+        report("IDStorageFactoryX2::CreateQueue1", E_INVALIDARG, "null desc");
+        return E_INVALIDARG;
+    }
+    let mut raw = [0u8; XQUEUE_DESC_SIZE];
+    unsafe { core::ptr::copy_nonoverlapping(desc, raw.as_mut_ptr(), XQUEUE_DESC_SIZE) };
+    let mut opt = [0u8; 8];
+    unsafe { core::ptr::copy_nonoverlapping(desc.add(XQUEUE_DESC_SIZE), opt.as_mut_ptr(), 8) };
+    let options = u64::from_le_bytes(opt);
+    let q = match QueueInner::create_with(raw, options) {
+        Ok(q) => q,
+        Err((hr, why)) => {
+            report("IDStorageFactoryX2::CreateQueue1", hr, &why);
+            return hr;
+        }
+    };
+    let obj = Box::into_raw(Box::new(QueueObj { vtbl: &QUEUE_VTBL, refs: AtomicU32::new(1), inner: q.clone() }));
+    let hr = unsafe { queue_qi(obj as *mut c_void, riid, ppv) };
+    unsafe { queue_release(obj as *mut c_void) };
+    log(
+        "IDStorageFactoryX2::CreateQueue1",
+        &format!("type={} capacity={} priority={} name='{}' options={options:#x} (auto-submit {}) -> hr={hr:#010x} queue={:p}", q.source_type, q.capacity, q.priority, q.name, if q.auto_submit { "on" } else { "disabled" }, unsafe { *ppv }),
     );
     hr
 }
@@ -583,6 +623,8 @@ pub enum Entry {
     Request { seq: u64, req: XRequest, file: Option<Arc<FileInner>>, pre_error: Option<i32> },
     Status { array: Arc<StatusInner>, index: u32 },
     Signal { fence: Option<PcFence>, raw: u64, value: u64 },
+    /// IDStorageQueueX1::EnqueueSetEvent: a private duplicate of the title's event handle (or why none could be made).
+    SetEvent { handle: Result<isize, i32>, raw: u64 },
 }
 
 #[derive(Clone, Default)]
@@ -614,7 +656,13 @@ pub struct QueueInner {
     pub capacity: u16,
     pub priority: i8,
     pub name: String,
+    /// DSTORAGE_QUEUE_OPTIONS as passed to CreateQueue1 (0 for CreateQueue).
+    pub options: u64,
+    /// False when the queue was created with `AutoSubmitDisabled`: nothing but Submit starts work.
+    pub auto_submit: bool,
     state: Mutex<QState>,
+    /// Signalled when entries leave `pending` (Submit) or the queue closes: wakes an Enqueue that is stalled on a full queue.
+    space: Condvar,
     pub errors: Mutex<ErrorState>,
     cancels: Mutex<Vec<(u64, u64, u64)>>,
     next_seq: AtomicU64,
@@ -628,6 +676,14 @@ unsafe impl Sync for QueueInner {}
 
 impl QueueInner {
     pub fn create(raw: [u8; XQUEUE_DESC_SIZE]) -> Result<Arc<QueueInner>, (i32, String)> {
+        Self::create_with(raw, 0)
+    }
+
+    /// `options` is the DSTORAGE_QUEUE_OPTIONS union: bit 0 AutoSubmitDisabled, the rest reserved.
+    pub fn create_with(raw: [u8; XQUEUE_DESC_SIZE], options: u64) -> Result<Arc<QueueInner>, (i32, String)> {
+        if options & !OPT_QUEUE_AUTO_SUBMIT_DISABLED != 0 {
+            return Err((E_DSTORAGE_RESERVED_FIELDS, format!("reserved bits of the queue options are set: {options:#x}")));
+        }
         let source_type = u32::from_le_bytes(raw[0..4].try_into().unwrap());
         let capacity = u16::from_le_bytes(raw[8..10].try_into().unwrap());
         let priority = raw[10] as i8;
@@ -655,7 +711,10 @@ impl QueueInner {
             capacity,
             priority,
             name,
+            options,
+            auto_submit: options & OPT_QUEUE_AUTO_SUBMIT_DISABLED == 0,
             state: Mutex::new(QState { pending: Vec::new(), tx: None, worker: None }),
+            space: Condvar::new(),
             errors: Mutex::new(ErrorState::default()),
             cancels: Mutex::new(Vec::new()),
             next_seq: AtomicU64::new(1),
@@ -771,6 +830,18 @@ impl QueueInner {
                 let hr = err_since_status.take().unwrap_or(S_OK);
                 array.slots[index as usize].store(hr, Ordering::Release);
             }
+            Entry::SetEvent { handle, raw } => match handle {
+                Ok(h) => {
+                    let hr = if unsafe { SetEvent(h) } != 0 { S_OK } else { hresult_from_win32(unsafe { GetLastError() }) };
+                    unsafe { CloseHandle(h) };
+                    if hr < 0 {
+                        report("IDStorageQueueX1::EnqueueSetEvent", hr, &format!("SetEvent({raw:#x}) failed"));
+                        // The runtime has no documented error-record command type for SetEvent; the signal type is the closest.
+                        self.fail(Failure { hr, command: COMMAND_TYPE_SIGNAL, object: raw, ..Default::default() });
+                    }
+                }
+                Err(hr) => self.fail(Failure { hr, command: COMMAND_TYPE_SIGNAL, object: raw, ..Default::default() }),
+            },
             Entry::Signal { fence, raw, value } => match fence {
                 Some(f) => {
                     let hr = unsafe { f.signal(value) };
@@ -820,9 +891,23 @@ impl QueueInner {
             return Err(e);
         }
         let mut st = self.state.lock().unwrap();
+        if !self.auto_submit {
+            // Nothing submits this queue but its owner: a full queue (one slot is always reserved to tell
+            // full from empty) stalls the enqueuing thread until another thread calls Submit.
+            let limit = (self.capacity as usize).saturating_sub(1).max(1);
+            if st.pending.len() >= limit {
+                log("IDStorageQueueX::Enqueue", &format!("queue '{}' has auto-submit disabled and is full ({limit} entries): this thread waits until another thread calls Submit", self.name));
+                while st.pending.len() >= limit && !self.closed.load(Ordering::Acquire) {
+                    st = self.space.wait(st).unwrap();
+                }
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(e);
+                }
+            }
+        }
         crate::stats::on_enqueue_q(self as *const _ as usize, st.pending.is_empty());
         st.pending.push(e);
-        if st.pending.len() >= (self.capacity / 2).max(1) as usize {
+        if self.auto_submit && st.pending.len() >= (self.capacity / 2).max(1) as usize {
             crate::stats::on_flush(self as *const _ as usize, st.pending.len(), false, self.priority);
             Self::flush(&mut st);
         }
@@ -846,6 +931,8 @@ impl QueueInner {
         let mut st = self.state.lock().unwrap();
         crate::stats::on_flush(self as *const _ as usize, st.pending.len(), true, self.priority);
         Self::flush(&mut st);
+        drop(st);
+        self.space.notify_all();
         true
     }
 
@@ -860,8 +947,8 @@ impl QueueInner {
         st.pending.iter().filter(|e| matches!(e, Entry::Request { req, .. } if req.cancellation_tag & mask == value)).count()
     }
 
-    pub fn query(&self, out: &mut [u8; XQUEUE_INFO_SIZE]) {
-        out[..XQUEUE_DESC_SIZE].copy_from_slice(&self.raw_desc);
+    /// (EmptySlotCount, RequestCountUntilAutoSubmit) of the queue now.
+    fn slot_counts(&self) -> (u16, u16) {
         let st = self.state.lock().unwrap();
         let pending = st.pending.len();
         let cap = self.capacity as usize;
@@ -869,8 +956,25 @@ impl QueueInner {
         let half = (cap / 2).max(1);
         let until = half.saturating_sub(pending);
         let until = if until == 0 { half } else { until } as u16;
+        (empty, until)
+    }
+
+    pub fn query(&self, out: &mut [u8; XQUEUE_INFO_SIZE]) {
+        out[..XQUEUE_DESC_SIZE].copy_from_slice(&self.raw_desc);
+        let (empty, until) = self.slot_counts();
         out[0x18..0x1a].copy_from_slice(&empty.to_le_bytes());
         out[0x1a..0x1c].copy_from_slice(&until.to_le_bytes());
+    }
+
+    /// `DSTORAGE_QUEUE_INFO1`: the `DSTORAGE_QUEUE_DESC1` used to create the queue, then the empty slot count and the
+    /// request count until automatic submission (as for `Query`; the reference does not say what the latter is for a
+    /// queue whose auto-submit is disabled, so it is reported the same way).
+    pub fn query1(&self, out: &mut [u8; XQUEUE_INFO1_SIZE]) {
+        out[..XQUEUE_DESC_SIZE].copy_from_slice(&self.raw_desc);
+        out[XQUEUE_DESC_SIZE..XQUEUE_DESC1_SIZE].copy_from_slice(&self.options.to_le_bytes());
+        let (empty, until) = self.slot_counts();
+        out[XQUEUE_DESC1_SIZE..XQUEUE_DESC1_SIZE + 2].copy_from_slice(&empty.to_le_bytes());
+        out[XQUEUE_DESC1_SIZE + 2..XQUEUE_DESC1_SIZE + 4].copy_from_slice(&until.to_le_bytes());
     }
 
     pub fn close(&self) -> bool {
@@ -887,6 +991,7 @@ impl QueueInner {
             }
         }
         drop(tx);
+        self.space.notify_all();
         if let Some(w) = worker {
             if w.thread().id() != std::thread::current().id() {
                 let _ = w.join();
@@ -963,8 +1068,10 @@ pub struct QueueVtbl {
     pub get_error_event: unsafe extern "system" fn(*mut c_void) -> isize,
     pub retrieve_error_record: unsafe extern "system" fn(*mut c_void, *mut u8),
     pub query: unsafe extern "system" fn(*mut c_void, *mut u8),
-    pub slot12: unsafe extern "system" fn(*mut c_void) -> i32,
-    pub slot13: unsafe extern "system" fn(*mut c_void) -> i32,
+    /// IDStorageQueueX1::EnqueueSetEvent(HANDLE).
+    pub enqueue_set_event: unsafe extern "system" fn(*mut c_void, isize),
+    /// IDStorageQueueX2::Query1(DSTORAGE_QUEUE_INFO1*).
+    pub query1: unsafe extern "system" fn(*mut c_void, *mut u8),
     pub slot14: unsafe extern "system" fn(*mut c_void) -> i32,
     pub slot15: unsafe extern "system" fn(*mut c_void) -> i32,
     pub slot16: unsafe extern "system" fn(*mut c_void) -> i32,
@@ -978,8 +1085,6 @@ pub struct QueueObj {
     pub inner: Arc<QueueInner>,
 }
 
-trap!(queue_slot12, "IDStorageQueueX", 12);
-trap!(queue_slot13, "IDStorageQueueX", 13);
 trap!(queue_slot14, "IDStorageQueueX", 14);
 trap!(queue_slot15, "IDStorageQueueX", 15);
 trap!(queue_slot16, "IDStorageQueueX", 16);
@@ -998,8 +1103,8 @@ pub static QUEUE_VTBL: QueueVtbl = QueueVtbl {
     get_error_event: queue_get_error_event,
     retrieve_error_record: queue_retrieve_error_record,
     query: queue_query,
-    slot12: queue_slot12,
-    slot13: queue_slot13,
+    enqueue_set_event: queue_enqueue_set_event,
+    query1: queue_query1,
     slot14: queue_slot14,
     slot15: queue_slot15,
     slot16: queue_slot16,
@@ -1016,7 +1121,7 @@ unsafe extern "system" fn queue_qi(this: *mut c_void, riid: *const c_void, ppv: 
     }
     unsafe { *ppv = core::ptr::null_mut() };
     match unsafe { read_iid(riid) } {
-        Some(i) if i == IID_QUEUE_X || i == IID_IUNKNOWN => {
+        Some(i) if i == IID_QUEUE_X || i == IID_QUEUE_X2 || i == IID_IUNKNOWN => {
             unsafe { queue_add_ref(this) };
             unsafe { qi_out(ppv, this) };
             S_OK
@@ -1208,4 +1313,39 @@ unsafe extern "system" fn queue_query(this: *mut c_void, out: *mut u8) {
     let mut info = [0u8; XQUEUE_INFO_SIZE];
     q.query(&mut info);
     unsafe { core::ptr::copy_nonoverlapping(info.as_ptr(), out, XQUEUE_INFO_SIZE) };
+}
+
+/// `IDStorageQueueX1::EnqueueSetEvent(HANDLE handle)`: the event is signalled once every entry enqueued before it has
+/// completed. The handle is duplicated here so the title may close its own copy after waiting.
+unsafe extern "system" fn queue_enqueue_set_event(this: *mut c_void, handle: isize) {
+    let q = &unsafe { queue(this) }.inner;
+    if q.closed.load(Ordering::Acquire) {
+        report("IDStorageQueueX1::EnqueueSetEvent", E_DSTORAGE_QUEUE_CLOSED, &format!("queue '{}'", q.name));
+        return;
+    }
+    let dup = if handle == 0 || handle == -1 { Err(E_INVALIDARG) } else { dup_handle(handle) };
+    if let Err(hr) = dup {
+        report("IDStorageQueueX1::EnqueueSetEvent", hr, &format!("event handle {handle:#x} cannot be duplicated; the failure is recorded in the queue's error record"));
+    }
+    if q.enqueue(Entry::SetEvent { handle: dup, raw: handle as u64 }).is_err() {
+        if let Ok(h) = dup {
+            unsafe { CloseHandle(h) };
+        }
+        report("IDStorageQueueX1::EnqueueSetEvent", E_DSTORAGE_QUEUE_CLOSED, &format!("queue '{}'", q.name));
+    }
+}
+
+unsafe extern "system" fn queue_query1(this: *mut c_void, out: *mut u8) {
+    let q = &unsafe { queue(this) }.inner;
+    if out.is_null() {
+        report("IDStorageQueueX2::Query1", E_POINTER, "null info");
+        return;
+    }
+    if q.closed.load(Ordering::Acquire) {
+        report("IDStorageQueueX2::Query1", E_DSTORAGE_QUEUE_CLOSED, &format!("queue '{}'", q.name));
+        return;
+    }
+    let mut info = [0u8; XQUEUE_INFO1_SIZE];
+    q.query1(&mut info);
+    unsafe { core::ptr::copy_nonoverlapping(info.as_ptr(), out, XQUEUE_INFO1_SIZE) };
 }

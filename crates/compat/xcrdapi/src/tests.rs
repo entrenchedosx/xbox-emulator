@@ -524,3 +524,203 @@ fn fixed_result_exports_match_every_console_xcrdapi() {
         assert!(seen.get(name).copied().unwrap_or(0) >= 3, "{name} compared against {:?} console dumps", seen.get(name));
     }
 }
+
+// ---- IDStorageFactoryX2::CreateQueue1 / IDStorageQueueX2 (the call the retail title makes) ----
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateEventW(sa: *mut c_void, manual: i32, initial: i32, name: *const u16) -> isize;
+    fn WaitForSingleObject(h: isize, ms: u32) -> u32;
+    fn CloseHandle(h: isize) -> i32;
+}
+
+/// `CreateQueue1(&DSTORAGE_QUEUE_DESC1{ SourceType, Capacity, Priority, Name = 0, Options }, IID_QUEUE_X2, &q)`.
+unsafe fn create_queue1(f: *mut c_void, source_type: u64, cap: u16, prio: i8, options: u64) -> (i32, *mut c_void) {
+    let mut d = [0u8; XQUEUE_DESC1_SIZE];
+    d[0..8].copy_from_slice(&source_type.to_le_bytes());
+    d[8..10].copy_from_slice(&cap.to_le_bytes());
+    d[10] = prio as u8;
+    d[0x18..0x20].copy_from_slice(&options.to_le_bytes());
+    let mut q: *mut c_void = core::ptr::null_mut();
+    let cq: unsafe extern "system" fn(*mut c_void, *const u8, *const c_void, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(slot(f, 10)) };
+    let hr = unsafe { cq(f, d.as_ptr(), IID_QUEUE_X2.as_ptr() as *const c_void, &mut q) };
+    (hr, q)
+}
+
+unsafe fn query1(q: *mut c_void) -> [u8; XQUEUE_INFO1_SIZE] {
+    let mut info = [0u8; XQUEUE_INFO1_SIZE];
+    let f: unsafe extern "system" fn(*mut c_void, *mut u8) = unsafe { core::mem::transmute(slot(q, 13)) };
+    unsafe { f(q, info.as_mut_ptr()) };
+    info
+}
+
+#[test]
+fn queue_x2_iid_is_the_one_the_title_asks_for() {
+    assert_eq!(iid_text(&IID_QUEUE_X2), "3c02cb0c-c050-4195-99a1-a1ce94ba33c5");
+}
+
+#[test]
+fn create_queue1_makes_a_queue_x2_and_query1_reports_its_desc1() {
+    let f = factory();
+    unsafe {
+        let (hr, q) = create_queue1(f, QUEUE_SOURCE_FILE as u64, 0x40, PRIORITY_LOW, OPT_QUEUE_AUTO_SUBMIT_DISABLED);
+        assert_eq!(hr, S_OK);
+        assert!(!q.is_null());
+        let info = query1(q);
+        assert_eq!(u64::from_le_bytes(info[0..8].try_into().unwrap()), QUEUE_SOURCE_FILE as u64, "source type");
+        assert_eq!(u16::from_le_bytes(info[8..10].try_into().unwrap()), 0x40, "capacity");
+        assert_eq!(info[10] as i8, PRIORITY_LOW, "priority");
+        assert_eq!(u64::from_le_bytes(info[0x18..0x20].try_into().unwrap()), 1, "options echo the AutoSubmitDisabled bit");
+        assert_eq!(u16::from_le_bytes(info[0x20..0x22].try_into().unwrap()), 0x3f, "an empty queue has capacity - 1 empty slots");
+        // the same object answers for the older queue interface, and refuses interfaces nobody has described
+        let qi: unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32 = core::mem::transmute(slot(q, 0));
+        let mut o: *mut c_void = core::ptr::null_mut();
+        assert_eq!(qi(q, IID_QUEUE_X.as_ptr() as *const c_void, &mut o), S_OK);
+        assert_eq!(o, q);
+        release(o);
+        assert_eq!(qi(q, IID_FILE_X.as_ptr() as *const c_void, &mut o), E_NOINTERFACE);
+        release(q);
+    }
+}
+
+#[test]
+fn create_queue1_validates_like_create_queue_and_rejects_reserved_option_bits() {
+    let f = factory();
+    unsafe {
+        assert_eq!(create_queue1(f, 0, 0x40, 0, 2).0, E_DSTORAGE_RESERVED_FIELDS, "reserved option bits must be zero");
+        assert_eq!(create_queue1(f, 0, 0x40, 0, 1u64 << 63).0, E_DSTORAGE_RESERVED_FIELDS);
+        assert_eq!(create_queue1(f, 0, 1, 0, 0).0, E_DSTORAGE_INVALID_QUEUE_CAPACITY);
+        assert_eq!(create_queue1(f, 0, 0x40, 3, 0).0, E_DSTORAGE_INVALID_QUEUE_PRIORITY);
+        assert_eq!(create_queue1(f, 7, 0x40, 0, 0).0, E_DSTORAGE_INVALID_QUEUE_TYPE);
+        assert_eq!(create_queue1(f, QUEUE_SOURCE_MEMORY as u64, 0x40, 0, 0).0, E_DSTORAGE_INVALID_MEMORY_QUEUE_PRIORITY);
+        let cq: unsafe extern "system" fn(*mut c_void, *const u8, *const c_void, *mut *mut c_void) -> i32 = core::mem::transmute(slot(f, 10));
+        let mut q: *mut c_void = 1 as *mut c_void;
+        assert_eq!(cq(f, core::ptr::null(), IID_QUEUE_X2.as_ptr() as *const c_void, &mut q), E_INVALIDARG);
+        assert!(q.is_null(), "the out pointer is cleared on failure");
+    }
+}
+
+/// With auto-submit on, half a queue's capacity of entries starts the work by itself; a queue created
+/// with `AutoSubmitDisabled` runs nothing until Submit.
+#[test]
+fn auto_submit_disabled_queue_runs_nothing_until_submit() {
+    let f = factory();
+    let data = pattern(512);
+    let comp = zlib(&data);
+    unsafe {
+        let arr = create_status(f, 2);
+        for (disabled, label) in [(false, "auto-submit on"), (true, "auto-submit disabled")] {
+            let (hr, q) = create_queue1(f, QUEUE_SOURCE_MEMORY as u64, 4, PRIORITY_REALTIME, disabled as u64);
+            assert_eq!(hr, S_OK);
+            let mut out = vec![0u8; 512];
+            enqueue(q, &build_request(OPT_SOURCE_MEMORY | 1, out.as_mut_ptr() as u64, 512, comp.as_ptr() as u64, 0, comp.len() as u32, 0));
+            enqueue_status(q, arr, 1); // two entries: half of a capacity of 4
+            let t = Instant::now();
+            let mut done = false;
+            while t.elapsed() < Duration::from_millis(400) && !done {
+                done = is_complete(arr, 1);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(done, !disabled, "{label}: completion before Submit");
+            if disabled {
+                assert!(out.iter().all(|&b| b == 0), "{label}: nothing may have been decoded yet");
+                submit(q);
+            }
+            assert_eq!(wait(arr, 1), S_OK, "{label}");
+            assert_eq!(out, data, "{label}");
+            release(q);
+        }
+        release(arr);
+    }
+}
+
+/// A full queue whose auto-submit is disabled stalls its Enqueue until another thread submits.
+#[test]
+fn enqueue_on_a_full_auto_submit_disabled_queue_waits_for_submit() {
+    let f = factory();
+    unsafe {
+        let arr = create_status(f, 4);
+        let (hr, q) = create_queue1(f, QUEUE_SOURCE_FILE as u64, 3, 0, OPT_QUEUE_AUTO_SUBMIT_DISABLED); // 2 usable slots
+        assert_eq!(hr, S_OK);
+        enqueue_status(q, arr, 0);
+        enqueue_status(q, arr, 1);
+        let (qa, aa) = (q as usize, arr as usize);
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fin = finished.clone();
+        let t = std::thread::spawn(move || {
+            enqueue_status(qa as *mut c_void, aa as *mut c_void, 2);
+            fin.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!finished.load(Ordering::SeqCst), "the third Enqueue must stall while nothing submits the queue");
+        submit(q);
+        let t0 = Instant::now();
+        while !finished.load(Ordering::SeqCst) {
+            assert!(t0.elapsed() < Duration::from_secs(10), "Submit did not release the stalled Enqueue");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        t.join().unwrap();
+        submit(q);
+        assert_eq!(wait(arr, 2), S_OK);
+        release(q);
+        release(arr);
+    }
+}
+
+#[test]
+fn closing_a_queue_releases_a_stalled_enqueue() {
+    let f = factory();
+    unsafe {
+        let arr = create_status(f, 4);
+        let (_, q) = create_queue1(f, QUEUE_SOURCE_FILE as u64, 2, 0, OPT_QUEUE_AUTO_SUBMIT_DISABLED); // 1 usable slot
+        enqueue_status(q, arr, 0);
+        let (qa, aa) = (q as usize, arr as usize);
+        let t = std::thread::spawn(move || enqueue_status(qa as *mut c_void, aa as *mut c_void, 1));
+        std::thread::sleep(Duration::from_millis(200));
+        let close: unsafe extern "system" fn(*mut c_void) = core::mem::transmute(slot(q, 8));
+        close(q);
+        t.join().unwrap();
+        assert_eq!(get_hr(arr, 0), E_DSTORAGE_QUEUE_CLOSED, "an entry that never ran is reported as closed");
+        release(q);
+        release(arr);
+    }
+}
+
+/// `EnqueueSetEvent` signals the event after everything enqueued before it has completed.
+#[test]
+fn enqueue_set_event_follows_the_requests_before_it() {
+    let f = factory();
+    let data = pattern(2048);
+    let comp = zlib(&data);
+    unsafe {
+        let (hr, q) = create_queue1(f, QUEUE_SOURCE_MEMORY as u64, 8, PRIORITY_REALTIME, OPT_QUEUE_AUTO_SUBMIT_DISABLED);
+        assert_eq!(hr, S_OK);
+        let ev = CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null());
+        assert_ne!(ev, 0);
+        let mut out = vec![0u8; 2048];
+        enqueue(q, &build_request(OPT_SOURCE_MEMORY | 1, out.as_mut_ptr() as u64, 2048, comp.as_ptr() as u64, 0, comp.len() as u32, 0));
+        let set: unsafe extern "system" fn(*mut c_void, isize) = core::mem::transmute(slot(q, 12));
+        set(q, ev);
+        assert_eq!(WaitForSingleObject(ev, 150), 0x102, "nothing runs before Submit");
+        submit(q);
+        assert_eq!(WaitForSingleObject(ev, 10_000), 0, "the event is signalled after Submit");
+        assert_eq!(out, data, "the request before the event has completed when the event fires");
+        // a bad handle is a recorded failure, not a hang or a crash
+        set(q, 0);
+        submit(q);
+        let t0 = Instant::now();
+        let rec = loop {
+            let mut rec = [0u8; XERROR_RECORD_SIZE];
+            let gr: unsafe extern "system" fn(*mut c_void, *mut u8) = core::mem::transmute(slot(q, 10));
+            gr(q, rec.as_mut_ptr());
+            if i32::from_le_bytes(rec[8..12].try_into().unwrap()) != 0 {
+                break rec;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(10), "no error record for the invalid event handle");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(i32::from_le_bytes(rec[8..12].try_into().unwrap()), E_INVALIDARG);
+        CloseHandle(ev);
+        release(q);
+    }
+}

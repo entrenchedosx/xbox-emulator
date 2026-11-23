@@ -78,6 +78,54 @@ void tb_gmem_store(uint2 va, uint v) { tb_gmem_store_n(va, v, 4u); }
 #endif
 "#;
 
+/// Atomic read-modify-write on a dword of a window, for the `flat_atomic_*` family. Added to
+/// [`HELPERS`] only when the shader has such an instruction, so every other shader's text is
+/// unchanged.
+///
+/// `op` is the instruction's operation (see [`atomic_op`]); `v` is DATA, `c` the compare value
+/// of a compare-and-swap. The old value is returned. Operations with a native `Interlocked*`
+/// form use it; the others are a compare-and-swap loop on the dword. An address that is not
+/// dword aligned, or that lies outside every window, is a fault: it is counted in the fault
+/// record (which the binder logs) and no memory is touched.
+pub const ATOMIC_HELPERS: &str = r#"uint tb_gatom_on(RWByteAddressBuffer b, uint o, uint op, uint v, uint c) {
+    uint old = 0u;
+    if (op == 0u) { b.InterlockedExchange(o, v, old); return old; }
+    if (op == 1u) { b.InterlockedCompareExchange(o, c, v, old); return old; }
+    if (op == 2u) { b.InterlockedAdd(o, v, old); return old; }
+    if (op == 3u) { b.InterlockedAdd(o, 0u - v, old); return old; }
+    if (op == 6u) { b.InterlockedMin(o, v, old); return old; }
+    if (op == 8u) { b.InterlockedMax(o, v, old); return old; }
+    if (op == 9u) { b.InterlockedAnd(o, v, old); return old; }
+    if (op == 10u) { b.InterlockedOr(o, v, old); return old; }
+    if (op == 11u) { b.InterlockedXor(o, v, old); return old; }
+    uint cur = b.Load(o);
+    [allow_uav_condition] for (uint i = 0u; i < 65536u; i++) {
+        uint nv = cur;
+        if (op == 5u) nv = asuint(min(asint(cur), asint(v)));
+        else if (op == 7u) nv = asuint(max(asint(cur), asint(v)));
+        else if (op == 12u) nv = (cur >= v) ? 0u : (cur + 1u);
+        else if (op == 13u) nv = ((cur == 0u) || (cur > v)) ? v : (cur - 1u);
+        else if (op == 14u) nv = (asfloat(cur) == asfloat(c)) ? v : cur;
+        else if (op == 15u) nv = (asfloat(v) < asfloat(cur)) ? v : cur;
+        else if (op == 16u) nv = (asfloat(v) > asfloat(cur)) ? v : cur;
+        if (nv == cur) return cur;
+        uint prev = 0u;
+        b.InterlockedCompareExchange(o, cur, nv, prev);
+        if (prev == cur) return cur;
+        cur = prev;
+    }
+    return cur;
+}
+uint tb_gatom(uint2 va, uint op, uint v, uint c) {
+    if ((va.x & 3u) != 0u) { tb_gmiss(va); return 0u; }
+    uint o;
+    uint w = tb_gwhich(va, o);
+    if (w == 0xffffffffu) { tb_gmiss(va); return 0u; }
+    if (w == 0u) return tb_gatom_on(tb_gw0, o, op, v, c);
+    return tb_gatom_on(tb_gw1, o, op, v, c);
+}
+"#;
+
 pub fn helpers() -> String {
     HELPERS
         .replace("bCBV", &format!("b{}", crate::global_abi::TB_GLOBAL_CBV))
@@ -85,6 +133,43 @@ pub fn helpers() -> String {
         .replace("NWINu", &format!("{TB_GLOBAL_WINDOWS}u"))
         .replace("NWIN", &TB_GLOBAL_WINDOWS.to_string())
         .replace("SPACE", &TB_GLOBAL_SPACE.to_string())
+}
+
+/// Helper text for the program: the window helpers, plus the atomic ones when used.
+pub fn helpers_for(insns: &[Insn]) -> String {
+    let mut h = helpers();
+    if insns.iter().any(|i| i.enc == Enc::Flat && i.mnemonic.starts_with("flat_atomic_")) {
+        h.push_str(ATOMIC_HELPERS);
+    }
+    h
+}
+
+/// The operation number `tb_gatom_on` takes for a 32-bit `flat_atomic_*` mnemonic, and whether
+/// the instruction has a second DATA dword (the compare value).
+fn atomic_op(m: &str) -> Result<(u32, bool), String> {
+    let name = m.strip_prefix("flat_atomic_").ok_or_else(|| format!("{m}: not an atomic"))?;
+    if name.ends_with("_x2") {
+        return Err(format!("{m}: 64-bit global atomics are not lowered (they need Int64 atomics on the window buffers)"));
+    }
+    Ok(match name {
+        "swap" => (0, false),
+        "cmpswap" => (1, true),
+        "add" => (2, false),
+        "sub" => (3, false),
+        "smin" => (5, false),
+        "umin" => (6, false),
+        "smax" => (7, false),
+        "umax" => (8, false),
+        "and" => (9, false),
+        "or" => (10, false),
+        "xor" => (11, false),
+        "inc" => (12, false),
+        "dec" => (13, false),
+        "fcmpswap" => (14, true),
+        "fmin" => (15, false),
+        "fmax" => (16, false),
+        other => return Err(format!("{m}: global atomic `{other}` is not lowered (its memory semantics are not modelled)")),
+    })
 }
 
 fn width(m: &str) -> Option<(bool, u8, u8, bool)> {
@@ -115,7 +200,8 @@ pub fn routes(ins: &Insn, insns: &[Insn]) -> bool {
     if m.starts_with("flat_load_dword") && ins.aux.mask != 1 && insns.iter().any(|i| i.mnemonic == "s_getpc_b64") {
         return false;
     }
-    ins.aux.mask != 1 || width(m).is_some_and(|w| w.0)
+    // Scratch-segment atomics are routed too, so that they fail with the scratch message.
+    ins.aux.mask != 1 || width(m).is_some_and(|w| w.0) || m.starts_with("flat_atomic_")
 }
 
 impl<'a> Emitter<'a> {
@@ -156,6 +242,89 @@ impl<'a> Emitter<'a> {
         if bytes == 4 { format!("tb_gstore({a}, {val});") } else { format!("tb_gstore_n({a}, {val}, {bytes}u);") }
     }
 
+    /// `s_load_dword{,x2,x4,x8,x16} sD, sBase[, soffset] [imm]` where `sBase:sBase+1` is a
+    /// 64-bit address held in SGPRs: a read of global memory by scalar unit, lowered to
+    /// the same window-table lookups as vector flat loads. Every lane takes the same
+    /// address, so there is no exec guard (scalar memory ignores exec). The hardware
+    /// ignores the low two address bits of a scalar load, so the address is aligned down.
+    /// An address outside every window reads zero and bumps the fault record, exactly like
+    /// the vector path; the binder logs those faults.
+    pub(super) fn emit_smem_global(&mut self, ins: &Insn) -> Result<(), String> {
+        let n = 1u32 << ins.op;
+        let b = match ins.src.first() {
+            Some(Opnd::Sgpr(b)) => *b,
+            other => return Err(format!("s_load at {:#x}: global base {other:?} is not an SGPR pair", ins.offset)),
+        };
+        let d = match ins.dst.first() {
+            Some(Opnd::Sgpr(d)) => *d,
+            other => return Err(format!("s_load at {:#x}: bad destination {other:?}", ins.offset)),
+        };
+        let (lo, hi) = (Opnd::Sgpr(b), Opnd::Sgpr(b + 1));
+        self.touch(&lo);
+        self.touch(&hi);
+        let soff = ins.raw.get(1).copied().unwrap_or(0) >> 25;
+        let add = if soff == 0x7d {
+            "0u".to_string()
+        } else if soff <= 107 {
+            self.touch(&Opnd::Sgpr(soff as u8));
+            r(&Opnd::Sgpr(soff as u8))?
+        } else {
+            return Err(format!("s_load at {:#x}: soffset {soff} unsupported", ins.offset));
+        };
+        let off = ins.aux.imm as i32;
+        let t = self.tmp;
+        self.tmp += 1;
+        self.line(&format!("uint2 g{t} = tb_gva({}, {}, {add}, {off}); g{t}.x &= 0xfffffffcu;", r(&lo)?, r(&hi)?));
+        let g = format!("g{t}");
+        for k in 0..n as u8 {
+            self.line(&format!("uint g{t}_{k} = {};", self.global_load_expr(&g, k, 4, false)));
+        }
+        for k in 0..n as u8 {
+            let dst = Opnd::Sgpr(d + k);
+            self.touch(&dst);
+            self.ws(&dst, &format!("g{t}_{k}"))?;
+        }
+        Ok(())
+    }
+
+    /// `global_atomic_*` / `flat_atomic_*` (32-bit): an atomic read-modify-write of one dword at
+    /// the instruction's 64-bit address. DATA is `v[data]` (and `v[data+1]` for the compare
+    /// operand of a compare-and-swap); with GLC set the pre-operation value is returned in VDST.
+    fn emit_global_atomic(&mut self, ins: &Insn) -> Result<(), String> {
+        let m = ins.mnemonic.as_str();
+        if self.amp_flat(ins) {
+            return Err(format!("{m}: global atomics in amplification/mesh shaders are not lowered"));
+        }
+        let (op, has_cmp) = atomic_op(m)?;
+        let data = match ins.src.get(1) {
+            Some(Opnd::Vgpr(d)) => *d,
+            _ => return Err(format!("{m}: data operand is not a VGPR")),
+        };
+        let va = self.global_va(ins)?;
+        let (val, cmp) = (Opnd::Vgpr(data), Opnd::Vgpr(data.wrapping_add(1)));
+        self.touch(&val);
+        let v = r(&val)?;
+        let c = if has_cmp {
+            self.touch(&cmp);
+            r(&cmp)?
+        } else {
+            "0u".to_string()
+        };
+        let t = self.tmp;
+        self.tmp += 1;
+        self.line(&format!("uint2 g{t} = {va}; uint g{t}_old = 0u;"));
+        self.line(&format!("if (exec_lo & 1u) {{ g{t}_old = tb_gatom(g{t}, {op}u, {v}, {c}); }}"));
+        let returns = ins.raw.first().is_some_and(|w| (w >> 16) & 1 != 0);
+        if returns {
+            let vd = match ins.dst.first() {
+                Some(Opnd::Vgpr(v)) => *v,
+                _ => return Err(format!("{m}: bad vdst")),
+            };
+            self.wv(&Opnd::Vgpr(vd), &format!("g{t}_old"))?;
+        }
+        Ok(())
+    }
+
     pub(super) fn emit_global(&mut self, ins: &Insn) -> Result<(), String> {
         let m = ins.mnemonic.as_str();
         if ins.aux.mask == 1 {
@@ -163,6 +332,9 @@ impl<'a> Emitter<'a> {
         }
         if ins.raw.first().is_some_and(|w| (w >> 13) & 1 != 0) {
             return Err(format!("{m}: LDS=1 (memory <-> LDS transfer) is not lowered"));
+        }
+        if m.starts_with("flat_atomic_") {
+            return self.emit_global_atomic(ins);
         }
         let (store, n, bytes, signed) = width(m).ok_or_else(|| format!("{m}: global/flat operation unsupported"))?;
         let va = self.global_va(ins)?;

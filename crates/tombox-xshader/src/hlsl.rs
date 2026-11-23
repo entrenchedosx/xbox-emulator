@@ -29,6 +29,7 @@ mod rootmem;
 mod mesh;
 mod amp;
 mod global;
+mod sval;
 mod centroid;
 mod durango;
 mod mixed;
@@ -564,6 +565,9 @@ struct Emitter<'a> {
     durango: Option<Vec<(u32, u32)>>,
     rm_mode: std::cell::Cell<Option<bool>>,
     rm_loads: BTreeMap<usize, u32>,
+    /// `s_load`s whose base is a 64-bit address held in SGPRs (not a root table): reads of
+    /// global memory through the window table, see `global.rs` / `sval.rs`.
+    smem_global: BTreeSet<usize>,
     rm_used: BTreeSet<usize>,
     bl: Vec<(u8, u32)>,
     bl_loads: HashMap<usize, (u32, u8)>,
@@ -1291,6 +1295,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         durango: durango::layout(ex)?,
         rm_mode: std::cell::Cell::new(None),
         rm_loads: BTreeMap::new(),
+        smem_global: BTreeSet::new(),
         rm_used: BTreeSet::new(),
         bl: Vec::new(),
         bl_loads: HashMap::new(),
@@ -1774,13 +1779,14 @@ impl<'a> Emitter<'a> {
         self.bsel.clear();
         self.dsel_loads.clear();
         self.dsel_moves.clear();
+        self.smem_global.clear();
         // Recording pass with the converged entry states.
         for (b, r) in ranges.iter().enumerate() {
             if let Some((mut sym, mut written)) = states[b].clone() {
                 self.res_block(&mut sym, &mut written, r.clone()).map_err(|e| first_err.clone().unwrap_or(e))?;
             }
         }
-        Ok(())
+        self.check_smem_global()
     }
 
     /// Element type of each typed buffer, inferred from how the shader uses the values it
@@ -2372,6 +2378,22 @@ impl<'a> Emitter<'a> {
                         Some(Sym::Table(t)) => *t,
                         None if !written.contains(&b) => b as u8,
                         Some(Sym::Desc { table, off, k }) if self.dg_table_ptr(*table, *off, *k).is_some() => self.dg_table_ptr(*table, *off, *k).unwrap_or(0),
+                        // An address built or loaded at run time (a pointer passed in root
+                        // constants, `(value << 8) | 12`, ...): this is a read of global
+                        // memory, not of the root table. Whether the address is a value the
+                        // shader really has is checked once the dataflow has converged
+                        // (`check_smem_global`).
+                        None | Some(Sym::Desc { .. }) => {
+                            if b >= 105 {
+                                return Err(format!("s_load at {:#x}: base s{b} has no high half", ins.offset));
+                            }
+                            self.smem_global.insert(idx);
+                            for k in 0..n {
+                                sym.remove(&(d + k as u16));
+                                written.insert(d + k as u16);
+                            }
+                            continue;
+                        }
                         other => {
                             return Err(format!(
                                 "s_load at {:#x}: base s{b} is not a root table pointer ({other:?})",
@@ -3916,6 +3938,10 @@ impl<'a> Emitter<'a> {
             }
             Enc::Smem => {
                 if ins.op <= 4 {
+                    if self.smem_global.contains(&idx) {
+                        self.uses_global = true;
+                        return self.emit_smem_global(ins);
+                    }
                     if let Some(Res::CodeTbl) = self.res.get(&idx).and_then(|v| v.first()) {
                         // Constant table embedded in the code section: byte address = pointer
                         // (relative to the start of the program) + immediate.
@@ -6984,7 +7010,7 @@ impl<'a> Emitter<'a> {
             h.push_str(&crate::trans32::hlsl());
         }
         if self.uses_global {
-            h.push_str(&global::helpers());
+            h.push_str(&global::helpers_for(&self.insns));
         }
         if self.uses_bvh {
             h.push_str(&BVH_HELPERS.replace("TB_GMEM_SPACE", &TB_GMEM_SPACE.to_string()));
