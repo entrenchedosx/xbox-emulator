@@ -354,16 +354,19 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
             aux.mask = (((w >> 8) & 7) | (((d1 >> 29) & 7) << 3)) as u8;
             aux.imm2 = ((d1 >> 27) & 3) as i64;
             aux.imm = ((w >> 15) & 1) as i64;
-            // Compare forms (op < 0x100) write a scalar mask register, not a VGPR.
+            // Compare forms write a scalar mask. V_READLANE_B32 writes one scalar.
             let dst = if op < 0x100 && op & 0x10 != 0 {
                 Opnd::ExecLo
-            } else if op < 0x100 {
+            } else if op < 0x100 || op == 0x360 {
                 ssrc8(vdst as u16, None)
             } else {
                 Opnd::Vgpr(vdst as u8)
             };
-            (vec![dst],
-             vec![src9(s0 as u16, l3), src9(s1 as u16, l3), src9(s2 as u16, l3)], aux)
+            let mut src = vec![src9(s0 as u16, l3), src9(s1 as u16, l3)];
+            if !matches!(op, 0x360 | 0x361) {
+                src.push(src9(s2 as u16, l3));
+            }
+            (vec![dst], src, aux)
         }
         Enc::Mimg => {
             let d1 = raw.get(1).copied().unwrap_or(0);

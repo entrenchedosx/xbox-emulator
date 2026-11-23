@@ -178,6 +178,33 @@ fn rootmem_overread_into_dead_sgprs_runs_on_warp() {
 }
 
 #[test]
+fn rootmem_overread_replaced_by_readlane_runs_on_warp() {
+    let mut ops = vec![sop1(3, 29, ic(-1))];
+    ops.extend(vop3(0x101, 6, [ic(0), ic(1), 29]));
+    ops.push(vop1(1, 7, ic(11)));
+    ops.extend(vop3(0x360, 30, [v(7), ic(1), 0]));
+    ops.extend(vop3(0x360, 31, [v(7), ic(3), 0]));
+    let mut words = prog_with(&smem(2, 28, 2, 0x1c, SNULL), &ops);
+    let store = words.len() - 3;
+    words.splice(store..store, [vop2(0x25, 2, 30, 2), vop2(0x25, 2, 31, 2)]);
+    let t = translate(&extract_rm(&words, rootmem_root())).unwrap_or_else(|e| panic!("translate: {e}"));
+    let code = dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).unwrap_or_else(|e| panic!("dxc: {e}\n{}", t.hlsl));
+    let m = CTX.get_or_init(|| Mutex::new(unsafe { ctx_new() }));
+    let mut c = m.lock().unwrap_or_else(|e| e.into_inner());
+    let out = unsafe { run(&mut c, &code) }.unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    for i in 0..T * GROUPS {
+        assert_eq!(out[i as usize], want(i).wrapping_add(22), "thread {i}");
+    }
+
+    // The same mask really does read s30 when it covers a 64-lane wave.
+    words.splice(store..store, [sop1(4, 126, ic(-1))]);
+    let Err(e) = translate(&extract_rm(&words, rootmem_root())) else {
+        panic!("accepted a wave64 mask whose high half reads beyond the root signature");
+    };
+    assert!(e.contains("s30 is read"), "{e}");
+}
+
+#[test]
 fn rootmem_overread_dead_on_every_branch_path_translates() {
     let words = prog_with(&smem(2, 28, 2, 0x1c, SNULL), &[0xbf85_0001, sop1(3, 30, 0), sop1(3, 31, 0)]);
     translate(&extract_rm(&words, rootmem_root())).unwrap_or_else(|e| panic!("translate: {e}"));
