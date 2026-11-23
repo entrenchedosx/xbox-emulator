@@ -464,8 +464,8 @@ pub struct ShaderCb {
     pub limits: Vec<(u32, u32, u64)>,
 }
 
-pub fn slot_limits(m: &std::collections::BTreeMap<u32, u64>) -> Vec<(u32, u32, u64)> {
-    m.iter().filter(|(slot, _)| **slot & 0x8000_0000 == 0).map(|(slot, b)| (slot & 0xffff, slot >> 16, *b)).collect()
+pub fn slot_limits(m: &std::collections::BTreeMap<tombox_xshader::hlsl::ShaderRegister, u64>) -> Vec<(u32, u32, u64)> {
+    m.iter().map(|(slot, b)| (slot.register, slot.space, *b)).collect()
 }
 
 static SHADER_CB: Mutex<Option<HashMap<u64, ShaderCb>>> = Mutex::new(None);
@@ -1152,12 +1152,13 @@ mod tests {
     }
 
     #[test]
-    fn translator_limits_map_to_register_and_space_and_skip_bindless() {
+    fn translator_limits_keep_full_register_space() {
+        use tombox_xshader::hlsl::ShaderRegister;
         let mut m = std::collections::BTreeMap::new();
-        m.insert(13, 0xffff_ffffu64 * 16);
-        m.insert((1 << 16) | 2, 0x20);
-        m.insert(0x8000_0005, 0x40);
-        assert_eq!(slot_limits(&m), vec![(13, 0, 0xffff_ffff * 16), (2, 1, 0x20)]);
+        m.insert(ShaderRegister { register: 13, space: 0 }, 0xffff_ffffu64 * 16);
+        m.insert(ShaderRegister { register: 2, space: 1 }, 0x20);
+        m.insert(ShaderRegister { register: 5, space: 0x3e_8000 }, 0x40);
+        assert_eq!(slot_limits(&m), vec![(13, 0, 0xffff_ffff * 16), (2, 1, 0x20), (5, 0x3e_8000, 0x40)]);
         let mut e = Engine::default();
         e.rs_params.insert(0x77, vec![(3, 13, 0, 5), (4, 2, 1, 0)]);
         e.pso_sizes.insert(0x99, vec![(5, 13, 0, 0x1000), (5, 2, 1, 0x100), (1, 2, 1, 0x80)]);

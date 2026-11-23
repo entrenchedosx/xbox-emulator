@@ -1,4 +1,4 @@
-use super::{r, Emitter, Res, BINDLESS};
+use super::{r, Binding, Emitter, Res};
 use crate::rdna2::{Insn, Opnd};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -224,7 +224,7 @@ fn pack16(h: &str, bits: u32, num: Num) -> Result<String, String> {
 }
 
 impl<'a> Emitter<'a> {
-    pub(super) fn mtbuf_res(&mut self, ins: &Insn, slot: u32, table: u8, off: u32) -> Result<Res, String> {
+    pub(super) fn mtbuf_res(&mut self, ins: &Insn, slot: Binding, table: u8, off: u32) -> Result<Res, String> {
         let fmt = ufmt(ins.aux.imm2 as u32).ok_or_else(|| format!("mtbuf at {:#x}: invalid buffer format {}", ins.offset, ins.aux.imm2))?;
         let writes = ins.mnemonic.starts_with("tbuffer_store") || self.uav_force.contains(&slot);
         let kind = self.kind_at(table, off, writes)?;
@@ -233,7 +233,7 @@ impl<'a> Emitter<'a> {
             Some(1) => true,
             other => return Err(format!("mtbuf at {:#x}: buffer in table of kind {other:?}", ins.offset)),
         };
-        if slot & BINDLESS != 0 {
+        if matches!(slot, Binding::Indexed(_)) {
             if is_uav { self.bl_uav.insert(slot); } else { self.bl_srv.insert(slot); }
         }
         let end = (ins.aux.imm as u32 + fmt.bytes).div_ceil(4);

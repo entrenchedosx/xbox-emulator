@@ -46,14 +46,68 @@ pub struct Translated {
     pub entry: &'static str,
     /// FXC/D3DCompile target profile.
     pub profile: &'static str,
-    pub mip_uavs: Vec<u32>,
-    pub mip_srvs: Vec<u32>,
+    pub mip_uavs: Vec<ShaderRegister>,
+    pub mip_srvs: Vec<ShaderRegister>,
     pub needs_gmem: bool,
     pub needs_global: bool,
     pub uses_typed_atomic64: bool,
     pub user_data_base: Option<usize>,
-    pub cb_limits: BTreeMap<u32, u64>,
+    pub cb_limits: BTreeMap<ShaderRegister, u64>,
     pub fmask: Vec<(u32, u32, u32)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ShaderRegister {
+    pub space: u32,
+    pub register: u32,
+}
+
+impl ShaderRegister {
+    fn hlsl(self, kind: char) -> String {
+        if self.space == 0 {
+            format!("{kind}{}", self.register)
+        } else {
+            format!("{kind}{}, space{}", self.register, self.space)
+        }
+    }
+
+    fn mip_views(self) -> Result<Self, String> {
+        let register = self.register.checked_mul(16).ok_or("per-mip register index overflow")?;
+        let space = TB_MIP_SPACE.checked_add(self.space).ok_or("per-mip register space overflow")?;
+        Ok(Self { space, register })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Binding {
+    Static(ShaderRegister),
+    Indexed(u32),
+}
+
+impl Binding {
+    fn register(register: u32, space: u32) -> Self {
+        Self::Static(ShaderRegister { space, register })
+    }
+
+    fn static_register(self) -> Option<ShaderRegister> {
+        match self {
+            Self::Static(register) => Some(register),
+            Self::Indexed(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Binding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            // Preserve the existing shader names for registers within the old 16-bit range.
+            Self::Static(r) if r.register <= 0xffff => {
+                write!(f, "{}", (u64::from(r.space) << 16) | u64::from(r.register))
+            }
+            Self::Static(r) => write!(f, "r{}s{}", r.register, r.space),
+            Self::Indexed(index) => write!(f, "d{index}"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -102,13 +156,13 @@ struct MSel {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Res {
-    Cb(u32),
-    Tex(u32, u32), // slot, dim
-    Samp(u32),
-    Uav(u32, u32), // slot, dim
-    Buf(u32, bool), // slot, is_uav (structured buffer)
-    TBuf(u32, bool), // slot, is_uav (typed buffer)
-    CbDyn(u32),      // constant buffer read through MUBUF (per-lane offset)
+    Cb(Binding),
+    Tex(Binding, u32), // slot, dim
+    Samp(Binding),
+    Uav(Binding, u32), // slot, dim
+    Buf(Binding, bool), // slot, is_uav (structured buffer)
+    TBuf(Binding, bool), // slot, is_uav (typed buffer)
+    CbDyn(Binding),      // constant buffer read through MUBUF (per-lane offset)
     CodeTbl,         // s_load from the code section (embedded constant table)
 }
 
@@ -490,24 +544,24 @@ struct Emitter<'a> {
     ex: &'a ShaderExtract,
     insns: Vec<Insn>,
     res: HashMap<usize, Vec<Res>>, // per-instruction resolved resources
-    cb_size: BTreeMap<u32, u32>,   // slot -> dwords
+    cb_size: BTreeMap<Binding, u32>,   // slot -> dwords
     vs_lat: HashMap<usize, [smem_bounds::Lat; 3]>,
     uses_smem_bounds: bool,
-    cb_lim: HashMap<u32, Option<u64>>,
-    tex: BTreeMap<u32, u32>,       // slot -> dim
-    fmask: BTreeMap<u32, u32>,
+    cb_lim: HashMap<ShaderRegister, Option<u64>>,
+    tex: BTreeMap<Binding, u32>,       // slot -> dim
+    fmask: BTreeMap<Binding, Binding>,
     fmask_loc: BTreeSet<(u32, u32, u32)>,
-    samp: BTreeSet<u32>,
-    samp_cmp: BTreeSet<u32>,
-    uav: BTreeMap<u32, u32>,       // slot -> dim
-    sbuf: BTreeMap<(bool, u32), u32>, // (is_uav, slot) -> element dwords used
-    tbuf: BTreeSet<(bool, u32)>,      // typed buffers (is_uav, slot)
-    tbuf_uint: BTreeSet<u32>,         // typed UAV slots whose element must be uint (atomics)
+    samp: BTreeSet<Binding>,
+    samp_cmp: BTreeSet<Binding>,
+    uav: BTreeMap<Binding, u32>,       // slot -> dim
+    sbuf: BTreeMap<(bool, Binding), u32>, // (is_uav, slot) -> element dwords used
+    tbuf: BTreeSet<(bool, Binding)>,     // typed buffers (is_uav, slot)
+    tbuf_uint: BTreeSet<Binding>,         // typed UAV slots whose element must be uint (atomics)
     /// Inferred integer element type of typed buffers: (is_uav, slot) -> 1 uint, 2 sint.
-    tbuf_ty: BTreeMap<(bool, u32), u8>,
+    tbuf_ty: BTreeMap<(bool, Binding), u8>,
     /// Inferred integer texel type of textures read with texel fetches / written with image
     /// stores: (is_uav, slot) -> 1 uint, 2 sint. Absent = float (the default).
-    img_ty: BTreeMap<(bool, u32), u8>,
+    img_ty: BTreeMap<(bool, Binding), u8>,
     /// Pixel-shader colour-export epilogues (see `find_export_epilogs`): pack instruction
     /// index -> capture id, and export instruction index -> the capture ids feeding its
     /// two packed operands (usize::MAX = operand not written).
@@ -517,7 +571,7 @@ struct Emitter<'a> {
     cur_idx: usize,
     /// Structured buffers read with scalar loads (`s_buffer_load` through an SRV/UAV
     /// descriptor): they need the byte-offset helper.
-    sbuf_flat: BTreeSet<(bool, u32)>,
+    sbuf_flat: BTreeSet<(bool, Binding)>,
     is_cs: bool,
     /// Nesting depth of emitted HLSL loops at the current instruction.
     loop_depth: u32,
@@ -535,8 +589,8 @@ struct Emitter<'a> {
     multi_sets: Vec<Vec<(u8, u32)>>,
     /// Image ops whose texture and/or sampler is one of several descriptors.
     /// UAV texture slots used with image atomics (declared `<uint>`).
-    uav_uint: BTreeSet<u32>,
-    uav_u64: BTreeSet<u32>,
+    uav_uint: BTreeSet<Binding>,
+    uav_u64: BTreeSet<Binding>,
     /// The shader uses wave intrinsics (needs shader model 6: DXC only).
     uses_wave: bool,
     wave64: bool,
@@ -576,13 +630,13 @@ struct Emitter<'a> {
     uses_d16: bool,
     uses_trans16: bool,
     uses_trans32: bool,
-    uav_mips: BTreeSet<u32>,
-    tex_mips: BTreeSet<u32>,
+    uav_mips: BTreeSet<ShaderRegister>,
+    tex_mips: BTreeSet<ShaderRegister>,
     sm6_minor: u32,
     hw_regs: BTreeSet<u32>,
-    uav_force: BTreeSet<u32>,
-    bl_uav: BTreeSet<u32>,
-    bl_srv: BTreeSet<u32>,
+    uav_force: BTreeSet<Binding>,
+    bl_uav: BTreeSet<Binding>,
+    bl_srv: BTreeSet<Binding>,
     uses_bvh: bool,
     uses_global: bool,
     mode_use: mode::ModeUse,
@@ -1211,7 +1265,7 @@ fn translate_linked_with(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, use
     }
 }
 
-fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_override: Option<usize>, uav_force: BTreeSet<u32>, user_data: bool) -> Result<Translated, String> {
+fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_override: Option<usize>, uav_force: BTreeSet<Binding>, user_data: bool) -> Result<Translated, String> {
     let (profile, is_ps) = match ex.stage {
         Stage::Vertex => ("vs_5_0", false),
         Stage::Pixel => ("ps_5_0", true),
@@ -1331,7 +1385,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         }
     }
     em.resolve_resources()?;
-    let clash: BTreeSet<u32> = em.bl_uav.intersection(&em.bl_srv).copied().filter(|s| !em.uav_force.contains(s)).collect();
+    let clash: BTreeSet<Binding> = em.bl_uav.intersection(&em.bl_srv).copied().filter(|s| !em.uav_force.contains(s)).collect();
     if !clash.is_empty() {
         let mut force = em.uav_force.clone();
         force.extend(clash);
@@ -1495,32 +1549,34 @@ impl<'a> Emitter<'a> {
         matches!(self.ex.root_sig.as_ref().and_then(|r| r.params.get(p)).map(|x| &x.kind), Some(crate::meta::RootParamKind::Descriptor { .. }))
     }
 
-    fn bind_id(&self, table: u8, off: u32, stride: u32) -> u32 {
-        if let Some(id) = self.rm_bind(table) {
-            return id;
+    fn bind_id(&self, table: u8, off: u32, stride: u32) -> Result<Binding, String> {
+        if let Some(id) = self.rm_bind(table)? {
+            return Ok(id);
         }
         if off & BINDLESS != 0 {
-            return off;
+            return Ok(Binding::Indexed(off & !BINDLESS));
         }
-        let fallback = off / stride;
-        let Some((p, 0)) = self.root_param_at(table, self.user_base()) else { return fallback };
-        let Some(param) = self.ex.root_sig.as_ref().and_then(|r| r.params.get(p)) else { return fallback };
-        match &param.kind {
-            crate::meta::RootParamKind::Descriptor { register, space, .. } => (space << 16) | register,
+        let idx = off / stride;
+        let fallback = Binding::register(idx, 0);
+        let Some((p, 0)) = self.root_param_at(table, self.user_base()) else { return Ok(fallback) };
+        let Some(param) = self.ex.root_sig.as_ref().and_then(|r| r.params.get(p)) else { return Ok(fallback) };
+        Ok(match &param.kind {
+            crate::meta::RootParamKind::Descriptor { register, space, .. } => Binding::register(*register, *space),
             crate::meta::RootParamKind::Table(ranges) => {
-                let idx = off / stride;
                 let mut next = 0u32;
                 for r in ranges {
                     let start = if r.offset_in_table == u32::MAX { next } else { r.offset_in_table };
                     next = start.saturating_add(r.num);
                     if idx >= start && (r.num == u32::MAX || idx - start < r.num) {
-                        return (r.space << 16) | (r.base_register + idx - start);
+                        let register = r.base_register.checked_add(idx - start)
+                            .ok_or("descriptor table register index overflow")?;
+                        return Ok(Binding::register(register, r.space));
                     }
                 }
                 fallback
             }
             _ => fallback,
-        }
+        })
     }
 
     fn sgpr_const_in(insns: &[Insn], start: usize, idx: usize, reg: u8) -> Option<u32> {
@@ -1557,21 +1613,19 @@ impl<'a> Emitter<'a> {
         if self.root_param_at(table, self.user_base()).is_none() {
             return dim;
         }
-        let id = self.bind_id(table, byte, 32);
-        if id & BINDLESS != 0 {
+        let Ok(Binding::Static(ShaderRegister { register, space })) = self.bind_id(table, byte, 32) else {
             return dim;
-        }
-        let (space, reg) = (id >> 16, id & 0xffff);
+        };
         let want = if is_uav { 6 } else { 3 };
-        let Some(p) = self.ex.resources.iter().find(|p| p.res_type == want && p.space == space && p.lower <= reg && reg <= p.upper) else { return dim };
+        let Some(p) = self.ex.resources.iter().find(|p| p.res_type == want && p.space == space && p.lower <= register && register <= p.upper) else { return dim };
         psv_image_dim_ms(p.kind, dim, msaa_dim_on())
     }
 
-    fn decl(&self, used: &mut Vec<(String, u8, usize)>, ty: &str, name: &str, slot: u32, class: char, range_type: u32, stride: u32) -> Result<String, String> {
-        if slot & BINDLESS == 0 {
-            return Ok(format!("{ty} {name} : register({});\n", Self::reg_of(class, slot)));
-        }
-        let n = slot & !BINDLESS;
+    fn decl(&self, used: &mut Vec<(String, u8, usize)>, ty: &str, name: &str, slot: Binding, class: char, range_type: u32, stride: u32) -> Result<String, String> {
+        let n = match slot {
+            Binding::Static(register) => return Ok(format!("{ty} {name} : register({});\n", register.hlsl(class))),
+            Binding::Indexed(n) => n,
+        };
         let (table, _) = *self.bl.get(n as usize).ok_or("bindless: unknown load")?;
         let (p, _) = self.root_param_at(table, self.user_base()).ok_or_else(|| format!("bindless: s{table} is not a root parameter"))?;
         let Some(crate::meta::RootParamKind::Table(ranges)) = self.ex.root_sig.as_ref().and_then(|r| r.params.get(p)).map(|x| &x.kind) else {
@@ -1617,14 +1671,6 @@ impl<'a> Emitter<'a> {
         };
         out.push_str(&format!("#define {name} {}[tb_bi{n} / {stride}u - {}u]\n", bl_name(table, key), starts[key & 0xffff]));
         Ok(out)
-    }
-
-    fn reg_of(kind: char, id: u32) -> String {
-        if id >> 16 == 0 {
-            format!("{kind}{id}")
-        } else {
-            format!("{kind}{}, space{}", id & 0xffff, id >> 16)
-        }
     }
 
     /// Classify descriptor loads and bind them to HLSL registers.
@@ -1856,15 +1902,15 @@ impl<'a> Emitter<'a> {
             }
         }
         // Keys are (is image, is_uav, slot): typed buffers and textures are told apart.
-        let mut votes: BTreeMap<(bool, bool, u32), [u32; 3]> = BTreeMap::new();
+        let mut votes: BTreeMap<(bool, bool, Binding), [u32; 3]> = BTreeMap::new();
         // (stored-to resource, loaded-from resource): a store of registers loaded from another
         // typed resource says both hold the same kind of element.
-        let mut links: Vec<((bool, bool, u32), (bool, bool, u32))> = Vec::new();
+        let mut links: Vec<((bool, bool, Binding), (bool, bool, Binding))> = Vec::new();
         // Textures that are sampled or gathered hold filterable (float) data.
-        let mut sampled: BTreeSet<u32> = BTreeSet::new();
+        let mut sampled: BTreeSet<Binding> = BTreeSet::new();
         let n = self.insns.len();
         // The typed resource an instruction reads or writes, with the data registers.
-        let typed = |em: &Self, i: usize| -> Option<((bool, bool, u32), BTreeSet<u8>, bool, bool)> {
+        let typed = |em: &Self, i: usize| -> Option<((bool, bool, Binding), BTreeSet<u8>, bool, bool)> {
             let ins = &em.insns[i];
             let Some(&Opnd::Vgpr(vd)) = ins.dst.first() else { return None };
             match em.res.get(&i).and_then(|v| v.first()).copied()? {
@@ -1972,7 +2018,7 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
-        let mut ty: BTreeMap<(bool, bool, u32), u8> = BTreeMap::new();
+        let mut ty: BTreeMap<(bool, bool, Binding), u8> = BTreeMap::new();
         for (k, v) in &votes {
             let ints = v[1] + v[2];
             if ints > v[0] {
@@ -2104,7 +2150,7 @@ impl<'a> Emitter<'a> {
     /// buffer that way and its view really has stride 4 (forcing 16 scrambled the per-object
     /// data it uploads); no 16-byte buffer in the comparison was touched like that.
     /// A heuristic (TECHNICAL_DEBT).
-    fn sbuf_words(&self, key: (bool, u32)) -> u32 {
+    fn sbuf_words(&self, key: (bool, Binding)) -> u32 {
         let raw = self.sbuf.get(&key).copied().unwrap_or(1).max(1);
         match raw {
             1 => 1,
@@ -2115,11 +2161,8 @@ impl<'a> Emitter<'a> {
 
     /// A raw SRV or UAV bound directly in the root signature is addressed in
     /// bytes. Instruction offsets do not describe a structured element size.
-    fn raw_root_buffer(&self, slot: u32, is_uav: bool) -> bool {
-        if slot & BINDLESS != 0 {
-            return false;
-        }
-        let (register, space) = (slot & 0xffff, slot >> 16);
+    fn raw_root_buffer(&self, slot: Binding, is_uav: bool) -> bool {
+        let Binding::Static(ShaderRegister { register, space }) = slot else { return false };
         let (binding_type, parameter_type) = if is_uav { (7, 4) } else { (4, 3) };
         self.ex.resources.iter().any(|r| {
             r.res_type == binding_type && r.space == space && (r.lower..=r.upper).contains(&register)
@@ -2131,13 +2174,13 @@ impl<'a> Emitter<'a> {
 
     /// Resource a MUBUF instruction addresses when its descriptor is `slot` of `table`
     /// (also records declaration requirements).
-    fn mubuf_res(&mut self, ins: &Insn, slot: u32, table: u8, off: u32) -> Result<Res, String> {
+    fn mubuf_res(&mut self, ins: &Insn, slot: Binding, table: u8, off: u32) -> Result<Res, String> {
         if ins.enc == Enc::Mtbuf {
             return self.mtbuf_res(ins, slot, table, off);
         }
         let writes = ins.mnemonic.contains("store") || ins.mnemonic.contains("atomic") || self.uav_force.contains(&slot);
         let kind = self.kind_at(table, off, writes)?;
-        if slot & BINDLESS != 0 && kind.is_some_and(|k| k <= 1) {
+        if matches!(slot, Binding::Indexed(_)) && kind.is_some_and(|k| k <= 1) {
             if kind == Some(1) { self.bl_uav.insert(slot); } else { self.bl_srv.insert(slot); }
         }
         let is_uav = match kind {
@@ -2163,8 +2206,12 @@ impl<'a> Emitter<'a> {
             }
             // PSV0 tells typed (6) from structured (8) UAVs. Atomics need a uint element, so
             // a typed UAV used atomically is declared RWBuffer<uint>.
-            let (reg, space) = (slot & 0xffff, slot >> 16);
-            let structured = slot & BINDLESS != 0 || self.ex.resources.iter().any(|p| matches!(p.res_type, 7 | 8 | 9) && p.space == space && p.lower <= reg && reg <= p.upper);
+            let structured = slot.static_register().is_none_or(|r| {
+                self.ex.resources.iter().any(|p| {
+                    matches!(p.res_type, 7 | 8 | 9) && p.space == r.space
+                        && (p.lower..=p.upper).contains(&r.register)
+                })
+            });
             if structured {
                 let e = self.sbuf.entry((true, slot)).or_insert(0);
                 *e = (*e).max(ins.aux.imm as u32 / 4 + 1);
@@ -2483,7 +2530,7 @@ impl<'a> Emitter<'a> {
                     // descriptors the load is still treated as a constant buffer (debt).
                     let buffer_kind = if cands.len() == 1 { self.kind_at(cands[0].0, cands[0].1, false)?.filter(|k| *k <= 1) } else { None };
                     for (table, off) in &cands {
-                        let slot = self.bind_id(*table, *off, 32);
+                        let slot = self.bind_id(*table, *off, 32)?;
                         if let Some(k) = buffer_kind {
                             let key = (k == 1, slot);
                             let e = self.sbuf.entry(key).or_insert(0);
@@ -2516,7 +2563,7 @@ impl<'a> Emitter<'a> {
                     })?;
                     let mut out: Vec<(u32, Res)> = Vec::new();
                     for (table, off) in &cands {
-                        let slot = self.bind_id(*table, *off, 32);
+                        let slot = self.bind_id(*table, *off, 32)?;
                         out.push((((*table as u32) << 24) | off, self.mubuf_res(ins, slot, *table, *off)?));
                     }
                     self.res.insert(idx, vec![out[0].1]);
@@ -2543,13 +2590,13 @@ impl<'a> Emitter<'a> {
                     })?;
                     let mut tex_res: Vec<(u32, Res)> = Vec::new();
                     for (ttable, off) in &tex_c {
-                        let tslot = self.bind_id(*ttable, *off, 32);
+                        let tslot = self.bind_id(*ttable, *off, 32)?;
                         let writes = ins.mnemonic.contains("store") || ins.mnemonic.contains("atomic") || self.uav_force.contains(&tslot);
                         let is_uav = self.kind_at(*ttable, *off, writes)? == Some(1);
                         let dim = self.gcn_image_dim(*ttable, *off, is_uav, da_dim);
                         if !is_uav && dim == 1 && msaa_dim_on() && ins.mnemonic == "image_load" && *off & BINDLESS == 0 && *off >= 32 && self.gcn_image_dim(*ttable, *off - 32, false, 1) == 6 {
-                            let ms = self.bind_id(*ttable, *off - 32, 32);
-                            if ms & BINDLESS == 0 {
+                            let ms = self.bind_id(*ttable, *off - 32, 32)?;
+                            if matches!(ms, Binding::Static(_)) {
                                 self.tex.entry(ms).or_insert(6);
                                 self.fmask.insert(tslot, ms);
                                 if let Some((param, _)) = self.root_param_at(*ttable, self.user_base()) {
@@ -2557,7 +2604,7 @@ impl<'a> Emitter<'a> {
                                 }
                             }
                         }
-                        if tslot & BINDLESS != 0 {
+                        if matches!(tslot, Binding::Indexed(_)) {
                             if is_uav { self.bl_uav.insert(tslot); } else { self.bl_srv.insert(tslot); }
                         }
                         if is_uav && ins.mnemonic.starts_with("image_atomic_") {
@@ -2581,13 +2628,16 @@ impl<'a> Emitter<'a> {
                     if ins.mnemonic.starts_with("image_sample") || ins.mnemonic.starts_with("image_gather") || ins.mnemonic == "image_get_lod" {
                         let fixed = if sym.get(&ss).is_none() && written.contains(&ss) { self.dg_static_sampler(idx, ss)? } else { None };
                         let samp_c = match fixed {
-                            Some(slot) => vec![(0xffu8, slot)],
+                            Some(_) => vec![(0xffu8, 0)],
                             None => self.desc_candidates(sym.get(&ss), 16).ok_or_else(|| {
                                 format!("mimg at {:#x}: s{ss} not a sampler descriptor ({:?})", ins.offset, sym.get(&ss))
                             })?,
                         };
                         for (stable, off) in &samp_c {
-                            let sslot = if fixed.is_some() { *off } else { self.bind_id(*stable, *off, 16) };
+                            let sslot = match fixed {
+                                Some(slot) => slot,
+                                None => self.bind_id(*stable, *off, 16)?,
+                            };
                             // Depth-compare variants (opcode bit 3) need a comparison sampler.
                             if ins.op & 8 != 0 {
                                 self.samp_cmp.insert(sslot);
@@ -6278,11 +6328,11 @@ impl<'a> Emitter<'a> {
                 return Err("image slot mixes 32-bit and 64-bit image atomics".into());
             }
             let uobj = if is_uav && with_mip {
-                if slot & BINDLESS != 0 {
+                let Some(register) = slot.static_register() else {
                     return Err(format!("{} on a bindless UAV: per-mip views need a heap-mirrored descriptor range", ins.mnemonic));
-                }
+                };
                 let mip_u = addr_i(self, ncoord)?;
-                self.uav_mips.insert(slot);
+                self.uav_mips.insert(register);
                 format!("uav{slot}_m[NonUniformResourceIndex(min({mip_u}, 15u))]")
             } else {
                 format!("uav{slot}")
@@ -6727,10 +6777,10 @@ impl<'a> Emitter<'a> {
                 if self.ex.stage != Stage::Pixel {
                     return Err(format!("{} (implicit LOD) outside a pixel shader", ins.mnemonic));
                 }
-                if tslot & BINDLESS != 0 {
+                let Some(register) = tslot.static_register() else {
                     return Err(format!("{} on a bindless texture: per-mip views need a heap-mirrored descriptor range", ins.mnemonic));
-                }
-                self.tex_mips.insert(tslot);
+                };
+                self.tex_mips.insert(register);
                 if zref.is_some() {
                     self.sm6_minor = self.sm6_minor.max(8);
                 }
@@ -7121,8 +7171,8 @@ impl<'a> Emitter<'a> {
         }
         for (slot, dwords) in &self.cb_size {
             let nv = dwords.div_ceil(4).max(1);
-            if slot & BINDLESS == 0 {
-                let _ = writeln!(h, "cbuffer CB{slot} : register({}) {{ uint4 cb{slot}[{nv}]; }};", Self::reg_of('b', *slot));
+            if let Some(register) = slot.static_register() {
+                let _ = writeln!(h, "cbuffer CB{slot} : register({}) {{ uint4 cb{slot}[{nv}]; }};", register.hlsl('b'));
             } else {
                 let _ = writeln!(h, "struct TbBlCb{slot} {{ uint4 v[{nv}]; }};");
                 let d = self.decl(&mut used, &format!("ConstantBuffer<TbBlCb{slot}>"), &format!("cb{slot}_"), *slot, 'b', 2, 32)?;
@@ -7150,8 +7200,8 @@ impl<'a> Emitter<'a> {
                 None => "float4",
             };
             h.push_str(&self.decl(&mut used, &format!("{ty}<{e}>"), &format!("tex{slot}"), *slot, 't', 0, 32)?);
-            if self.tex_mips.contains(slot) {
-                let _ = writeln!(h, "{ty}<{e}> tex{slot}_m[16] : register(t{}, space{});", (slot & 0xffff) * 16, TB_MIP_SPACE + (slot >> 16));
+            if let Some(register) = slot.static_register().filter(|r| self.tex_mips.contains(r)) {
+                let _ = writeln!(h, "{ty}<{e}> tex{slot}_m[16] : register({});", register.mip_views()?.hlsl('t'));
             }
         }
         for slot in &self.samp {
@@ -7221,8 +7271,8 @@ impl<'a> Emitter<'a> {
                 _ => return Err(format!("UAV dim {dim} unsupported")),
             };
             h.push_str(&self.decl(&mut used, &ty, &format!("uav{slot}"), *slot, 'u', 1, 32)?);
-            if self.uav_mips.contains(slot) {
-                let _ = writeln!(h, "{ty} uav{slot}_m[16] : register(u{}, space{});", (slot & 0xffff) * 16, TB_MIP_SPACE + (slot >> 16));
+            if let Some(register) = slot.static_register().filter(|r| self.uav_mips.contains(r)) {
+                let _ = writeln!(h, "{ty} uav{slot}_m[16] : register({});", register.mip_views()?.hlsl('u'));
             }
         }
         if self.uses_code {

@@ -4,6 +4,11 @@ const T: u32 = 8;
 const GROUPS: u32 = 2;
 const BYTES: u64 = 4096;
 const CONSTS: [u32; 5] = [0x1000_0001, 0x0000_0101, 0xdead_0002, 0xbeef_0003, 0x5a5a_a5a5];
+const NATIVE_PARAMS: [[u32; 8]; 3] = [
+    [4, 0, 0, 0, 0, 0, 0, 0],
+    [1, 0, 0, 0, 5, 0, 0, 0],
+    [3, 0, 0, 0, 0, 0, 0, 0],
+];
 
 fn input(i: u32) -> u32 {
     i.wrapping_mul(0x9e37_79b9) ^ 0x0bad_f00d
@@ -86,8 +91,12 @@ unsafe fn ser_params(params: &[[u32; 8]]) -> Result<Vec<u8>, String> {
 }
 
 unsafe fn run(c: &mut Ctx, code: &[u8]) -> Result<Vec<u32>, String> {
+    run_with_params(c, code, &NATIVE_PARAMS)
+}
+
+unsafe fn run_with_params(c: &mut Ctx, code: &[u8], params: &[[u32; 8]]) -> Result<Vec<u32>, String> {
     let g = &c.gpu;
-    let blob = ser_params(&[[4, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 5, 0, 0, 0], [3, 0, 0, 0, 0, 0, 0, 0]])?;
+    let blob = ser_params(params)?;
     let mut rs: *mut c_void = core::ptr::null_mut();
     let hr = vcall!(g.device, 16, fn(u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32, 0, blob.as_ptr(), blob.len(), &d3d::IID_ROOTSIG, &mut rs);
     if hr < 0 {
@@ -148,6 +157,28 @@ fn rootmem_descriptors_and_constants() {
     let wrong: Vec<String> = (0..T * GROUPS).filter(|&i| out[i as usize] != want(i)).map(|i| format!("[{i}] {:08x} want {:08x}", out[i as usize], want(i))).collect();
     assert!(wrong.is_empty(), "{}\n{}", wrong.join(", "), t.hlsl);
     assert!(out[(T * GROUPS) as usize..].iter().all(|&w| w == 0));
+}
+
+#[test]
+fn rootmem_preserves_full_register_spaces_on_warp() {
+    const UAV_SPACE: u32 = 0x3e_8fa1;
+    const SRV_SPACE: u32 = 0x1_8fa1;
+    let mut root = rootmem_root();
+    root.params[0].kind = RootParamKind::Descriptor { kind: 4, register: 0, space: UAV_SPACE };
+    root.params[2].kind = RootParamKind::Descriptor { kind: 3, register: 0, space: SRV_SPACE };
+    let t = translate(&extract_rm(&prog(), root)).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert!(t.hlsl.contains(&format!("register(u0, space{UAV_SPACE})")));
+    assert!(t.hlsl.contains(&format!("register(t0, space{SRV_SPACE})")));
+    let code = dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).unwrap_or_else(|e| panic!("dxc: {e}\n{}", t.hlsl));
+    let mut params = NATIVE_PARAMS;
+    params[0][3] = UAV_SPACE;
+    params[2][3] = SRV_SPACE;
+    let m = CTX.get_or_init(|| Mutex::new(unsafe { ctx_new() }));
+    let mut c = m.lock().unwrap_or_else(|e| e.into_inner());
+    let out = unsafe { run_with_params(&mut c, &code, &params) }.unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    for i in 0..T * GROUPS {
+        assert_eq!(out[i as usize], want(i), "thread {i}");
+    }
 }
 
 #[test]

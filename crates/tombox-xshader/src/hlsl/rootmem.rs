@@ -1,4 +1,4 @@
-use super::{sreg_num, sreg_opnd, Emitter, Sym, BINDLESS};
+use super::{sreg_num, sreg_opnd, Binding, Emitter, Sym, BINDLESS};
 use crate::meta::RootParamKind;
 use crate::rdna2::{Enc, Insn, Opnd};
 use std::fmt::Write as _;
@@ -122,14 +122,14 @@ impl Emitter<'_> {
         })
     }
 
-    pub(super) fn rm_bind(&self, table: u8) -> Option<u32> {
+    pub(super) fn rm_bind(&self, table: u8) -> Result<Option<Binding>, String> {
         if table < RM_TABLE {
-            return None;
+            return Ok(None);
         }
         match self.rm_kind_of((table & !RM_TABLE) as usize) {
-            Some(RootParamKind::Descriptor { register, space, .. }) => Some((space << 16) | register),
-            Some(RootParamKind::Table(_)) => None,
-            _ => Some(u32::MAX),
+            Some(RootParamKind::Descriptor { register, space, .. }) => Ok(Some(Binding::register(*register, *space))),
+            Some(RootParamKind::Table(_)) => Ok(None),
+            _ => Err(format!("root-memory table {table:#x} has no resource binding")),
         }
     }
 

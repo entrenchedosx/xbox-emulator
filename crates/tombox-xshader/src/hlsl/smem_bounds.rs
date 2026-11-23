@@ -318,20 +318,21 @@ impl Emitter<'_> {
         }
     }
 
-    pub(super) fn note_cb_bound(&mut self, slot: u32, b: Option<&Bound>) {
+    pub(super) fn note_cb_bound(&mut self, slot: super::Binding, b: Option<&Bound>) {
+        let Some(register) = slot.static_register() else { return };
         let lim = match b {
             Some(Bound::Static { nr, stride: Some(s) }) => Some(limit(*nr, *s)),
             _ => None,
         };
-        let e = self.cb_lim.entry(slot).or_insert(lim);
+        let e = self.cb_lim.entry(register).or_insert(lim);
         *e = match (*e, lim) {
             (Some(a), Some(b)) => Some(a.max(b)),
             _ => None,
         };
     }
 
-    pub(super) fn cb_limits(&self) -> std::collections::BTreeMap<u32, u64> {
-        self.cb_lim.iter().filter(|(s, _)| *s & super::BINDLESS == 0).filter_map(|(s, l)| l.map(|l| (*s, l))).collect()
+    pub(super) fn cb_limits(&self) -> std::collections::BTreeMap<super::ShaderRegister, u64> {
+        self.cb_lim.iter().filter_map(|(s, l)| l.map(|l| (*s, l))).collect()
     }
 
     pub(super) fn smem_cond_static(&mut self, b: &Bound, o: u64) -> Cond {
