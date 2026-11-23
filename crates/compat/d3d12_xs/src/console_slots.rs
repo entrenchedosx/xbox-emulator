@@ -306,7 +306,7 @@ static WBI_LOG: AtomicUsize = AtomicUsize::new(0);
 pub(crate) unsafe fn write_immediate(list: *mut c_void, va: u64, words: &[u32], mode: u32, what: &str) {
     let _ij = unsafe { crate::inject::scope(list, crate::inject::COPY) };
     let align = 4 * words.len() as u64;
-    if va == 0 || va & GRAPHICS_VA_HIGH_MASK != 0 || va % align != 0 {
+    if va == 0 || va % align != 0 {
         if once(&WBI_LOG, 8) {
             record("d3d12_xs", "console_slots", &format!("{what}: destination {va:#x} must be {align}-byte aligned (console validation)"));
         }
@@ -340,7 +340,16 @@ pub(crate) unsafe fn write_immediate(list: *mut c_void, va: u64, words: &[u32], 
             return;
         }
     }
-    let params = wbi_params(va, words);
+    // Tracked title aliases can be above the console's 40-bit address
+    // limit. PC WriteBufferImmediate needs the host buffer's actual VA.
+    let host_base = unsafe { crate::gpu_va::host_buffer_base(e.res as *mut c_void) };
+    let Some(host_va) = host_base.checked_add(off).filter(|host_va| host_base != 0 && host_va % 4 == 0) else {
+        if once(&WBI_LOG, 8) {
+            record("d3d12_xs", "console_slots", &format!("{what}: destination {va:#x} has no aligned host buffer address"));
+        }
+        return;
+    };
+    let params = wbi_params(host_va, words);
     let modes = vec![mode; params.len()];
     unsafe {
         if let Some((a, b)) = db { crate::fill::barrier_pub(list, e.res, a, b); }

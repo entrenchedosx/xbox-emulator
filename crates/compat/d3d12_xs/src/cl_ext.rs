@@ -153,7 +153,7 @@ pub enum Bop64 {
 }
 
 pub fn bop64_route(va: u64, flags: u32) -> Result<Bop64, &'static str> {
-    if va == 0 || va & GRAPHICS_VA_HIGH_MASK != 0 || va % 8 != 0 {
+    if va == 0 || va % 8 != 0 || (va & GRAPHICS_VA_HIGH_MASK != 0 && !crate::gpu_va::contains_buffer_range(va, 8)) {
         return Err("destination must be an 8-byte aligned graphics address");
     }
     Ok(if flags & BOP_FLAG_GPU_TIMESTAMP != 0 {
