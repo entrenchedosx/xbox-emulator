@@ -163,6 +163,21 @@ unsafe extern "system" fn check_feature_support(
     hr
 }
 
+/// Largest shader-visible CBV/SRV/UAV heap a PC D3D12 runtime creates
+/// (`D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_1/2`). Measured on the
+/// development host: 1,000,000 accepted, 1,000,001 refused with E_INVALIDARG,
+/// while the same size without the shader-visible flag is accepted. The console
+/// has no such limit - GTA VI asks for a 1,245,184-slot heap.
+pub(crate) const PC_MAX_SHADER_VISIBLE_CBV_SRV_UAV: u32 = 1_000_000;
+
+/// For a descriptor heap the host refused with E_INVALIDARG, the size to retry
+/// with. `desc` is `{ Type, NumDescriptors, Flags, NodeMask }`. Only the one
+/// documented host ceiling is handled; anything else is a real error.
+pub(crate) fn host_heap_retry(desc: &[u32; 4]) -> Option<u32> {
+    let (ty, num, flags) = (desc[0], desc[1], desc[2]);
+    (ty == 0 && flags & 1 != 0 && num > PC_MAX_SHADER_VISIBLE_CBV_SRV_UAV).then_some(PC_MAX_SHADER_VISIBLE_CBV_SRV_UAV)
+}
+
 /// Intercept `CreateDescriptorHeap` (slot 14) and wrap the returned heap so the
 /// descriptor-handle getters get the Xbox RAX return-convention bridge.
 unsafe extern "system" fn create_descriptor_heap(
@@ -172,7 +187,28 @@ unsafe extern "system" fn create_descriptor_heap(
     let real = unsafe { (*this).real };
     let f: unsafe extern "system" fn(*mut c_void, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(14)) };
-    let hr = unsafe { f(real, pdesc, riid, ppv) };
+    let mut hr = unsafe { f(real, pdesc, riid, ppv) };
+    // The host's shader-visible CBV/SRV/UAV ceiling is below the console's heap size.
+    // Create the largest heap the host allows rather than none: the title would
+    // otherwise carry on with a null heap. The difference is reported, not hidden -
+    // console descriptor slots at or above the host size have no PC slot behind them.
+    let mut retried = None;
+    if hr == 0x8007_0057u32 as i32 && !pdesc.is_null() {
+        let want = unsafe { *(pdesc as *const [u32; 4]) };
+        if let Some(n) = host_heap_retry(&want) {
+            let mut smaller = want;
+            smaller[1] = n;
+            let hr2 = unsafe { f(real, smaller.as_ptr() as *const c_void, riid, ppv) };
+            record("d3d12_xs", "CreateDescriptorHeap", &format!(
+                "HOST LIMIT: shader-visible CBV/SRV/UAV heap of {} descriptors is above what the PC runtime allows; retried with {} -> hr={hr2:#010x}. Console slots {}..{} have no PC descriptor behind them",
+                want[1], n, n, want[1]));
+            if hr2 == S_OK {
+                hr = hr2;
+                retried = Some(smaller);
+            }
+        }
+    }
+    let pdesc = retried.as_ref().map_or(pdesc, |d| d.as_ptr() as *const c_void);
     if hr != S_OK && !pdesc.is_null() { let d = pdesc as *const u32; record("d3d12_xs", "CreateDescriptorHeap", &unsafe { format!("FAILED type={} num={} flags={:#x} node={:#x} hr={hr:#010x}", *d, *d.add(1), *d.add(2), *d.add(3)) }); }
     if hr == S_OK && !ppv.is_null() {
         // Keep the heap REAL (so it works when passed to SetDescriptorHeaps etc.);
@@ -2102,6 +2138,100 @@ dev_stubs!(
     (d86,86),(d87,87),(d88,88),(d89,89),(d90,90),
 );
 
+// Console device slots past the ones with a body (91..160) used to share one
+// silent stub that returned E_NOTIMPL, so a title bailing out on a missing method
+// left no trace in the log. These stubs still return E_NOTIMPL - nothing is
+// pretended to work - but say which slot was called and from where.
+unsafe extern "system" fn dev_notimpl_impl(_this: *mut c_void, a: u64, caller: usize, slot: u64) -> i32 {
+    static PER_SLOT: [core::sync::atomic::AtomicUsize; 160] = [const { core::sync::atomic::AtomicUsize::new(0) }; 160];
+    DEVSTUB_HITS.fetch_add(1, Ordering::Relaxed);
+    if PER_SLOT[(slot as usize).min(159)].fetch_add(1, Ordering::Relaxed) < 3 {
+        if DEVSTUB_EXE_BASE.load(Ordering::Relaxed) == 0 {
+            extern "system" { fn GetModuleHandleW(n: *const u16) -> *mut c_void; }
+            DEVSTUB_EXE_BASE.store(unsafe { GetModuleHandleW(core::ptr::null()) } as usize, Ordering::Relaxed);
+        }
+        let base = DEVSTUB_EXE_BASE.load(Ordering::Relaxed);
+        record("d3d12_xs", "dev_ext", &format!(
+            "slot={slot} arg1={a:#x} caller=EXE+{:#x} -> E_NOTIMPL (console device method not implemented)", caller.wrapping_sub(base)));
+    }
+    0x8000_4001u32 as i32
+}
+macro_rules! dev_notimpl_stubs {
+    ($(($name:ident, $slot:literal)),* $(,)?) => {
+        $(
+            #[unsafe(naked)]
+            unsafe extern "system" fn $name() -> i32 {
+                core::arch::naked_asm!(
+                    "mov r8, [rsp]", "mov r9d, {s}", "jmp {i}",
+                    s = const $slot, i = sym dev_notimpl_impl,
+                );
+            }
+        )*
+        unsafe fn install_dev_notimpl_stubs(v: &mut [usize]) {
+            $( v[$slot] = $name as usize; )*
+        }
+    };
+}
+dev_notimpl_stubs!(
+    (n91,91),(n92,92),(n93,93),(n94,94),(n95,95),(n96,96),(n97,97),(n98,98),(n99,99),(n100,100),
+    (n101,101),(n102,102),(n103,103),(n104,104),(n105,105),(n106,106),(n107,107),(n108,108),(n109,109),(n110,110),
+    (n111,111),(n112,112),(n113,113),(n114,114),(n115,115),(n116,116),(n117,117),(n118,118),(n119,119),(n120,120),
+    (n121,121),(n122,122),(n123,123),(n124,124),(n125,125),(n126,126),(n127,127),(n128,128),(n129,129),(n130,130),
+    (n131,131),(n132,132),(n133,133),(n134,134),(n135,135),(n136,136),(n137,137),(n138,138),(n139,139),(n140,140),
+    (n141,141),(n142,142),(n143,143),(n144,144),(n145,145),(n146,146),(n147,147),(n148,148),(n149,149),(n150,150),
+    (n151,151),(n152,152),(n153,153),(n154,154),(n155,155),(n156,156),(n157,157),(n158,158),(n159,159),
+);
+
+/// Initial state a PC buffer is created in for the console's "no state" value.
+/// The console does not track resource states for buffers, so a title passes
+/// 0xFFFFFFFF; the PC runtime rejects that, and a buffer created in COMMON
+/// promotes implicitly to whatever its first use needs.
+pub(crate) fn address_resource_state(console_state: u32) -> u32 {
+    if console_state == u32::MAX { 0 } else { console_state }
+}
+
+/// Scarlett `ID3D12Device11`-layout device slot 133 (vtable +0x428): create a
+/// buffer resource spanning a range of mapped title memory.
+///
+/// Evidence: the call at EXE+0x1E8684C in the descriptor-heap setup
+/// (EXE+0x1E86440), after it has built five placeholder-backed regions and mapped
+/// physical pages into them. Arguments are
+/// `(this, address, D3D12_RESOURCE_DESC*, 0xFFFFFFFF, NULL, IID_ID3D12Resource, &out)`
+/// with `Dimension=BUFFER`, `Width` = the byte size of the last three regions,
+/// `Format=UNKNOWN`, `Layout=ROW_MAJOR`, `Flags=0x20004` (UAV + a console bit).
+/// That is exactly the `CreatePlacedResourceX` shape (slot 44: `(this, va, desc,
+/// state, clear, riid, ppv)`), so it is served by the same placement path: the
+/// resource is aliased onto the title's memory where the host allows it.
+/// Unverified: whether the console treats `address` as a GPU virtual address or
+/// a CPU one (they are the same for mapped title memory).
+unsafe extern "system" fn create_resource_from_address_x(
+    this: *mut DeviceWrapper, va: u64, pdesc: *const u8, init_state: u32,
+    pclear: *const c_void, riid: *const Guid, ppv: *mut *mut c_void,
+) -> i32 {
+    static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if !pdesc.is_null() {
+        let dim = unsafe { core::ptr::read_unaligned(pdesc as *const u32) };
+        if dim != 1 {
+            record("d3d12_xs", "CreateResourceFromAddressX", &format!("#{n} va={va:#x}: Dimension {dim} is not BUFFER -> E_INVALIDARG, nothing created"));
+            return 0x8007_0057u32 as i32;
+        }
+    }
+    let state = address_resource_state(init_state);
+    let hr = unsafe { create_placed_resource_x(this, va, pdesc, state, pclear, riid, ppv) };
+    if hr < 0 || n < 8 {
+        let (width, flags) = if pdesc.is_null() {
+            (0, 0)
+        } else {
+            unsafe { (core::ptr::read_unaligned(pdesc.add(0x10) as *const u64), core::ptr::read_unaligned(pdesc.add(0x30) as *const u32)) }
+        };
+        let res = if ppv.is_null() { core::ptr::null_mut() } else { unsafe { *ppv } };
+        record("d3d12_xs", "CreateResourceFromAddressX", &format!(
+            "#{n} va={va:#x} width={width:#x} flags={flags:#x} state={init_state:#x}->{state:#x} -> hr={hr:#010x} res={res:p} (served by the CreatePlacedResourceX path, slot 44)"));
+    }
+    hr
+}
+
 pub(crate) fn vtable() -> *const usize {
     static VT: OnceLock<usize> = OnceLock::new();
     *VT.get_or_init(|| {
@@ -2122,6 +2252,7 @@ pub(crate) fn vtable() -> *const usize {
             v.push(dev_stub as usize);
         }
         unsafe { install_dev_stubs(&mut v); } // 44..90: logging S_OK stubs (diagnostic)
+        unsafe { install_dev_notimpl_stubs(&mut v); } // 91..159: logging E_NOTIMPL stubs
         let console_defaults = crate::console_slots::snapshot_slice(&v);
         // Frame pacing (see frame.rs).
         v[78] = crate::frame::set_frame_interval_x as usize;
@@ -2155,6 +2286,7 @@ pub(crate) fn vtable() -> *const usize {
         v[74] = crate::device_x::register_page_pool_x as usize;
         v[75] = crate::device_x::unregister_page_pool_x as usize;
         v[87] = crate::device_x::device87_release_x as usize;
+        v[133] = create_resource_from_address_x as usize; // buffer resource over mapped title memory (see fn)
         crate::device_ext_a::install(&mut v);
         if crate::rtcap::enabled() || crate::passcap::on() || crate::blendclamp::lazy() {
             v[20] = create_rtv_traced as usize;
@@ -2206,6 +2338,72 @@ pub(crate) fn wrapper_qi(real: *mut c_void, riid: *const Guid, ppv: *mut *mut c_
 
 fn unregister_wrapper(w: usize) {
     WRAPPED.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| e.1 != w);
+}
+
+#[cfg(test)]
+mod host_heap_limit_tests {
+    use super::*;
+
+    /// The console's main bindless heap (type 0, 1,245,184 slots, shader visible) is
+    /// 245,184 over the PC runtime's ceiling; the retry uses exactly that ceiling.
+    #[test]
+    fn oversized_shader_visible_cbv_srv_uav_heap_is_retried_at_the_host_ceiling() {
+        assert_eq!(host_heap_retry(&[0, 1_245_184, 1, 1]), Some(1_000_000));
+        assert_eq!(host_heap_retry(&[0, 1_000_001, 1, 0]), Some(1_000_000));
+    }
+
+    /// Everything else the host refuses is a genuine error and must not be papered over.
+    #[test]
+    fn nothing_else_is_retried() {
+        assert_eq!(host_heap_retry(&[0, 1_000_000, 1, 1]), None, "at the ceiling already");
+        assert_eq!(host_heap_retry(&[0, 500, 1, 1]), None);
+        assert_eq!(host_heap_retry(&[0, 1_245_184, 0, 1]), None, "not shader visible: the host accepts any size");
+        assert_eq!(host_heap_retry(&[1, 1_245_184, 1, 1]), None, "sampler heaps have their own limit");
+        assert_eq!(host_heap_retry(&[2, 1_245_184, 1, 1]), None);
+        assert_eq!(host_heap_retry(&[3, 1_245_184, 1, 1]), None);
+    }
+}
+
+#[cfg(test)]
+mod slot133_tests {
+    use super::*;
+
+    #[test]
+    fn console_no_state_becomes_common() {
+        assert_eq!(address_resource_state(u32::MAX), 0);
+        assert_eq!(address_resource_state(0), 0);
+        assert_eq!(address_resource_state(0xac3), 0xac3);
+    }
+
+    /// Slot 133 used to be the silent shared stub; GTA VI's descriptor-heap setup
+    /// called it, got E_NOTIMPL, and its initialisation routine returned false.
+    #[test]
+    fn slot_133_has_a_body_and_unimplemented_slots_say_so() {
+        let v = vtable();
+        let at = |i: usize| unsafe { *v.add(i) };
+        assert_eq!(at(133), create_resource_from_address_x as usize);
+        assert_ne!(at(133), dev_stub as usize);
+        // A slot nobody implements is a logging E_NOTIMPL stub, never the silent one and never S_OK.
+        assert_eq!(at(134), n134 as usize);
+        assert_ne!(at(134), dev_stub as usize);
+        let f: unsafe extern "system" fn(*mut c_void, u64) -> i32 = unsafe { core::mem::transmute(at(134)) };
+        assert_eq!(unsafe { f(core::ptr::null_mut(), 0) }, 0x8000_4001u32 as i32);
+        for i in 91..160 {
+            assert_ne!(at(i), dev_stub as usize, "slot {i} still silent");
+        }
+    }
+
+    #[test]
+    fn address_resource_must_be_a_buffer() {
+        let mut desc = [0u8; 0x38];
+        desc[0..4].copy_from_slice(&3u32.to_le_bytes()); // TEXTURE2D
+        let mut out: *mut c_void = core::ptr::null_mut();
+        let hr = unsafe {
+            create_resource_from_address_x(core::ptr::null_mut(), 0x1000_0000, desc.as_ptr(), 0xffff_ffff, core::ptr::null(), &IID_ID3D12RESOURCE, &mut out)
+        };
+        assert_eq!(hr, 0x8007_0057u32 as i32);
+        assert!(out.is_null());
+    }
 }
 
 #[cfg(test)]
