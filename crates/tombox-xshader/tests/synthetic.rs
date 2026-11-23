@@ -54,6 +54,51 @@ fn shader(stage: Stage, words: &[u32], input_sig: Vec<SigElement>, output_sig: V
 }
 
 #[test]
+fn extract_reads_the_bounded_uncompressed_fssm_section() {
+    let put = |bytes: &mut [u8], offset: usize, word: u32| {
+        bytes[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+    };
+    let mut program = vec![0u8; 0x58 + 0x110];
+    let length = program.len() as u32;
+    put(&mut program, 0, 0x0001_0066);
+    put(&mut program, 4, length / 4);
+    program[8..12].copy_from_slice(b"DXIL");
+    program[24..28].copy_from_slice(b"XDAT");
+    put(&mut program, 28, 1);
+    put(&mut program, 32, 12);
+    put(&mut program, 36, 12);
+    put(&mut program, 40, 0x58);
+    put(&mut program, 44, 0x110);
+    let fssm = &mut program[0x58..];
+    fssm[..4].copy_from_slice(b"FSSM");
+    put(fssm, 4, 0x101);
+    put(fssm, 8, 0x100);
+    put(fssm, 0xc0, 0xe0);
+    put(fssm, 0xc8, 0x20);
+    put(fssm, 0xf0, S_NOP);
+    put(fssm, 0xf4, S_ENDPGM);
+    fssm[0x100..].fill(0x55);
+
+    let mut dxbc = vec![0u8; 44];
+    dxbc[..4].copy_from_slice(b"DXBC");
+    put(&mut dxbc, 20, 1);
+    put(&mut dxbc, 24, 44 + length);
+    put(&mut dxbc, 28, 1);
+    put(&mut dxbc, 32, 36);
+    dxbc[36..40].copy_from_slice(b"DXIL");
+    put(&mut dxbc, 40, length);
+    dxbc.extend_from_slice(&program);
+
+    let shader = tombox_xshader::extract(&dxbc).expect("uncompressed native program");
+    assert_eq!(shader.stage, Stage::Vertex);
+    assert_eq!(shader.fssm.len(), 0x100);
+    assert_eq!(shader.isa, [S_NOP, S_ENDPGM].map(u32::to_le_bytes).concat());
+
+    put(&mut dxbc, 44 + 44, 0x0ff);
+    assert!(tombox_xshader::extract(&dxbc).is_err());
+}
+
+#[test]
 fn external_root_signature_binds_a_stripped_mesh_shader() {
     let words = [
         0xf420_0108,
