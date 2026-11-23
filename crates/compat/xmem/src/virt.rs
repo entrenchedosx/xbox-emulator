@@ -501,6 +501,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn physical_frame_numbers_round_trip_through_64k_page_numbers() {
+        use compat_common::physical_pages::FRAMES_PER_PAGE;
+
+        let _g = crate::phys::map_test_guard();
+        let count = FRAMES_PER_PAGE as usize;
+        let size = count * XMEM_PAGE;
+        let reserve = || {
+            XMemVirtualAlloc(
+                core::ptr::null_mut(), size, MEM_RESERVE | XMEM_64K_PAGES, 0, PAGE_READWRITE,
+            ) as usize
+        };
+        let primary = reserve();
+        let alias = reserve();
+        assert!(primary != 0 && alias != 0);
+
+        let mut requested = count;
+        let mut pfns = vec![0u64; count];
+        let mut addresses: Vec<_> = (0..count)
+            .map(|index| (alias + index * XMEM_PAGE) as *mut c_void)
+            .collect();
+        unsafe {
+            assert_eq!(XMemAllocatePhysicalPages(0x380, &mut requested, pfns.as_mut_ptr()), 1);
+            assert_eq!(requested, count);
+            assert_eq!(XMemMapPhysicalPages(primary as *mut c_void, count, pfns.as_mut_ptr()) as usize, primary);
+            let mut round_trip: Vec<_> = pfns.iter()
+                .map(|pfn| (pfn / FRAMES_PER_PAGE) * FRAMES_PER_PAGE)
+                .collect();
+            assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_mut_ptr(), count, round_trip.as_mut_ptr()), 1);
+            for (index, address) in addresses.into_iter().enumerate() {
+                *address.cast::<usize>() = index + 1;
+            }
+            for index in 0..count {
+                assert_eq!(*((primary + index * XMEM_PAGE) as *const usize), index + 1);
+            }
+            assert_eq!(XMemFreePhysicalPages(count, pfns.as_mut_ptr()), 1);
+        }
+        assert_eq!(release_via_hook(alias), 1);
+        assert_eq!(release_via_hook(primary), 1);
+    }
+
     fn release_via_hook(va: usize) -> i32 {
         let vfree: unsafe extern "system" fn(usize, usize, u32) -> i32 = unsafe { core::mem::transmute(crate::hooks::vfree_wrapper()) };
         unsafe { vfree(va, 0, MEM_RELEASE) }
