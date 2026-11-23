@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use crate::sys::*;
+use compat_common::physical_pages::{FIRST_TITLE_FRAME, FRAMES_PER_PAGE};
 use compat_common::record;
 
 #[path = "phys_runs.rs"]
@@ -202,7 +203,7 @@ static S: Mutex<Option<State>> = Mutex::new(None);
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut g = S.lock().unwrap_or_else(|e| e.into_inner());
     let s = g.get_or_insert_with(|| State {
-        next_pfn: compat_common::physical_pages::FIRST_TITLE_PAGE,
+        next_pfn: FIRST_TITLE_FRAME,
         next_section: 1,
         sections: HashMap::new(),
         pfns: HashMap::new(),
@@ -275,10 +276,12 @@ pub fn allocate(n: usize) -> Option<Vec<u64>> {
         s.next_section += 1;
         s.sections.insert(sid, Section { handle: h, live: n });
         let base = s.next_pfn;
-        s.next_pfn += n as u64;
+        // XMem maps 64 KiB pages and reports their physical addresses in 4 KiB frames.
+        s.next_pfn += n as u64 * FRAMES_PER_PAGE;
         (0..n as u64).map(|i| {
-            s.pfns.insert(base + i, (sid, i * PAGE as u64));
-            base + i
+            let pfn = base + i * FRAMES_PER_PAGE;
+            s.pfns.insert(pfn, (sid, i * PAGE as u64));
+            pfn
         }).collect()
     }))
 }

@@ -7,6 +7,8 @@ extern "system" {
     fn GetCurrentProcess() -> *mut c_void;
 }
 
+use compat_common::physical_pages::FRAMES_PER_PAGE;
+
 type Ws = unsafe extern "system" fn(u32, *mut u8) -> i32;
 
 fn xmem() -> *mut c_void {
@@ -50,9 +52,9 @@ fn layout_19041_reports_the_first_title_allocation_in_4k_frames() {
         let mut pages = [0; 2];
         assert_eq!(allocate(0x2040_0000, &mut count, pages.as_mut_ptr()), 1);
         assert_eq!(free(count, pages.as_mut_ptr()), 1);
-        let first_frame = pages[0] * 16;
+        let first_frame = pages[0];
         assert_eq!(words, [u64::MAX, first_frame, first_frame, u64::MAX]);
-        assert_eq!(pages[1], pages[0] + 1);
+        assert_eq!(pages[1], first_frame + FRAMES_PER_PAGE);
         assert_eq!(query(words.as_mut_ptr().add(1)), 1);
         assert_eq!(words[1..3], [first_frame; 2]);
     }
