@@ -221,6 +221,37 @@ fn rootmem_raw_descriptors_use_byte_offsets_on_warp() {
 }
 
 #[test]
+fn rootmem_typed_raw_load_and_store_cross_a_dword_boundary_on_warp() {
+    use tombox_xshader::meta::PsvResource;
+
+    let mut load = super::mtbuf::mtbuf(0, 11, 3, false, 0, 8, 0x80);
+    load[1] = (load[1] & !(0x1f << 16)) | (6 << 16); // SRV at s24
+    let mut store = super::mtbuf::mtbuf(4, 11, 0xffb, false, 0, 10, 0x80);
+    store[1] = (store[1] & !(0x1f << 16)) | (5 << 16); // UAV at s20
+    let mut words = prog();
+    let end = words.len() - 3;
+    words.splice(end..end, [
+        load[0], load[1], vop2(0x25, 2, v(8), 2),
+        vop1(1, 10, LIT), 0x7ef1, store[0], store[1],
+    ]);
+    let mut ex = extract_rm(&words, rootmem_root());
+    ex.resources = [7, 4].into_iter()
+        .map(|res_type| PsvResource { res_type, space: 0, lower: 0, upper: 0, kind: 11 })
+        .collect();
+    let t = translate(&ex).unwrap_or_else(|e| panic!("translate: {e}"));
+    let code = dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).unwrap_or_else(|e| panic!("dxc: {e}\n{}", t.hlsl));
+    let m = CTX.get_or_init(|| Mutex::new(unsafe { ctx_new() }));
+    let mut c = m.lock().unwrap_or_else(|e| e.into_inner());
+    let out = unsafe { run(&mut c, &code) }.unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let read = (input(0) >> 24) | ((input(1) & 0xff) << 8);
+    for i in 0..T * GROUPS {
+        assert_eq!(out[i as usize], want(i).wrapping_add(read), "thread {i}");
+    }
+    assert_eq!(out[out.len() - 2], 0xf100_0000);
+    assert_eq!(out[out.len() - 1], 0x7e);
+}
+
+#[test]
 fn rootmem_refuses_unresolvable() {
     let table = RootParam { visibility: 0, kind: RootParamKind::Table(vec![RootRange { range_type: 1, num: 1, base_register: 0, space: 0, offset_in_table: u32::MAX }]) };
     let r = root(vec![table, desc(4, 0), RootParam { visibility: 0, kind: RootParamKind::Constants { register: 0, space: 0, num32: 5 } }, desc(3, 0)]);

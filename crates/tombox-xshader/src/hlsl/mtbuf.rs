@@ -273,21 +273,31 @@ impl<'a> Emitter<'a> {
             }
         };
         let imm = ins.aux.imm as u32;
-        let konst = voff.is_none() && matches!(soff, Opnd::ConstInt(0));
-        let mut byte = format!("{imm:#x}u");
-        if let Some(vo) = &voff {
-            byte = format!("({vo}) + {byte}");
-        }
-        if !matches!(soff, Opnd::ConstInt(0)) {
-            byte = format!("{byte} + {}", r(&soff)?);
-        }
+        let soff = if matches!(soff, Opnd::ConstInt(0)) { None } else { Some(r(&soff)?) };
+        let offset = match (voff, soff) {
+            (Some(v), Some(s)) => Some(format!("({v}) + ({s})")),
+            (v, s) => v.or(s),
+        };
+        let raw = self.raw_root_buffer(slot, is_uav);
+        let byte = if raw {
+            self.raw_buffer_address(idx, ins, idxen.then_some(index.as_str()), offset.as_deref())?
+        } else {
+            match &offset {
+                Some(o) => format!("{imm:#x}u + ({o})"),
+                None => format!("{imm:#x}u"),
+            }
+        };
+        let aligned = offset.is_none() && !(raw && idxen) && imm % 4 == 0;
         let vd = match ins.dst[0] {
             Opnd::Vgpr(v) => v,
             _ => return Err("mtbuf: bad vdata".into()),
         };
         let nm = if is_uav { format!("ubuf{slot}") } else { format!("sbuf{slot}") };
         let nwords = self.sbuf_words((is_uav, slot));
-        let el = |w: String| format!("{nm}[{index} + ({w}) / {nwords}u].w[({w}) % {nwords}u]");
+        let word = |w: &str| format!("{nm}[{index} + ({w}) / {nwords}u].w[({w}) % {nwords}u]");
+        let load = |w: &str| {
+            if raw { format!("{nm}.Load(({w}) * 4u)") } else { word(w) }
+        };
         let t = self.tmp;
         self.tmp += 1;
         self.line(&format!("uint t{t}b = {byte}; uint t{t}w = t{t}b >> 2; uint t{t}s = (t{t}b & 3u) * 8u;"));
@@ -295,12 +305,16 @@ impl<'a> Emitter<'a> {
         let ndw = fmt.bytes.div_ceil(4);
         if !store {
             for k in 0..ndw {
-                let lo = el(format!("t{t}w + {k}u"));
-                if konst && imm % 4 == 0 {
+                let lo = load(&format!("t{t}w + {k}u"));
+                if aligned {
                     self.line(&format!("uint t{t}_{k} = {lo};"));
                 } else {
-                    let hi = el(format!("t{t}w + {}u", k + 1));
-                    self.line(&format!("uint t{t}_{k} = ({lo} >> t{t}s) | (({hi} << (31u - t{t}s)) << 1u);"));
+                    let hi = load(&format!("t{t}w + {}u", k + 1));
+                    let unused_bits = (4 - (fmt.bytes - k * 4).min(4)) * 8;
+                    self.line(&format!("uint t{t}_{k} = {lo} >> t{t}s;"));
+                    self.line(&format!(
+                        "[branch] if (t{t}s > {unused_bits}u) t{t}_{k} |= {hi} << (32u - t{t}s);"
+                    ));
                 }
             }
             if d16 {
@@ -362,12 +376,23 @@ impl<'a> Emitter<'a> {
         let full = len / 4;
         let mut body = format!("uint t{t}p[{}] = {{ {} }}; uint t{t}j0 = 0u; ", ndw.max(1), init.join(", "));
         if full > 0 {
-            let direct: String = (0..full).map(|k| format!("{} = t{t}p[{k}]; ", el(format!("t{t}w + {k}u")))).collect();
+            let direct: String = (0..full).map(|k| {
+                if raw {
+                    format!("{nm}.Store((t{t}w + {k}u) * 4u, t{t}p[{k}]); ")
+                } else {
+                    format!("{} = t{t}p[{k}]; ", word(&format!("t{t}w + {k}u")))
+                }
+            }).collect();
             body += &format!("if (t{t}s == 0u) {{ {direct}t{t}j0 = {}u; }} ", full * 4);
         }
-        let ew = el(format!("t{t}x"));
+        let ew = load(&format!("t{t}x"));
+        let exchange = if raw {
+            format!("{nm}.InterlockedCompareExchange(t{t}x * 4u")
+        } else {
+            format!("InterlockedCompareExchange({ew}")
+        };
         body += &format!(
-            "[allow_uav_condition] for (uint t{t}j = t{t}j0; t{t}j < {len}u; t{t}j++) {{ uint t{t}y = t{t}b + t{t}j; uint t{t}x = t{t}y >> 2; uint t{t}q = (t{t}y & 3u) * 8u; uint t{t}d = (t{t}p[t{t}j >> 2] >> ((t{t}j & 3u) * 8u)) & 0xffu; uint t{t}o = {ew}; [allow_uav_condition] for (uint t{t}i = 0u; t{t}i < 4096u; t{t}i++) {{ uint t{t}r; InterlockedCompareExchange({ew}, t{t}o, (t{t}o & ~(0xffu << t{t}q)) | (t{t}d << t{t}q), t{t}r); if (t{t}r == t{t}o) break; t{t}o = t{t}r; }} }}"
+            "[allow_uav_condition] for (uint t{t}j = t{t}j0; t{t}j < {len}u; t{t}j++) {{ uint t{t}y = t{t}b + t{t}j; uint t{t}x = t{t}y >> 2; uint t{t}q = (t{t}y & 3u) * 8u; uint t{t}d = (t{t}p[t{t}j >> 2] >> ((t{t}j & 3u) * 8u)) & 0xffu; uint t{t}o = {ew}; [allow_uav_condition] for (uint t{t}i = 0u; t{t}i < 4096u; t{t}i++) {{ uint t{t}r; {exchange}, t{t}o, (t{t}o & ~(0xffu << t{t}q)) | (t{t}d << t{t}q), t{t}r); if (t{t}r == t{t}o) break; t{t}o = t{t}r; }} }}"
         );
         self.line(&format!("if (exec_lo & 1u) {{ {body}}}"));
         Ok(())
