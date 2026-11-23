@@ -2113,6 +2113,22 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// A raw SRV or UAV bound directly in the root signature is addressed in
+    /// bytes. Instruction offsets do not describe a structured element size.
+    fn raw_root_buffer(&self, slot: u32, is_uav: bool) -> bool {
+        if slot & BINDLESS != 0 {
+            return false;
+        }
+        let (register, space) = (slot & 0xffff, slot >> 16);
+        let (binding_type, parameter_type) = if is_uav { (7, 4) } else { (4, 3) };
+        self.ex.resources.iter().any(|r| {
+            r.res_type == binding_type && r.space == space && (r.lower..=r.upper).contains(&register)
+        }) && self.ex.root_sig.as_ref().is_some_and(|root| root.params.iter().any(|p| {
+            matches!(p.kind, crate::meta::RootParamKind::Descriptor { kind, register: r, space: s }
+                if kind == parameter_type && r == register && s == space)
+        }))
+    }
+
     /// Resource a MUBUF instruction addresses when its descriptor is `slot` of `table`
     /// (also records declaration requirements).
     fn mubuf_res(&mut self, ins: &Insn, slot: u32, table: u8, off: u32) -> Result<Res, String> {
@@ -5607,7 +5623,20 @@ impl<'a> Emitter<'a> {
                 (Some(v), Some(s)) => Some(format!("({v}) + ({s})")),
             };
             let imm = ins.aux.imm as u32;
-            let target = match (self.res.get(&idx).and_then(|v| v.first()).copied(), dyn_off) {
+            let resource = self.res.get(&idx).and_then(|v| v.first()).copied();
+            if let Some(Res::Buf(slot, true)) = resource.filter(|r| {
+                matches!(r, Res::Buf(slot, true) if self.raw_root_buffer(*slot, true))
+            }) {
+                let addr = self.raw_buffer_address(idx, ins, idxen.then_some(index.as_str()), dyn_off.as_deref())?;
+                let vdata = ins.dst[0];
+                let op = ins.mnemonic.strip_prefix("buffer_atomic_").ok_or("bad MUBUF atomic")?;
+                let old = self.atomic_raw_rmw(op, &format!("ubuf{slot}"), &addr, vdata)?;
+                if glc {
+                    self.wv(&vdata, &old)?;
+                }
+                return Ok(());
+            }
+            let target = match (resource, dyn_off) {
                 (Some(Res::TBuf(slot, true)), None) if imm == 0 => format!("utb{slot}[{index}]"),
                 (Some(Res::TBuf(slot, true)), None) if imm % 4 == 0 => format!("utb{slot}[{index} + {}u]", imm / 4),
                 (Some(Res::TBuf(slot, true)), Some(d)) if !idxen => format!("utb{slot}[(({d}) + {imm:#x}u) >> 2]"),
@@ -5805,6 +5834,55 @@ impl<'a> Emitter<'a> {
             _ => return Err("bad vdata".into()),
         };
         let nm = if is_uav { format!("ubuf{slot}") } else { format!("sbuf{slot}") };
+        if self.raw_root_buffer(slot, is_uav) {
+            let addr = self.raw_buffer_address(idx, ins, idxen.then_some(index.as_str()), voff.as_deref())?;
+            let t = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("uint t{t}b = {addr};"));
+            if let Some((bits, signed, store)) = sub {
+                let mask = (1u32 << bits) - 1;
+                let o = Opnd::Vgpr(vd);
+                self.line(&format!("uint t{t}w = t{t}b & ~3u; uint t{t}s = (t{t}b & 3u) * 8u;"));
+                if store {
+                    if !is_uav {
+                        return Err("buffer_store to a non-UAV table".into());
+                    }
+                    self.touch(&o);
+                    let shift = if ins.mnemonic.ends_with("_d16_hi") { 16 } else { 0 };
+                    let data = r(&o)?;
+                    self.line(&format!("if (exec_lo & 1u) {{ uint t{t}old = {nm}.Load(t{t}w); [allow_uav_condition] while (true) {{ uint t{t}new = (t{t}old & ~({mask:#x}u << t{t}s)) | ((({data} >> {shift}u) & {mask:#x}u) << t{t}s); uint t{t}prior; {nm}.InterlockedCompareExchange(t{t}w, t{t}old, t{t}new, t{t}prior); if (t{t}prior == t{t}old) break; t{t}old = t{t}prior; }} }}"));
+                    return Ok(());
+                }
+                let v = format!("(({nm}.Load(t{t}w) >> t{t}s) & {mask:#x}u)");
+                let mut e = if signed { format!("asuint(asint({v} << {}) >> {})", 32 - bits, 32 - bits) } else { v };
+                if ins.mnemonic.ends_with("_d16_hi") {
+                    self.touch(&o);
+                    e = format!("(({} & 0xffffu) | (({e}) << 16u))", r(&o)?);
+                } else if ins.mnemonic.ends_with("_d16") {
+                    self.touch(&o);
+                    e = format!("(({} & 0xffff0000u) | (({e}) & 0xffffu))", r(&o)?);
+                }
+                return self.wv(&o, &e);
+            }
+            if ins.mnemonic.starts_with("buffer_store") {
+                if !is_uav {
+                    return Err("buffer_store to a non-UAV table".into());
+                }
+                for k in 0..n {
+                    let reg = Opnd::Vgpr(vd + k as u8);
+                    self.touch(&reg);
+                    self.line(&format!("if (exec_lo & 1u) {nm}.Store(t{t}b + {}u, {});", 4 * k, r(&reg)?));
+                }
+            } else {
+                for k in 0..n {
+                    self.line(&format!("uint t{t}_{k} = {nm}.Load(t{t}b + {}u);", 4 * k));
+                }
+                for k in 0..n {
+                    self.wv(&Opnd::Vgpr(vd + k as u8), &format!("t{t}_{k}"))?;
+                }
+            }
+            return Ok(());
+        }
         // Element `k` of this access. With a run-time byte offset the buffer is addressed
         // flat over the declared element size (which assumes, like every structured-buffer
         // access here, that the declared element matches the view's stride).
@@ -5873,6 +5951,25 @@ impl<'a> Emitter<'a> {
             }
         }
         Ok(())
+    }
+
+    fn raw_buffer_address(&mut self, idx: usize, ins: &Insn, index: Option<&str>, offset: Option<&str>) -> Result<String, String> {
+        let mut addr = format!("{:#x}u", ins.aux.imm as u32);
+        if let Some(offset) = offset {
+            let _ = write!(addr, " + ({offset})");
+        }
+        if let Some(index) = index {
+            let Some(Opnd::Sgpr(base)) = ins.src.get(1) else {
+                return Err(format!("indexed raw buffer at {:#x} has no scalar descriptor", ins.offset));
+            };
+            let stride = match self.vs_bound(idx, *base) {
+                smem_bounds::Bound::Static { stride: Some(stride), .. } => format!("{stride}u"),
+                smem_bounds::Bound::Rt { w1, .. } => format!("(({w1} >> 16u) & 0x3fffu)"),
+                _ => return Err(format!("indexed raw buffer at {:#x} has an unresolved descriptor stride", ins.offset)),
+            };
+            let _ = write!(addr, " + ({index}) * {stride}");
+        }
+        Ok(addr)
     }
 
     /// Geometry-shader LDS layout (read off WriteToSliceMainGS): input vertex data lives at
@@ -7068,6 +7165,14 @@ impl<'a> Emitter<'a> {
         }
         for (is_uav, slot) in self.sbuf.keys() {
             let (ty, nm, reg) = if *is_uav { ("RWStructuredBuffer", "ubuf", 'u') } else { ("StructuredBuffer", "sbuf", 't') };
+            if self.raw_root_buffer(*slot, *is_uav) {
+                let raw = if *is_uav { "RWByteAddressBuffer" } else { "ByteAddressBuffer" };
+                h.push_str(&self.decl(&mut used, raw, &format!("{nm}{slot}"), *slot, reg, if *is_uav { 1 } else { 0 }, 32)?);
+                if self.sbuf_flat.contains(&(*is_uav, *slot)) {
+                    let _ = writeln!(h, "uint tb_sbw_{nm}{slot}(uint off) {{ return {nm}{slot}.Load(off); }}");
+                }
+                continue;
+            }
             let _ = writeln!(h, "struct TbElem_{nm}{slot} {{ uint w[{}]; }};
 ", self.sbuf_words((*is_uav, *slot)));
             h.push_str(&self.decl(&mut used, &format!("{ty}<TbElem_{nm}{slot}>"), &format!("{nm}{slot}"), *slot, reg, if *is_uav { 1 } else { 0 }, 32)?);

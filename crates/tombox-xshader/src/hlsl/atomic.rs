@@ -3,6 +3,16 @@ use crate::rdna2::Opnd;
 
 impl<'a> Emitter<'a> {
     pub(super) fn atomic_rmw(&mut self, op: &str, target: &str, vdata: Opnd) -> Result<String, String> {
+        self.atomic_rmw_target(op, target, None, vdata)
+    }
+
+    pub(super) fn atomic_raw_rmw(&mut self, op: &str, buffer: &str, offset: &str, vdata: Opnd) -> Result<String, String> {
+        self.atomic_rmw_target(op, offset, Some(buffer), vdata)
+    }
+
+    fn atomic_rmw_target(&mut self, op: &str, target: &str, buffer: Option<&str>, vdata: Opnd) -> Result<String, String> {
+        let prefix = buffer.map(|b| format!("{b}.")).unwrap_or_default();
+        let compare_exchange = format!("{prefix}InterlockedCompareExchange");
         self.touch(&vdata);
         let val = r(&vdata)?;
         let t = self.tmp;
@@ -13,7 +23,7 @@ impl<'a> Emitter<'a> {
                 _ => return Err("bad vdata".into()),
             };
             self.touch(&cmp);
-            self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ InterlockedCompareExchange({target}, {}, {val}, t{t}); }}", r(&cmp)?));
+            self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ {compare_exchange}({target}, {}, {val}, t{t}); }}", r(&cmp)?));
             return Ok(format!("t{t}"));
         }
         let c = format!("t{t}c");
@@ -25,8 +35,9 @@ impl<'a> Emitter<'a> {
             _ => None,
         };
         if let Some(new) = looped {
+            let load = buffer.map_or_else(|| target.to_string(), |b| format!("{b}.Load({target})"));
             self.line(&format!(
-                "uint t{t} = 0u; if (exec_lo & 1u) {{ uint {c} = {target}; [allow_uav_condition] for (uint t{t}i = 0u; t{t}i < 1024u; t{t}i++) {{ uint t{t}p = 0u; InterlockedCompareExchange({target}, {c}, {new}, t{t}p); if (t{t}p == {c}) break; {c} = t{t}p; }} t{t} = {c}; }}"
+                "uint t{t} = 0u; if (exec_lo & 1u) {{ uint {c} = {load}; [allow_uav_condition] for (uint t{t}i = 0u; t{t}i < 1024u; t{t}i++) {{ uint t{t}p = 0u; {compare_exchange}({target}, {c}, {new}, t{t}p); if (t{t}p == {c}) break; {c} = t{t}p; }} t{t} = {c}; }}"
             ));
             return Ok(format!("t{t}"));
         }
@@ -41,7 +52,7 @@ impl<'a> Emitter<'a> {
             "swap" => ("InterlockedExchange", val),
             other => return Err(format!("atomic {other} unsupported")),
         };
-        self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ {func}({target}, {arg}, t{t}); }}"));
+        self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ {prefix}{func}({target}, {arg}, t{t}); }}"));
         Ok(format!("t{t}"))
     }
 }
