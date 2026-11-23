@@ -23,6 +23,10 @@ pub const CL_RECORD_D1: usize = 86;
 pub const CL_SET_COMPUTE_LIMITS: usize = 96;
 pub const CL_SET_COMPRESSION_STATE: usize = 97;
 
+pub(crate) const SCARLETT_WRITE32_BOTTOM_OF_PIPE: usize = 71;
+pub(crate) const SCARLETT_WRITE64_BOTTOM_OF_PIPE: usize = 72;
+pub(crate) const SCARLETT_WAIT64: usize = 74;
+
 #[cfg(test)]
 pub const SLOTS: [usize; 14] = [
     CL_WRITE32_BOTTOM_OF_PIPE, CL_WRITE64_BOTTOM_OF_PIPE,
@@ -587,6 +591,19 @@ pub fn plan() -> Vec<(usize, usize)> {
         (CL_SET_COMPUTE_LIMITS, cl_set_compute_limits as usize),
         (CL_SET_COMPRESSION_STATE, cl_set_compression_state as usize),
     ]
+}
+
+pub(crate) fn install_scarlett_memory_ops(vtable: &[AtomicUsize]) {
+    // This title's graphics list puts the bottom-of-pipe writes and the
+    // 64-bit wait two entries later. The wait takes a graphics address,
+    // which the older slot 74 implementation would dereference as a COM object.
+    for (slot, method) in [
+        (SCARLETT_WRITE32_BOTTOM_OF_PIPE, cl_write32_bottom_of_pipe as usize),
+        (SCARLETT_WRITE64_BOTTOM_OF_PIPE, cl_write64_bottom_of_pipe as usize),
+        (SCARLETT_WAIT64, cl_wait64 as usize),
+    ] {
+        vtable[slot].store(method, Ordering::Relaxed);
+    }
 }
 
 pub fn install(xbox_vt: &[AtomicUsize]) -> usize {
