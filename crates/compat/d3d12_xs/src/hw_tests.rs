@@ -109,6 +109,33 @@ fn gpu() -> &'static Gpu {
     })
 }
 
+#[test]
+fn address_resource_slot_creates_and_tracks_a_texture() {
+    extern "system" {
+        fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
+        fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
+    }
+    unsafe {
+        let dev = gpu().dev as *mut c_void;
+        call!(dev, 1, () -> u32);
+        let wrapped = crate::device_wrap::wrap_device(dev);
+        let address = VirtualAlloc(core::ptr::null_mut(), 0x10000, 0x3000, 4);
+        assert!(!address.is_null());
+        // Texture2D, 32x32 typeless depth/stencil, one mip and one sample.
+        let desc = [3u64, 0, 32, 0x0001_0001_0000_0020, 0x0000_0001_0000_0013, 0, 2];
+        let mut texture: *mut c_void = core::ptr::null_mut();
+        let hr = call!(wrapped, 133, (u64, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32,
+            address as u64, desc.as_ptr().cast(), 6u32, core::ptr::null(), &IID_RESOURCE, &mut texture);
+        assert!(hr >= 0 && !texture.is_null(), "CreateResourceFromAddressX hr={hr:#010x}");
+        let placement = crate::placed::lookup(texture).expect("title VA placement");
+        assert_eq!((placement.va, placement.dim(), placement.format()), (address as u64, 3, 19));
+        assert_eq!(placement.init_state, 0xc0);
+        call!(texture, 2, () -> u32);
+        call!(wrapped, 2, () -> u32);
+        assert_ne!(VirtualFree(address, 0, 0x8000), 0);
+    }
+}
+
 struct Buf {
     res: usize,
     va: u64,
