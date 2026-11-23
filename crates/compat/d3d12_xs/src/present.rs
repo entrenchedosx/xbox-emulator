@@ -986,6 +986,24 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
     crate::gpuprof::ecl_exit(queue);
 }
 
+pub(crate) unsafe extern "system" fn scarlett_queue_submit(
+    queue: *mut c_void, count: u32, lists: *const *mut c_void, token: u64, flags: u32,
+) -> i32 {
+    if count != 0 && lists.is_null() {
+        return 0x8007_0057u32 as i32;
+    }
+    if flags != 0 {
+        record("d3d12_xs", "queue.submit", &format!("unsupported submission flags {flags:#x}"));
+        return 0x8000_4001u32 as i32;
+    }
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    if CALLS.fetch_add(1, Ordering::Relaxed) < 4 {
+        record("d3d12_xs", "queue.submit", &format!("Scarlett slot 35 submits {count} command lists, frame token {token}"));
+    }
+    unsafe { exec_lists_x(queue, count, lists) };
+    unsafe { crate::ecl_probe::removed_reason(queue) }.unwrap_or(0)
+}
+
 unsafe extern "system" fn queue_freq(queue: *mut c_void, out: *mut u64) -> i32 {
     let f: crate::timestamp::FreqFn = core::mem::transmute(REAL_QVT[16].load(Ordering::Relaxed));
     let mut host = 0u64;
@@ -1160,6 +1178,7 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
                 QUEUE_SLOT16_SIGNAL_CALLER.store(base + SCARLETT_QUEUE_SIGNAL_RETURN, Ordering::Relaxed);
                 QUEUE_VT[16].store(scarlett_queue_slot16 as *const () as usize, Ordering::Relaxed);
                 QUEUE_VT[18].store(scarlett_queue_slot18 as *const () as usize, Ordering::Relaxed);
+                XBOX_QVT[35].store(scarlett_queue_submit as *const () as usize, Ordering::Relaxed);
             }
             record("d3d12_xs", "queue.vtable", "built extended queue vtable (title slot 30 = PresentX; caller-dispatched)");
         }
