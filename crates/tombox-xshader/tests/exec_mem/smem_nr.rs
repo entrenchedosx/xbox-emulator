@@ -188,9 +188,10 @@ fn smem_bounds_emission() {
     let h4 = hl(4);
     assert!(h4.contains("tb_smem_in(s25, s26, 0x10u, 0u)"), "{h4}");
     let lims = |i: usize| translate(&extract(&prog(&cs[i]))).unwrap().cb_limits;
-    assert_eq!(lims(0).get(&0), Some(&0x20));
-    assert_eq!(lims(1).get(&0), Some(&32));
-    assert_eq!(lims(2).get(&0), Some(&(u32::MAX as u64 * 16)));
+    let cb = tombox_xshader::hlsl::ShaderRegister { register: 0, space: 0 };
+    assert_eq!(lims(0).get(&cb), Some(&0x20));
+    assert_eq!(lims(1).get(&cb), Some(&32));
+    assert_eq!(lims(2).get(&cb), Some(&(u32::MAX as u64 * 16)));
     assert!(lims(4).is_empty(), "run-time NR has no static limit");
     let raw = tombox_xshader::cbv_raw_hlsl::rewrite_hlsl(&h3).unwrap();
     assert!(raw.contains(tombox_xshader::hlsl::CBFIT_RAW) && !raw.contains(tombox_xshader::hlsl::CBFIT_CBUFFER), "{raw}");

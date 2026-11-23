@@ -148,7 +148,7 @@ impl Emitter<'_> {
         None
     }
 
-    pub(super) fn dg_static_sampler(&self, idx: usize, ss: u16) -> Result<Option<u32>, String> {
+    pub(super) fn dg_static_sampler(&self, idx: usize, ss: u16) -> Result<Option<super::Binding>, String> {
         if self.dg().is_none() {
             return Ok(None);
         }
@@ -178,7 +178,7 @@ impl Emitter<'_> {
                 }
             }
         };
-        Ok(Some((pick.space << 16) | pick.register))
+        Ok(Some(super::Binding::register(pick.register, pick.space)))
     }
 }
 

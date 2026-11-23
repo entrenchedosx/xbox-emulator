@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
+use tombox_xshader::hlsl::ShaderRegister;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Needs {
-    pub mip_uavs: Vec<u32>,
-    pub mip_srvs: Vec<u32>,
+    pub mip_uavs: Vec<ShaderRegister>,
+    pub mip_srvs: Vec<ShaderRegister>,
     pub gmem: bool,
 }
 
@@ -21,7 +22,7 @@ impl Needs {
         if !self.any() {
             return None;
         }
-        let slot = |s: &u32| format!("space{} r{}", s >> 16, s & 0xffff);
+        let slot = |s: &ShaderRegister| format!("space{} r{}", s.space, s.register);
         let mut parts = Vec::new();
         if !self.mip_uavs.is_empty() {
             parts.push(format!("per-mip UAV views of {}", self.mip_uavs.iter().map(slot).collect::<Vec<_>>().join(", ")));
@@ -63,7 +64,7 @@ mod tests {
         assert_eq!(none.refusal(), None);
         note(1, &none);
         assert_eq!(lookup(1), None);
-        let n = Needs { mip_uavs: vec![(2 << 16) | 3], mip_srvs: vec![], gmem: false };
+        let n = Needs { mip_uavs: vec![ShaderRegister { space: 2, register: 3 }], mip_srvs: vec![], gmem: false };
         note(7, &n);
         assert_eq!(lookup(7), Some(n.clone()));
         let r = n.refusal().unwrap();
