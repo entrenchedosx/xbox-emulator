@@ -1004,6 +1004,42 @@ pub fn real_queue_slot(i: usize) -> usize {
     REAL_QVT.get(i).map_or(0, |v| v.load(Ordering::Relaxed))
 }
 
+const SCARLETT_QUEUE_FREQUENCY_RETURN: usize = 0x24841ac;
+static QUEUE_SLOT18_FREQUENCY_CALLER: AtomicUsize = AtomicUsize::new(0);
+
+/// The Scarlett title calls queue slot 18 with a UINT64 output and uses the
+/// result as the timestamp frequency. A PC GetDesc writes 16 bytes there and
+/// overwrites the saved RBX above that eight-byte output slot. Preserve GetDesc
+/// for the other calls, including host code that sees the same real queue.
+#[unsafe(naked)]
+pub(crate) unsafe extern "system" fn scarlett_queue_slot18() {
+    core::arch::naked_asm!(
+        "mov rax, [rsp]",
+        "cmp rax, [rip + {caller}]",
+        "je 2f",
+        "lea rax, [rip + {real}]",
+        "jmp qword ptr [rax + 144]",
+        "2:",
+        "jmp {frequency}",
+        caller = sym QUEUE_SLOT18_FREQUENCY_CALLER, real = sym REAL_QVT, frequency = sym queue_freq,
+    );
+}
+
+#[cfg(test)]
+#[unsafe(naked)]
+pub(crate) unsafe extern "system" fn call_scarlett_slot18_frequency(_queue: *mut c_void, _out: *mut u64) -> i32 {
+    core::arch::naked_asm!(
+        "sub rsp, 0x28",
+        "lea rax, [rip + 2f]",
+        "mov [rip + {caller}], rax",
+        "call {slot}",
+        "2:",
+        "add rsp, 0x28",
+        "ret",
+        caller = sym QUEUE_SLOT18_FREQUENCY_CALLER, slot = sym scarlett_queue_slot18,
+    );
+}
+
 #[unsafe(naked)]
 unsafe extern "system" fn q_freq_dispatch() {
     core::arch::naked_asm!(
@@ -1080,6 +1116,12 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
             let size = core::ptr::read_unaligned((base + e_lfanew + 0x50) as *const u32) as usize;
             EXE_BASE.store(base, Ordering::Relaxed);
             EXE_SIZE.store(size, Ordering::Relaxed);
+            if SCARLETT_QUEUE_FREQUENCY_RETURN < size && std::env::current_exe().is_ok_and(|exe| {
+                exe.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.eq_ignore_ascii_case("game_scarlett_master.exe"))
+            }) {
+                QUEUE_SLOT18_FREQUENCY_CALLER.store(base + SCARLETT_QUEUE_FREQUENCY_RETURN, Ordering::Relaxed);
+                QUEUE_VT[18].store(scarlett_queue_slot18 as *const () as usize, Ordering::Relaxed);
+            }
             record("d3d12_xs", "queue.vtable", "built extended queue vtable (title slot 30 = PresentX; caller-dispatched)");
         }
         let slot0 = queue as *mut usize;

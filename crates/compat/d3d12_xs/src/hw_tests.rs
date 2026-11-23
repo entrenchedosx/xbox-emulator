@@ -136,6 +136,19 @@ fn address_resource_slot_creates_and_tracks_a_texture() {
     }
 }
 
+#[test]
+fn queue_slot18_preserves_the_title_callers_eight_byte_output() {
+    let queue = gpu().a as *mut c_void;
+    let guard = 0x1234_5678_9abc_def0;
+    let mut out = [0, guard];
+    let hr = unsafe { crate::present::call_scarlett_slot18_frequency(queue, out.as_mut_ptr()) };
+    assert_eq!(hr, 0);
+    assert_eq!(out, [99_750_000, guard]);
+    let pc_desc = unsafe { crate::ecl_probe::queue_desc(queue, crate::present::real_queue_slot(18)) };
+    let routed = unsafe { crate::ecl_probe::queue_desc(queue, crate::present::scarlett_queue_slot18 as *const () as usize) };
+    assert_eq!(routed, pc_desc);
+}
+
 struct Buf {
     res: usize,
     va: u64,
