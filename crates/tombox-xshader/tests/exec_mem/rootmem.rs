@@ -151,6 +151,45 @@ fn rootmem_descriptors_and_constants() {
 }
 
 #[test]
+fn rootmem_raw_descriptors_use_byte_offsets_on_warp() {
+    use tombox_xshader::meta::PsvResource;
+
+    // The immediate reaches the last dword of a 4 KiB buffer. It cannot be
+    // used to infer the stride of a structured element.
+    let mut words = prog();
+    let store = words.len() - 3;
+    let [load, data] = mubuf_op(0x0c, 0, 8, 24);
+    let [byte_load, byte_data] = mubuf_op(0x08, 0, 9, 24);
+    let [atomic, atomic_data] = mubuf_op(0x32, 0, 10, 20);
+    let [byte_store, store_data] = mubuf_op(0x18, 0, 10, 20);
+    words.splice(store..store, [
+        (load & !(1 << 12)) | 0xffc, data,
+        (byte_load & !(1 << 12)) | 0xffd, byte_data,
+        vop2(0x25, 2, v(8), 2),
+        vop2(0x25, 2, v(9), 2),
+        vop1(1, 10, ic(3)),
+        (atomic & !(1 << 12)) | 0xffc, atomic_data,
+        vop1(1, 10, ic(32)),
+        (byte_store & !(1 << 12)) | 0xff9, store_data,
+    ]);
+    let mut ex = extract_rm(&words, rootmem_root());
+    ex.resources = [7, 4].into_iter().map(|res_type| PsvResource { res_type, space: 0, lower: 0, upper: 0, kind: 11 }).collect();
+    let t = translate(&ex).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert!(t.hlsl.contains("RWByteAddressBuffer ubuf0"));
+    assert!(t.hlsl.contains("ByteAddressBuffer sbuf0"));
+    let code = dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).unwrap_or_else(|e| panic!("dxc: {e}\n{}", t.hlsl));
+    let m = CTX.get_or_init(|| Mutex::new(unsafe { ctx_new() }));
+    let mut c = m.lock().unwrap_or_else(|e| e.into_inner());
+    let out = unsafe { run(&mut c, &code) }.unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let last = input((BYTES / 4 - 1) as u32);
+    for i in 0..T * GROUPS {
+        assert_eq!(out[i as usize], want(i).wrapping_add(last).wrapping_add((last >> 8) & 0xff), "thread {i}");
+    }
+    assert_eq!(out[out.len() - 2], 32 << 8);
+    assert_eq!(out[out.len() - 1], 3 * T * GROUPS);
+}
+
+#[test]
 fn rootmem_refuses_unresolvable() {
     let table = RootParam { visibility: 0, kind: RootParamKind::Table(vec![RootRange { range_type: 1, num: 1, base_register: 0, space: 0, offset_in_table: u32::MAX }]) };
     let r = root(vec![table, desc(4, 0), RootParam { visibility: 0, kind: RootParamKind::Constants { register: 0, space: 0, num32: 5 } }, desc(3, 0)]);
