@@ -67,6 +67,7 @@ fn main() {
     let mut exebp_rva: u64 = 0;
     let mut trace_mode = false; // --trace: exebp logs regs+caller and CONTINUES (log-and-continue)
     let mut trace_limit: u64 = 40;
+    let mut watch_rvas: Vec<u64> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
     let mut it = args[2..].iter();
     while let Some(a) = it.next() {
@@ -74,6 +75,10 @@ fn main() {
             if let Some(v) = it.next() { exebp_rva = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap_or(0); }
         } else if a == "--trace" {
             trace_mode = true;
+        } else if a == "--watch" {
+            if let Some(v) = it.next() {
+                if let Ok(r) = u64::from_str_radix(v.trim_start_matches("0x"), 16) { watch_rvas.push(r); }
+            }
         } else if a == "--tracelimit" {
             if let Some(v) = it.next() { trace_limit = v.parse().unwrap_or(40); }
         } else { rest.push(a.clone()); }
@@ -146,6 +151,12 @@ fn main() {
     let mut exebp_replant_pending = false;
     let mut exebp_hits: u64 = 0;
 
+    // --watch <rva_hex> (repeatable, up to 4): a hardware write watchpoint on
+    // exe_base+rva, re-armed on every thread. Use it to find what writes a global
+    // the engine later dereferences, without depending on absolute addresses.
+    let mut watch_addrs: Vec<u64> = Vec::new();
+    let mut watch_hits: u64 = 0;
+
     // MDBG_COM=1: log COM/WinRT activation at combase's entry points. The point is
     // to read the class name and IID the title actually asks for rather than
     // guessing which Xbox interface is missing.
@@ -188,7 +199,8 @@ fn main() {
         if unsafe { WaitForDebugEventEx(&mut evt, 1000) } == 0 { continue; }
         let mut status = DBG_CONTINUE;
         match evt.code {
-            2 | 3 => { tids.insert(evt.tid); }
+            2 => { tids.insert(evt.tid); if !watch_addrs.is_empty() { arm_watch(hproc, evt.tid, &watch_addrs); } }
+            3 => { tids.insert(evt.tid); }
             4 => { tids.remove(&evt.tid); }
             _ => {}
         }
@@ -226,6 +238,11 @@ fn main() {
                     let cc = [0xCCu8]; let mut wr = 0usize;
                     unsafe { WriteProcessMemory(hproc, cfw_addr as *mut c_void, cc.as_ptr(), 1, &mut wr); }
                     eprintln!("[trace] CreateFileW trace bp @0x{:x}", cfw_addr);
+                }
+                if !watch_rvas.is_empty() {
+                    watch_addrs = watch_rvas.iter().map(|r| base + r).collect();
+                    arm_watch(hproc, evt.tid, &watch_addrs);
+                    eprintln!("[WATCH] write watchpoint on {} address(es), main thread armed", watch_addrs.len());
                 }
             }
             6 => { // LOAD_DLL: hFile(0), lpBaseOfDll(8)
@@ -278,7 +295,14 @@ fn main() {
                 let ecode = rd_u32(&evt.u, 0);
                 let addr = rd_u64(&evt.u, 16);
                 let first = rd_u32(&evt.u, 152);
-                if ecode == 0x80000003 && tracefile && addr == cfw_addr {
+                if ecode == 0x80000004 && !watch_addrs.is_empty() {
+                    if let Some((rip, dr6)) = watch_fired(hproc, evt.tid) {
+                        watch_hits += 1;
+                        eprintln!("[WATCH #{watch_hits}] wrote a watched address at EXE+{:#x} (dr6={dr6:#x})",
+                            rip.wrapping_sub(exe_base));
+                    }
+                    status = DBG_CONTINUE;
+                } else if ecode == 0x80000003 && tracefile && addr == cfw_addr {
                     cfw_handle(hproc, evt.tid, cfw_addr, cfw_orig, nt_mode);
                     cfw_replant_pending = true;
                     status = DBG_CONTINUE;
@@ -1226,4 +1250,39 @@ mod tests {
         assert!(r.iter().any(|l| l.contains("[rsp+0x10] \"inline stack message\"")));
         assert!(r.iter().any(|l| l.contains("-> 0x1c360000000 \"cannot select: %5:_(s32) = G_FOO %3, %4 (in function: main)\"")));
     }
+}
+// --- hardware write watchpoints ---------------------------------------------
+// Per-thread debug registers: a write to any watched address raises
+// EXCEPTION_SINGLE_STEP (0x80000004) with Dr6 marking the slot. Addresses are
+// passed as RVAs and rebased per process, so ASLR does not matter.
+fn arm_watch(hproc: HANDLE, tid: u32, addrs: &[u64]) {
+    let h = unsafe { OpenThread(0x58, 0, tid) };
+    if h == 0 { return; }
+    let mut ctx = Ctx([0u8; 1256]);
+    ctx.0[0x30..0x34].copy_from_slice(&0x0010_0013u32.to_le_bytes());
+    if unsafe { GetThreadContext(h, ctx.0.as_mut_ptr()) } == 0 { unsafe { CloseHandle(h); } return; }
+    let mut dr7: u64 = 0;
+    for (i, a) in addrs.iter().take(4).enumerate() {
+        wr_u64(&mut ctx.0, 0x48 + i * 8, *a);
+        dr7 |= 1u64 << (i * 2);          // L<i>: local enable
+        dr7 |= 0b01u64 << (16 + i * 4);  // R/W<i> = 1: break on write
+        dr7 |= 0b11u64 << (18 + i * 4);  // LEN<i> = 3: 8 bytes
+    }
+    wr_u64(&mut ctx.0, 0x68, 0); // Dr6
+    wr_u64(&mut ctx.0, 0x70, dr7);
+    unsafe { SetThreadContext(h, ctx.0.as_ptr()); CloseHandle(h); }
+}
+
+fn watch_fired(hproc: HANDLE, tid: u32) -> Option<(u64, u64)> {
+    let h = unsafe { OpenThread(0x58, 0, tid) };
+    if h == 0 { return None; }
+    let mut ctx = Ctx([0u8; 1256]);
+    ctx.0[0x30..0x34].copy_from_slice(&0x0010_0013u32.to_le_bytes());
+    if unsafe { GetThreadContext(h, ctx.0.as_mut_ptr()) } == 0 { unsafe { CloseHandle(h); } return None; }
+    let dr6 = rd_u64(&ctx.0, 0x68);
+    if dr6 & 0xF == 0 { unsafe { CloseHandle(h); } return None; }
+    let rip = rd_u64(&ctx.0, 0xF8);
+    wr_u64(&mut ctx.0, 0x68, 0);
+    unsafe { SetThreadContext(h, ctx.0.as_ptr()); CloseHandle(h); }
+    Some((rip, dr6))
 }
