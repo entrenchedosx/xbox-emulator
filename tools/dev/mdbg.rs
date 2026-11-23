@@ -368,7 +368,18 @@ fn main() {
                     unsafe { TerminateProcess(hproc, code.unwrap_or(1)); }
                     status = DBG_CONTINUE;
                 } else if ecode == 0x80000003 || ecode == 0x4000001F {
-                    status = DBG_CONTINUE; // loader/init breakpoint
+                    // An int3 the title planted itself is an assert. Swallowing it silently
+                    // hides exactly the failures we are chasing, so name the site.
+                    static ASSERT_N: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let n = ASSERT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let m = modules.range(..=addr).next_back()
+                        .map(|(b, nm)| format!("{nm} +0x{:x}", addr - b))
+                        .unwrap_or_else(|| format!("0x{addr:x}"));
+                    if n < 40 {
+                        eprintln!("[INT3 #{n}] assert at {m} (t_ms unix={})", ods_ms());
+                    }
+                    status = DBG_CONTINUE; // assert / loader breakpoint, execution continues
                 } else if ecode == 0x40010006 || ecode == 0x4001000A {
                     // DBG_PRINTEXCEPTION_C / _WIDE_C: OutputDebugString via RaiseException.
                     // Info[0] = char count (incl NUL), Info[1] = pointer to string.
@@ -1270,7 +1281,13 @@ fn arm_watch(hproc: HANDLE, tid: u32, addrs: &[u64]) {
     }
     wr_u64(&mut ctx.0, 0x68, 0); // Dr6
     wr_u64(&mut ctx.0, 0x70, dr7);
-    unsafe { SetThreadContext(h, ctx.0.as_ptr()); CloseHandle(h); }
+    let ok = unsafe { SetThreadContext(h, ctx.0.as_ptr()) };
+    static ARMED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = ARMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if ok == 0 || n < 12 {
+        eprintln!("[WATCH] tid={tid} armed={} (total {})", ok != 0, n + 1);
+    }
+    unsafe { CloseHandle(h); }
 }
 
 fn watch_fired(hproc: HANDLE, tid: u32) -> Option<(u64, u64)> {

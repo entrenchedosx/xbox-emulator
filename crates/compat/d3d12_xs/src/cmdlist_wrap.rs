@@ -22,6 +22,9 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[allow(unused_imports)] use core::sync::atomic::AtomicU64;
 use compat_common::record;
+use crate::device_wrap::{Guid, IID_XBOX_GRAPHICS_COMMAND_LIST};
+const E_POINTER: i32 = 0x8000_4003u32 as i32;
+const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
 
 extern "system" {
     fn VirtualProtect(addr: *mut c_void, size: usize, new_protect: u32, old_protect: *mut u32) -> i32;
@@ -107,14 +110,23 @@ unsafe extern "system" fn inserted_stub() {
 static EXE_BASE: AtomicUsize = AtomicUsize::new(0);
 static PROBE_HITS: AtomicUsize = AtomicUsize::new(0);
 
+pub(crate) static mut PROBE_ARGS: [u64; 6] = [0; 6];
+
 unsafe extern "system" fn probe_impl(_this: *mut c_void, a: u64, caller: usize, slot: u64) {
     let h = PROBE_HITS.fetch_add(1, Ordering::Relaxed);
     static PER: [AtomicUsize; 160] = [const { AtomicUsize::new(0) }; 160];
     let _ = h;
     if PER[(slot as usize).min(127)].fetch_add(1, Ordering::Relaxed) < 4 {
         let base = EXE_BASE.load(Ordering::Relaxed);
+        // PROBE_ARGS was filled by the stub with the real call's rcx/rdx/r8/r9/ret/rsp.
+        let (rcx, rdx, r8, r9, ret, rsp) = unsafe {
+            let p = PROBE_ARGS.as_ptr();
+            (*p, *p.add(1), *p.add(2), *p.add(3), *p.add(4), *p.add(5))
+        };
+        let _ = a;
         record("d3d12_xs", "cmdlist.hi",
-            &format!("slot={slot} arg1={a:#x} caller={:#x}", caller.wrapping_sub(base)));
+            &format!("slot={slot} rcx={rcx:#x} rdx={rdx:#x} r8={r8:#x} r9={r9:#x} ret={:#x} rsp={rsp:#x} caller={:#x}",
+                ret.wrapping_sub(base as u64), caller.wrapping_sub(base)));
     }
 }
 
@@ -123,11 +135,21 @@ macro_rules! make_probes {
         $(
             #[unsafe(naked)]
             unsafe extern "system" fn $name() {
+                // Snapshot the incoming arguments before the Rust callee clobbers them:
+                // rcx/rdx/r8/r9 (Windows x64) plus the return address and caller rsp.
                 core::arch::naked_asm!(
+                    "lea r10, [rip + {a}]",
+                    "mov [r10], rcx",
+                    "mov [r10 + 8], rdx",
+                    "mov [r10 + 16], r8",
+                    "mov [r10 + 24], r9",
+                    "mov rax, [rsp]",
+                    "mov [r10 + 32], rax",
+                    "mov [r10 + 40], rsp",
                     "mov r8, [rsp]",        // caller return address -> 3rd arg
                     "mov r9d, {s}",         // slot -> 4th arg
                     "jmp {i}",
-                    s = const $slot, i = sym probe_impl,
+                    s = const $slot, i = sym probe_impl, a = sym PROBE_ARGS,
                 );
             }
         )*
@@ -438,6 +460,7 @@ pub fn apply(real_list: *mut c_void) {
             crate::cbv_raw::install_draw_check(&XBOX_VT);
             crate::passcap::install(&XBOX_VT);
             crate::gpuprof::install_ops(&XBOX_VT);
+            XBOX_VT[0].store(shim_qi as usize, Ordering::Relaxed);
             XBOX_VT[CONSOLE_NULL_SLOT].store(0, Ordering::Relaxed);
             record("d3d12_xs", "cmdlist.vtable",
                 &format!("built Xbox-layout cmdlist vtable from real {real_vt:p} (+4 shift at PC28)"));
@@ -508,6 +531,74 @@ unsafe fn build_shim_thunks() {
         core::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len());
         SHIM_VT[i].store(p as usize, Ordering::Relaxed);
     }
+}
+
+
+// ---- shim QueryInterface ----------------------------------------------------------------
+//
+// Slots 0..=26 are otherwise the real PC methods, so a QueryInterface on the shim asks the
+// PC object. The PC object has never heard of the console list interfaces, so it answers
+// E_NOINTERFACE and leaves the title with a null object. The shim is the object that
+// actually implements the console layout, so it answers those IDs itself.
+const IID_IUNKNOWN_Q: Guid =
+    Guid { d1: 0, d2: 0, d3: 0, d4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
+
+static QI_LOGGED: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "system" fn shim_qi(this: *mut c_void, riid: *const Guid, ppv: *mut *mut c_void) -> i32 {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    unsafe { *ppv = core::ptr::null_mut() };
+    let Some(i) = (unsafe { riid.as_ref().copied() }) else { return E_POINTER };
+
+    let is_shim = unsafe { *(this as *const usize) == SHIM_VT.as_ptr() as usize };
+    // A real list that we pointed at the Xbox table has `this` == the real object.
+    let real = if is_shim {
+        unsafe { *((this as *const u8).add(SHIM_REAL_OFF) as *const usize) as *mut c_void }
+    } else {
+        this
+    };
+    if real.is_null() {
+        return E_NOINTERFACE;
+    }
+
+    let serves = i == IID_IUNKNOWN_Q
+        || i == crate::dma_list::IID_GRAPHICS_COMMAND_LIST
+        || i == IID_XBOX_GRAPHICS_COMMAND_LIST
+        || i == crate::dma_list::IID_XBOX_DMA_COMMAND_LIST;
+    if serves && is_shim {
+        // Hand back the same shim and take a reference on the real list behind it.
+        let vt = unsafe { *(real as *const *const usize) };
+        let add: unsafe extern "system" fn(*mut c_void) -> u32 =
+            unsafe { core::mem::transmute(*vt.add(1)) };
+        unsafe { add(real) };
+        unsafe { *ppv = this };
+        if QI_LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+            record("d3d12_xs", "cmdlist.qi", &format!("served this shim for {{{:08X}-{:04X}-{:04X}}}",
+                i.d1, i.d2, i.d3));
+        }
+        return 0;
+    }
+
+    // Everything else goes to the real list. If its vtable is already the Xbox table, use the
+    // saved PC entry point so this does not recurse into itself.
+    let vt = unsafe { *(real as *const *const usize) };
+    let qi_ptr = if vt == XBOX_VT.as_ptr() as *const usize {
+        let saved = unsafe { REAL_VT_PTR };
+        if saved.is_null() { return E_NOINTERFACE; }
+        unsafe { *saved }
+    } else {
+        unsafe { *vt }
+    };
+    let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(qi_ptr) };
+    let hr = unsafe { qi(real, riid, ppv) };
+    if QI_LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+        record("d3d12_xs", "cmdlist.qi", &format!("forwarded {{{:08X}-{:04X}-{:04X}}} -> hr={hr:#010x}",
+            i.d1, i.d2, i.d3));
+    }
+    hr
 }
 
 /// Wrap a freshly created real command list in a shim object for the title.
