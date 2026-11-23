@@ -459,6 +459,89 @@ pub fn forget(heap: usize) -> bool {
     heaps(|m| m.remove(&heap).is_some())
 }
 
+/// `XMEM_ATTRIBUTES` the console driver allocates descriptor-heap memory with:
+/// object type 4 (the title's handler matches `attributes & 0x3fff == 4`), 64 KiB
+/// pages, allocator id 0x80 (selects the title's record list), 64 KiB alignment.
+pub const DESCRIPTOR_HEAP_ALLOC_ATTRS: u64 = 4 | 1 << 14 | 0x80 << 16 | 16 << 24;
+
+type TitleAllocFn = unsafe extern "system" fn(usize, u64, *mut u32) -> *mut c_void;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetModuleHandleW(name: *const u16) -> usize;
+    fn GetProcAddress(module: usize, name: *const u8) -> *const c_void;
+}
+
+fn xmem_title_alloc() -> Option<TitleAllocFn> {
+    static F: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let f = *F.get_or_init(|| unsafe {
+        let name: Vec<u16> = "xmem.dll\0".encode_utf16().collect();
+        let m = GetModuleHandleW(name.as_ptr());
+        if m == 0 {
+            return 0;
+        }
+        GetProcAddress(m, b"TomboxXMemTitleAlloc\0".as_ptr()) as usize
+    });
+    (f != 0).then(|| unsafe { core::mem::transmute::<usize, TitleAllocFn>(f) })
+}
+
+pub fn console_family(device_type: u32) -> u32 {
+    if crate::console_slots_dev2::family(device_type) == crate::console_slots_dev2::Family::Scarlett {
+        FAMILY_SCARLETT
+    } else {
+        FAMILY_ONE
+    }
+}
+
+/// The CPU and GPU start a title must see for a heap over its own memory: the CPU
+/// start is the memory itself, the GPU start is its first descriptor slot.
+pub fn title_start_handles(base: u64, ty: u32) -> (u64, u64) {
+    (base, first_slot(base, ty))
+}
+
+/// A console descriptor heap lives in memory the title supplies: before creating it
+/// the title arms its XMem allocation hook with `{base, bytes}`, the console driver
+/// allocates the heap's memory through that hook, and the title then asserts that
+/// the heap's CPU start equals `base`.
+///
+/// Called after the PC heap exists. Asks the title's hook for `count * increment`
+/// bytes; if the title supplied memory, registers the heap over it (its descriptors
+/// are mirrored from there at execute time) and binds the handles the title must see.
+/// A hook with nothing armed falls through to the default allocator and the heap stays
+/// an ordinary PC heap. `pc_count` is how many descriptors the PC heap really has.
+pub unsafe fn adopt_title_memory(heap: usize, requested: [u32; 4], pc_count: u32, device_type: u32) -> Option<u64> {
+    if std::env::var("TOMBOX_TITLE_DESC_MEMORY").map_or(false, |v| v.trim() == "0") {
+        return None;
+    }
+    crate::heap_wrap::unbind_title_handles(heap);
+    let alloc = xmem_title_alloc()?;
+    let ty = crate::xone_heap::heap_type(requested[0]);
+    let get_device: unsafe extern "system" fn(usize, *const [u8; 16], *mut usize) -> i32 = core::mem::transmute(vfn(heap, 7));
+    let mut device = 0usize;
+    if get_device(heap, &IID_ID3D12_DEVICE, &mut device) < 0 || device == 0 {
+        return None;
+    }
+    release(device);
+    let inc_f: unsafe extern "system" fn(usize, u32) -> u32 = core::mem::transmute(vfn(device, 15));
+    let bytes = requested[1] as usize * inc_f(device, ty) as usize;
+    let mut from_title = 0u32;
+    let base = alloc(bytes, DESCRIPTOR_HEAP_ALLOC_ATTRS, &mut from_title) as u64;
+    if from_title == 0 || base == 0 {
+        return None;
+    }
+    let hr = register(heap, base, (pc_count as u64) << 32 | requested[0] as u64, console_family(device_type));
+    if hr < 0 {
+        record(M, TAG, &format!("heap {heap:#x}: title supplied descriptor memory {base:#x} ({bytes:#x} bytes) but registering the heap failed hr={hr:#010x}"));
+        return None;
+    }
+    let (cpu, gpu) = title_start_handles(base, ty);
+    crate::heap_wrap::bind_title_handles(heap, cpu, gpu);
+    record(M, TAG, &format!(
+        "heap {heap:#x}: title-supplied descriptor memory {base:#x} ({bytes:#x} bytes, {} descriptors requested, {pc_count} in the PC heap) -> title sees CPU start {cpu:#x}, GPU start {gpu:#x}",
+        requested[1]));
+    Some(base)
+}
+
 pub fn set_kind(heap: usize, first: u32, count: u32, kind: u8) -> u32 {
     heaps(|m| {
         let Some(h) = m.get_mut(&heap) else {
@@ -1071,6 +1154,27 @@ pub static DXGI_TO_HW: [[u16; 2]; 193] = [[0, 0], [75, 0], [77, 77], [75, 75], [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_heap_alloc_attributes_match_what_the_title_hook_tests() {
+        assert_eq!(DESCRIPTOR_HEAP_ALLOC_ATTRS & 0x3fff, 4, "the title's handler matches (attributes & 0x3fff) == 4");
+        assert_eq!(DESCRIPTOR_HEAP_ALLOC_ATTRS >> 16 & 0xff, 0x80, "bits 16..24 select its record list");
+    }
+
+    #[test]
+    fn title_sees_its_own_memory_as_the_heap_start() {
+        // The title asserts GetCPUDescriptorHandleForHeapStart() == the memory it armed.
+        assert_eq!(title_start_handles(0x5000_0000, 0), (0x5000_0000, 0x5000_0000));
+        // Sampler heaps carry a 16-byte header before descriptor 0.
+        assert_eq!(title_start_handles(0x5000_0000, 1), (0x5000_0000, 0x5000_0010));
+    }
+
+    #[test]
+    fn family_follows_the_console_device_type() {
+        assert_eq!(console_family(1), FAMILY_SCARLETT);
+        assert_eq!(console_family(2), FAMILY_ONE);
+        assert_eq!(console_family(5), FAMILY_ONE);
+    }
 
     #[test]
     fn bindtrace_resolves_title_table_handles_to_written_views() {

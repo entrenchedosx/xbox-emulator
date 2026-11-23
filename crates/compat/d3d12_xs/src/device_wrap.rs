@@ -187,6 +187,7 @@ unsafe extern "system" fn create_descriptor_heap(
     let real = unsafe { (*this).real };
     let f: unsafe extern "system" fn(*mut c_void, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(14)) };
+    let requested = if pdesc.is_null() { None } else { Some(unsafe { *(pdesc as *const [u32; 4]) }) };
     let mut hr = unsafe { f(real, pdesc, riid, ppv) };
     // The host's shader-visible CBV/SRV/UAV ceiling is below the console's heap size.
     // Create the largest heap the host allows rather than none: the title would
@@ -214,6 +215,12 @@ unsafe extern "system" fn create_descriptor_heap(
         // Keep the heap REAL (so it works when passed to SetDescriptorHeaps etc.);
         // patch the shared heap vtable once to fix the handle-getter ABI.
         crate::heap_wrap::ensure_patched(unsafe { *ppv });
+        // A heap the title supplied memory for (it armed its XMem allocation hook) lives
+        // over that memory; a title that armed nothing keeps an ordinary PC heap.
+        if let Some(req) = requested {
+            let pc_count = retried.map_or(req[1], |d| d[1]);
+            unsafe { crate::title_heap::adopt_title_memory(*ppv as usize, req, pc_count, xgs_kmd_emu::device_type()) };
+        }
         if (crate::rtcap::enabled() || crate::passcap::tables_on()) && !pdesc.is_null() {
             // Binding trace: remember shader-visible heaps (GPU handle -> CPU handle).
             let d = pdesc as *const u32;

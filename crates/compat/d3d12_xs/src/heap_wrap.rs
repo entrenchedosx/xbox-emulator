@@ -28,7 +28,28 @@ static ORIG_CPU: AtomicUsize = AtomicUsize::new(0);
 static ORIG_GPU: AtomicUsize = AtomicUsize::new(0);
 static PATCHED_VTABLES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+/// Heaps whose descriptors live in memory the title supplied (see `title_heap`):
+/// on the console such a heap's CPU start *is* that memory, and the title checks
+/// it. Value is `(cpu_start, gpu_start)` as the title must see them.
+static TITLE_HANDLES: Mutex<Option<std::collections::HashMap<usize, (u64, u64)>>> = Mutex::new(None);
+
+pub fn bind_title_handles(heap: usize, cpu: u64, gpu: u64) {
+    TITLE_HANDLES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(heap, (cpu, gpu));
+}
+
+/// A new heap can reuse the address of a released one; drop any stale binding.
+pub fn unbind_title_handles(heap: usize) -> bool {
+    TITLE_HANDLES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map_or(false, |m| m.remove(&heap).is_some())
+}
+
+pub fn title_handles(heap: usize) -> Option<(u64, u64)> {
+    TITLE_HANDLES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&heap).copied())
+}
+
 unsafe extern "system" fn bridge_cpu(heap: *mut c_void) -> u64 {
+    if let Some((cpu, _)) = title_handles(heap as usize) {
+        return cpu;
+    }
     let orig: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 =
         unsafe { core::mem::transmute(ORIG_CPU.load(Ordering::Relaxed)) };
     let mut out: u64 = 0;
@@ -41,6 +62,9 @@ unsafe extern "system" fn bridge_cpu(heap: *mut c_void) -> u64 {
 }
 
 unsafe extern "system" fn bridge_gpu(heap: *mut c_void) -> u64 {
+    if let Some((_, gpu)) = title_handles(heap as usize) {
+        return gpu;
+    }
     let orig: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 =
         unsafe { core::mem::transmute(ORIG_GPU.load(Ordering::Relaxed)) };
     let mut out: u64 = 0;
@@ -50,6 +74,23 @@ unsafe extern "system" fn bridge_gpu(heap: *mut c_void) -> u64 {
         record("d3d12_xs", "heap.GetGPUHandleBase", &format!("heap={heap:p} base={out:#x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn title_bound_heap_reports_the_title_handles_and_other_heaps_do_not() {
+        let heap = 0x7e57_0001usize;
+        assert_eq!(title_handles(heap), None);
+        bind_title_handles(heap, 0x2_0000_0000, 0x2_0000_0010);
+        assert_eq!(title_handles(heap), Some((0x2_0000_0000, 0x2_0000_0010)));
+        assert_eq!(title_handles(heap + 1), None, "only the bound heap");
+        assert!(unbind_title_handles(heap));
+        assert_eq!(title_handles(heap), None);
+        assert!(!unbind_title_handles(heap), "already gone");
+    }
 }
 
 /// Patch this heap's descriptor-heap vtable (slots 9/10) if not already done.

@@ -211,6 +211,102 @@ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
     p
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetModuleHandleW(name: *const u16) -> usize;
+    fn GetProcAddress(module: usize, name: *const u8) -> *const c_void;
+}
+
+/// Size of the image a module handle points at (`OptionalHeader.SizeOfImage`).
+unsafe fn image_size(base: usize) -> Option<usize> {
+    if base == 0 || *(base as *const u16) != 0x5a4d {
+        return None;
+    }
+    let nt = base + *((base + 0x3c) as *const u32) as usize;
+    if *(nt as *const u32) != 0x4550 {
+        return None;
+    }
+    Some(*((nt + 0x50) as *const u32) as usize)
+}
+
+/// Pure validation of an exported `__XMemAllocationHooks__` block: `{ alloc, free, .. }`,
+/// both entry points inside the title's own image `[lo, hi)`.
+pub fn hooks_from_block(block: &[usize], lo: usize, hi: usize) -> Option<(usize, usize)> {
+    let (alloc, free) = (*block.first()?, *block.get(1)?);
+    let inside = |a: usize| a >= lo && a < hi;
+    (inside(alloc) && inside(free)).then_some((alloc, free))
+}
+
+/// A GDK title exports a data symbol `__XMemAllocationHooks__`. The console OS reads
+/// it and routes the allocations it makes on the title's behalf (descriptor-heap
+/// memory, among others) through the title's allocator, so the title can hand back
+/// memory it prepared. GTA VI uses it: before creating a descriptor heap it arms a
+/// record for its alloc hook and then asserts that the heap's CPU start equals the
+/// address it armed.
+fn exported_title_hooks() -> Option<(usize, usize)> {
+    static HOOKS: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+    *HOOKS.get_or_init(|| unsafe {
+        let exe = GetModuleHandleW(core::ptr::null());
+        let size = image_size(exe)?;
+        let p = GetProcAddress(exe, b"__XMemAllocationHooks__\0".as_ptr()) as *const usize;
+        if p.is_null() {
+            return None;
+        }
+        let block = core::slice::from_raw_parts(p, 2);
+        let hooks = hooks_from_block(block, exe, exe + size);
+        record(M, "XMemAllocationHooks", &match hooks {
+            Some((a, f)) => format!("title export __XMemAllocationHooks__ at {p:p}: alloc=EXE+{:#x} free=EXE+{:#x}", a - exe, f - exe),
+            None => format!("title export __XMemAllocationHooks__ at {p:p} ignored: entry points {:#x?} are not inside the image", block),
+        });
+        hooks
+    })
+}
+
+/// The allocation hook currently in force: one set through `XMemSetAllocationHooks`,
+/// else the title's exported block.
+fn current_alloc_hook() -> Option<AllocHook> {
+    let set = ALLOC_HOOK.load(Ordering::Acquire);
+    let h = if set != 0 { set } else { exported_title_hooks()?.0 };
+    Some(unsafe { core::mem::transmute::<usize, AllocHook>(h) })
+}
+
+/// Run `hook` for an allocation and say whether the memory came from the title.
+/// A hook that has nothing prepared falls through to `XMemAllocDefault`, which is
+/// tracked here; that allocation is released again and reported as "not from the
+/// title". Memory the hook returns that this allocator did not make was supplied by
+/// the title.
+pub unsafe fn alloc_through(hook: AllocHook, size: usize, attributes: u64) -> (*mut c_void, bool) {
+    let p = hook(size, attributes);
+    if p.is_null() {
+        return (p, false);
+    }
+    if is_tracked(p) {
+        default_free(p, attributes);
+        return (core::ptr::null_mut(), false);
+    }
+    (p, true)
+}
+
+/// For the emulated console driver: allocate `size` bytes the way the console OS
+/// allocates on the title's behalf, through the title's allocation hook.
+/// Returns the title-supplied memory and sets `*from_title = 1`; returns NULL with
+/// `*from_title = 0` when the title exports no hook or the hook had nothing prepared
+/// (its fall-through allocation is released again).
+#[no_mangle]
+pub unsafe extern "system" fn TomboxXMemTitleAlloc(size: usize, attributes: u64, from_title: *mut u32) -> *mut c_void {
+    if !from_title.is_null() {
+        *from_title = 0;
+    }
+    let Some(hook) = current_alloc_hook() else {
+        return core::ptr::null_mut();
+    };
+    let (p, ours) = alloc_through(hook, size, attributes);
+    if ours && !from_title.is_null() {
+        *from_title = 1;
+    }
+    p
+}
+
 #[no_mangle]
 pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
     let h = FREE_HOOK.load(Ordering::Acquire);
@@ -347,6 +443,79 @@ pub unsafe extern "system" fn XMemGetAllocationStatistics(memory_type: u32, alt:
     }
     SetLastError(0);
     1
+}
+
+#[cfg(test)]
+mod title_hook_tests {
+    use super::*;
+
+    /// Descriptor-heap allocation as the console driver makes it: object type 4,
+    /// 64 KiB pages, allocator id 0x80, 64 KiB alignment.
+    const DESCRIPTOR_HEAP_ATTRS: u64 = 4 | 1 << 14 | 0x80 << 16 | 16 << 24;
+
+    thread_local! {
+        static LAST: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    unsafe extern "system" fn armed_hook(_size: usize, _attributes: u64) -> *mut c_void {
+        0x7000_0000usize as *mut c_void
+    }
+
+    unsafe extern "system" fn fall_through_hook(size: usize, attributes: u64) -> *mut c_void {
+        let p = default_alloc(size, attributes);
+        LAST.with(|c| c.set(p as usize));
+        p
+    }
+
+    unsafe extern "system" fn null_hook(_size: usize, _attributes: u64) -> *mut c_void {
+        core::ptr::null_mut()
+    }
+
+    #[test]
+    fn exported_block_must_point_into_the_title_image() {
+        let (lo, hi) = (0x1_4000_0000usize, 0x1_4b06_d000usize);
+        assert_eq!(hooks_from_block(&[lo + 0x4deb420, lo + 0x4e38ec0, lo + 0x6188660], lo, hi), Some((lo + 0x4deb420, lo + 0x4e38ec0)));
+        assert_eq!(hooks_from_block(&[0, lo + 0x10], lo, hi), None, "null alloc");
+        assert_eq!(hooks_from_block(&[lo + 0x10, hi], lo, hi), None, "free past the image");
+        assert_eq!(hooks_from_block(&[lo + 0x10], lo, hi), None, "block too short");
+        assert_eq!(hooks_from_block(&[], lo, hi), None);
+    }
+
+    #[test]
+    fn title_supplied_memory_is_returned_and_flagged() {
+        let (p, from_title) = unsafe { alloc_through(armed_hook, 0x1000, DESCRIPTOR_HEAP_ATTRS) };
+        assert_eq!(p as usize, 0x7000_0000);
+        assert!(from_title);
+        assert!(!is_tracked(p), "the title's own memory is never ours to track or free");
+    }
+
+    /// A hook with nothing prepared falls through to the default allocator; that
+    /// allocation must be released again, not leaked and not mistaken for title memory.
+    #[test]
+    fn fall_through_allocation_is_released_and_not_flagged() {
+        let (p, from_title) = unsafe { alloc_through(fall_through_hook, 0x1000, DESCRIPTOR_HEAP_ATTRS) };
+        assert!(p.is_null());
+        assert!(!from_title);
+        let made = LAST.with(|c| c.get());
+        assert_ne!(made, 0, "the hook did allocate");
+        assert!(!is_tracked(made as *const c_void), "and the allocation was freed again");
+    }
+
+    #[test]
+    fn a_failing_hook_is_not_flagged() {
+        let (p, from_title) = unsafe { alloc_through(null_hook, 0x1000, DESCRIPTOR_HEAP_ATTRS) };
+        assert!(p.is_null());
+        assert!(!from_title);
+    }
+
+    #[test]
+    fn descriptor_heap_attributes_decode_as_the_title_hook_expects() {
+        let a = Attr(DESCRIPTOR_HEAP_ATTRS);
+        assert_eq!(a.object_type(), 4, "the title's handler matches (attributes & 0x3fff) == 4");
+        assert_eq!(a.allocator_id(), 0x80, "bits 16..24 select the title's per-allocator record list");
+        assert_eq!(a.page_bytes(), 0x1_0000);
+        assert!(a.type_valid());
+    }
 }
 
 #[cfg(test)]
