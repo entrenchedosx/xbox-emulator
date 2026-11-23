@@ -251,10 +251,7 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
         ));
     }
 
-    // The shader is a zlib stream inside XDAT. The XDAT section table layout is only
-    // partially understood, so locate the stream robustly by scanning for the zlib
-    // header (0x78 0x9c / 0x78 0xda / 0x78 0x01); inflate self-terminates. Pick the
-    // first blob that inflates to an FSSM container.
+    // XDAT can carry a raw FSSM section or a zlib-compressed program.
     //
     // A shader can carry several FSSM programs (observed on vertex shaders: one variant
     // that leaves through `s_setpc_b64` — a hardware-pipeline continuation form using LDS
@@ -264,7 +261,7 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
     if let Some(blob) = gcn::find_durango(xdat) {
         return gcn::extract_durango(dxbc, &container, stage, sm, bitcode_stripped, &blob);
     }
-    let variants = match find_and_inflate_fssm(xdat) {
+    let variants = match find_fssm(xdat) {
         Ok(v) => v,
         Err(_) if xdat_bitcode_section(xdat).is_some() => {
             return Err(bitcode_only_error(dxbc, "XDAT holds an LLVM DXIL bitcode section and no compressed GPU program"));
@@ -346,20 +343,26 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
 }
 
 const XDAT_BITCODE_SECTION: u32 = 7;
+const XDAT_RAW_FSSM_SECTION: u32 = 12;
 
 fn is_bitcode_at(b: &[u8], off: usize) -> bool {
     b.get(off..off + 4) == Some(b"BC\xC0\xDE")
 }
 
-fn xdat_bitcode_section(xdat: &[u8]) -> Option<(usize, usize)> {
-    let table = u32_at(xdat, 8).ok()? as usize;
-    if table % 12 != 0 || 12 + table > xdat.len() {
-        return None;
-    }
-    (0..table / 12).find_map(|e| {
+fn xdat_sections(xdat: &[u8]) -> impl Iterator<Item = (u32, usize, usize)> + '_ {
+    let table = u32_at(xdat, 8).unwrap_or(0) as usize;
+    let entries = if table % 12 == 0 && 12 + table <= xdat.len() { table / 12 } else { 0 };
+    (0..entries).filter_map(|e| {
         let at = 12 + e * 12;
         let (kind, off, size) = (u32_at(xdat, at).ok()?, u32_at(xdat, at + 4).ok()? as usize, u32_at(xdat, at + 8).ok()? as usize);
-        (kind == XDAT_BITCODE_SECTION && off.checked_add(size)? <= xdat.len() && is_bitcode_at(xdat, off)).then_some((off, size))
+        Some((kind, off, size))
+    })
+}
+
+fn xdat_bitcode_section(xdat: &[u8]) -> Option<(usize, usize)> {
+    xdat_sections(xdat).find_map(|(kind, off, size)| {
+        (kind == XDAT_BITCODE_SECTION && off.checked_add(size)? <= xdat.len()
+            && is_bitcode_at(xdat, off)).then_some((off, size))
     })
 }
 
@@ -370,23 +373,40 @@ fn bitcode_only_error(dxbc: &[u8], layout: &str) -> String {
     format!("{layout} (runtime-JIT DXIL, triple {triple}{jit}): the console compiles it when the PSO is created; TomBox has no DXIL passthrough yet")
 }
 
-/// Scan a blob for zlib streams and return every one that inflates to an `FSSM` container
-/// (in file order).
-fn find_and_inflate_fssm(xdat: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-    let mut last_err = String::from("no zlib stream found in XDAT");
-    let mut found = Vec::new();
+/// Find native program containers in file order.
+fn find_fssm(xdat: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let mut last_err = String::from("no FSSM section or zlib stream found in XDAT");
+    let mut found: Vec<_> = xdat_sections(xdat).filter_map(|(kind, off, size)| {
+        if kind != XDAT_RAW_FSSM_SECTION {
+            return None;
+        }
+        // Offsets for raw sections are relative to the start of the DXIL body,
+        // 24 bytes before XDAT. The section may include a trailer after FSSM.
+        let start = off.checked_sub(24)?;
+        let section = xdat.get(start..start.checked_add(size)?)?;
+        if section.get(..4) != Some(b"FSSM") {
+            return None;
+        }
+        let length = u32_at(section, 8).ok()? as usize;
+        let blob = section.get(..length)?;
+        (length >= 0xd0).then(|| (start, blob.to_vec()))
+    }).collect();
     let mut i = 8; // past "XDAT" + version
     while i + 2 < xdat.len() {
         if xdat[i] == 0x78 && matches!(xdat[i + 1], 0x01 | 0x9c | 0xda) {
             match miniz_oxide::inflate::decompress_to_vec_zlib(&xdat[i..]) {
-                Ok(out) if out.len() >= 8 && &out[0..4] == b"FSSM" => found.push(out),
+                Ok(out) if out.len() >= 8 && &out[0..4] == b"FSSM" => found.push((i, out)),
                 Ok(out) => last_err = format!("inflated {} bytes but magic={:?}", out.len(), &out[0..4.min(out.len())]),
                 Err(e) => last_err = format!("inflate at {i:#x} failed: {e:?}"),
             }
         }
         i += 1;
     }
-    if found.is_empty() { Err(last_err) } else { Ok(found) }
+    if found.is_empty() {
+        return Err(last_err);
+    }
+    found.sort_by_key(|(offset, _)| *offset);
+    Ok(found.into_iter().map(|(_, blob)| blob).collect())
 }
 
 /// Locate the RDNA2 ISA section inside an FSSM blob.
