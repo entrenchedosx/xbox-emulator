@@ -34,7 +34,7 @@ fn dir() -> Option<&'static PathBuf> {
             record("d3d12_xs", "shader_dump", &format!("TOMBOX_SHADER_DUMP: cannot create {}: {e}; dump off", d.display()));
             return None;
         }
-        record("d3d12_xs", "shader_dump", &format!("TOMBOX_SHADER_DUMP: every shader given to the translator is written once to {} as <hash>_<rtfmt>.xbox (+ .<roothash>.root for mesh pipelines); check offline with xshader_corpus", d.display()));
+        record("d3d12_xs", "shader_dump", &format!("TOMBOX_SHADER_DUMP: every shader given to the translator is written once to {} as <hash>_<rtfmt>.xbox with .<roothash>.root for external root signatures; check offline with xshader_corpus", d.display()));
         Some(d)
     })
     .as_ref()

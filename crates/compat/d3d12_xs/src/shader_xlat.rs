@@ -1025,16 +1025,20 @@ pub unsafe fn translate_for_targets(ptr: *const u8, len: usize, rtfmt: [u8; 8], 
 
 pub fn needs_external_root_data(blob: &[u8]) -> bool {
     (32..=0x40_0000).contains(&blob.len())
-        && tombox_xshader::Dxbc::parse(blob).is_ok_and(|dxbc| dxbc.chunk(b"RTS0").is_none())
+        && tombox_xshader::Dxbc::parse(blob).is_ok_and(|dxbc| {
+            dxbc.chunk(b"RTS0").is_none() && dxbc.chunk(b"DXIL").is_some_and(|dxil| {
+                dxil.size >= 28 && &blob[dxil.offset + 24..dxil.offset + 28] == b"XDAT"
+            })
+        })
 }
 
-pub fn translate_mesh_with_root(blob: &[u8], root: &[u8], link: &InputInterp) -> Cached {
+pub fn translate_with_root(blob: &[u8], root: &[u8], rtfmt: [u8; 8], link: &InputInterp) -> Cached {
     let hash = fnv1a(blob);
-    crate::shader_dump::note(blob, hash, &[0; 8], Some(root));
-    let entry = mesh_root_cell(link_key(hash, link), root);
+    crate::shader_dump::note(blob, hash, &rtfmt, Some(root));
+    let entry = mesh_root_cell(link_key(cache_key(hash, &rtfmt), link), root);
     entry.get_or_init(|| {
         crate::perf::timed(crate::perf::SHADER, || {
-            let result = std::panic::catch_unwind(|| translate_uncached_with(blob, hash, &[0; 8], link, None, Some(root)))
+            let result = std::panic::catch_unwind(|| translate_uncached_with(blob, hash, &rtfmt, link, None, Some(root)))
                 .unwrap_or_else(|_| Err("translator panicked".to_string()));
             finish_with(result, hash, blob.len(), None)
         })
@@ -1177,13 +1181,17 @@ mod tests {
     }
 
     #[test]
-    fn mesh_pipeline_root_cache_separates_layouts_and_keeps_embedded_roots() {
+    fn pipeline_root_cache_separates_layouts_and_keeps_embedded_roots() {
         let body = [0; 24];
         let embedded = crate::device_wrap::wrap_root_signature(&body);
         assert!(!needs_external_root_data(&embedded));
-        let mut stripped = embedded[..32].to_vec();
-        stripped[24..28].copy_from_slice(&32u32.to_le_bytes());
-        stripped[28..32].fill(0);
+        let mut dxil = [0u8; 28];
+        let mut stripped = crate::device_wrap::wrap_root_signature(&dxil);
+        let at = u32::from_le_bytes(stripped[32..36].try_into().unwrap()) as usize;
+        stripped[at..at + 4].copy_from_slice(b"DXIL");
+        assert!(!needs_external_root_data(&stripped));
+        dxil[24..28].copy_from_slice(b"XDAT");
+        stripped[at + 8..].copy_from_slice(&dxil);
         assert!(needs_external_root_data(&stripped));
         assert!(!needs_external_root_data(&stripped[..31]));
         let hash = fnv1a(&stripped);
@@ -1191,6 +1199,7 @@ mod tests {
         let root_b = mesh_root_cell(hash, &[1, 2, 4]);
         assert!(Arc::ptr_eq(&root_a, &mesh_root_cell(hash, &[1, 2, 3])));
         assert!(!Arc::ptr_eq(&root_a, &root_b));
+        assert!(!Arc::ptr_eq(&root_a, &mesh_root_cell(cache_key(hash, &[1; 8]), &[1, 2, 3])));
         assert!(!Arc::ptr_eq(&root_a, &cell(cache_key(hash, &[0; 8]))));
     }
 

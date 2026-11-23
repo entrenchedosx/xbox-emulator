@@ -548,15 +548,20 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
     }
     let root = parse(stream).ok().and_then(|s| s.iter().find(|(t, _)| *t == 0).map(|&(_, o)| bytecode(stream, o).0)).unwrap_or(0);
     let pc_centroid = crate::centroid_bind::tag_rtfmt(root, [0; 8])[0] & crate::centroid_bind::RTFMT_PC_CENTROID != 0;
+    let root_data = std::cell::OnceCell::new();
     let xlat = |ty: u32, b: &[u8], (n, f): (u32, [u32; 8]), feeds: Option<&[u8]>| {
         let link = feeds.map(|ps| crate::shader_xlat::ps_link(ps, pc_centroid)).unwrap_or_else(crate::shader_xlat::no_link);
-        if ty == SUB_MS && root != 0 && crate::shader_xlat::needs_external_root_data(b) {
-            if let Some(data) = crate::console_slots_mesh::root_data(root as *mut c_void) {
-                return crate::shader_xlat::translate_mesh_with_root(b, &data, &link).map_err(|e| e.to_string());
-            }
-        }
         let k = stage_rtfmt(ty, (n, f));
         let k = if ty == SUB_PS { crate::centroid_bind::tag_rtfmt(root, k) } else { k };
+        if root != 0 && crate::shader_xlat::needs_external_root_data(b) {
+            let data = root_data.get_or_init(|| {
+                crate::console_slots_mesh::root_data(root as *mut c_void).map(Arc::<[u8]>::from)
+                    .or_else(|| crate::pso_lib::root_info(root as usize).map(|(_, blob, _)| blob))
+            });
+            if let Some(data) = data {
+                return crate::shader_xlat::translate_with_root(b, data, k, &link).map_err(|e| e.to_string());
+            }
+        }
         crate::shader_xlat::translate_for_targets(b.as_ptr(), b.len(), k, &link).map_err(|e| e.to_string())
     };
     let (out, keep) = match translate_stream(stream, &xlat) {

@@ -2342,8 +2342,8 @@ pub(crate) fn address_resource_state(console_state: u32) -> u32 {
     if console_state == u32::MAX { 0 } else { console_state }
 }
 
-/// Scarlett `ID3D12Device11`-layout device slot 133 (vtable +0x428): create a
-/// buffer resource spanning a range of mapped title memory.
+/// Scarlett device slot 133 creates a resource at a title virtual address.
+/// Buffers and textures use the same ABI and placement path as slot 44.
 ///
 /// Evidence: the call at EXE+0x1E8684C in the descriptor-heap setup
 /// (EXE+0x1E86440), after it has built five placeholder-backed regions and mapped
@@ -2357,29 +2357,39 @@ pub(crate) fn address_resource_state(console_state: u32) -> u32 {
 /// Unverified: whether the console treats `address` as a GPU virtual address or
 /// a CPU one (they are the same for mapped title memory).
 unsafe extern "system" fn create_resource_from_address_x(
-    this: *mut DeviceWrapper, va: u64, pdesc: *const u8, init_state: u32,
+    this: *mut DeviceWrapper, va: u64, pdesc: *const u8, initial: u32,
     pclear: *const c_void, riid: *const Guid, ppv: *mut *mut c_void,
 ) -> i32 {
     static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    if !pdesc.is_null() {
-        let dim = unsafe { core::ptr::read_unaligned(pdesc as *const u32) };
-        if dim != 1 {
-            record("d3d12_xs", "CreateResourceFromAddressX", &format!("#{n} va={va:#x}: Dimension {dim} is not BUFFER -> E_INVALIDARG, nothing created"));
+    if !ppv.is_null() {
+        unsafe { *ppv = core::ptr::null_mut() };
+    }
+    let dim = if pdesc.is_null() { 0 } else { unsafe { core::ptr::read_unaligned(pdesc.cast::<u32>()) } };
+    let state = match dim {
+        1 => address_resource_state(initial),
+        2..=4 => {
+            // Texture calls specify the enhanced-barrier layout. The title uses
+            // SHADER_RESOURCE (6) for both a render target and a depth texture.
+            let (state, known) = layout_to_state(initial);
+            if !known {
+                record("d3d12_xs", "CreateResourceFromAddressX", &format!("#{n} va={va:#x}: unsupported texture layout {initial:#x}"));
+                return 0x8000_4001u32 as i32;
+            }
+            state
+        }
+        _ => {
+            record("d3d12_xs", "CreateResourceFromAddressX", &format!("#{n} va={va:#x}: invalid resource dimension {dim} -> E_INVALIDARG"));
             return 0x8007_0057u32 as i32;
         }
-    }
-    let state = address_resource_state(init_state);
+    };
     let hr = unsafe { create_placed_resource_x(this, va, pdesc, state, pclear, riid, ppv) };
     if hr < 0 || n < 8 {
-        let (width, flags) = if pdesc.is_null() {
-            (0, 0)
-        } else {
-            unsafe { (core::ptr::read_unaligned(pdesc.add(0x10) as *const u64), core::ptr::read_unaligned(pdesc.add(0x30) as *const u32)) }
-        };
+        let width = unsafe { core::ptr::read_unaligned(pdesc.add(0x10).cast::<u64>()) };
+        let flags = unsafe { core::ptr::read_unaligned(pdesc.add(0x30).cast::<u32>()) };
         let res = if ppv.is_null() { core::ptr::null_mut() } else { unsafe { *ppv } };
         record("d3d12_xs", "CreateResourceFromAddressX", &format!(
-            "#{n} va={va:#x} width={width:#x} flags={flags:#x} state={init_state:#x}->{state:#x} -> hr={hr:#010x} res={res:p} (served by the CreatePlacedResourceX path, slot 44)"));
+            "#{n} va={va:#x} dim={dim} width={width:#x} flags={flags:#x} initial={initial:#x} state={state:#x} -> hr={hr:#010x} res={res:p} (CreatePlacedResourceX)"));
     }
     hr
 }
@@ -2599,10 +2609,10 @@ mod slot133_tests {
     }
 
     #[test]
-    fn address_resource_must_be_a_buffer() {
+    fn address_resource_refuses_an_invalid_dimension() {
         let mut desc = [0u8; 0x38];
-        desc[0..4].copy_from_slice(&3u32.to_le_bytes()); // TEXTURE2D
-        let mut out: *mut c_void = core::ptr::null_mut();
+        desc[0..4].copy_from_slice(&5u32.to_le_bytes());
+        let mut out = core::ptr::dangling_mut::<c_void>();
         let hr = unsafe {
             create_resource_from_address_x(core::ptr::null_mut(), 0x1000_0000, desc.as_ptr(), 0xffff_ffff, core::ptr::null(), &IID_ID3D12RESOURCE, &mut out)
         };
