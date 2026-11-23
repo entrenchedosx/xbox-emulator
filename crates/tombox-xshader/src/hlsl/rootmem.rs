@@ -157,6 +157,14 @@ impl Emitter<'_> {
 
     pub(super) fn sgpr_dead_after(&self, idx: usize, r: u32) -> bool {
         let reads = |ins: &Insn| {
+            if ins.enc == Enc::Smem && ins.op <= 4 {
+                // S_LOAD takes a 64-bit address and an optional one-dword offset.
+                // The four-SGPR descriptor applies to S_BUFFER_LOAD instead.
+                let base = sgpr(ins.src.first()).map(u32::from);
+                let offset = ins.raw.get(1).map(|word| word >> 25).filter(|&reg| reg != 0x7d);
+                return base.is_some_and(|base| (base..base + 2).contains(&r))
+                    || offset == Some(r);
+            }
             if ins.enc == Enc::Vop3 && matches!(ins.mnemonic.as_str(), "v_cndmask_b32" | "v_readlane_b32" | "v_writelane_b32") {
                 return ins.src.iter().enumerate().any(|(i, o)| match o {
                     Opnd::Sgpr(n) => {

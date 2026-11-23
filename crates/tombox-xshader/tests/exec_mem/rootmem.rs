@@ -217,6 +217,17 @@ fn rootmem_overread_into_dead_sgprs_runs_on_warp() {
 }
 
 #[test]
+fn rootmem_overread_reused_as_scalar_load_destination_translates() {
+    let mut ops = vec![sop1(3, 28, 12), sop1(3, 29, 13)];
+    ops.extend(smem(0, 30, 28, 0x0c, SNULL));
+    ops.push(sop1(3, 31, 0));
+    let words = prog_with(&smem(2, 28, 2, 0x1c, SNULL), &ops);
+    let t = translate(&extract_rm(&words, rootmem_root())).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert!(t.needs_global);
+    dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).unwrap_or_else(|e| panic!("dxc: {e}\n{}", t.hlsl));
+}
+
+#[test]
 fn rootmem_overread_replaced_by_readlane_runs_on_warp() {
     let mut ops = vec![sop1(3, 29, ic(-1))];
     ops.extend(vop3(0x101, 6, [ic(0), ic(1), 29]));
