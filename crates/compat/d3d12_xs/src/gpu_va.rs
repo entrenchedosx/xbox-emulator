@@ -114,6 +114,12 @@ pub fn lookup(va: u64) -> Option<(Entry, u64)> {
     with(|t| find_in(&t.ranges, va).or_else(|| find_in(&t.cpu, va)))
 }
 
+pub(crate) fn contains_buffer_range(va: u64, size: u64) -> bool {
+    lookup(va).is_some_and(|(entry, offset)| {
+        entry.buffer && offset.checked_add(size).is_some_and(|end| end <= entry.len)
+    })
+}
+
 pub fn near_in(m: &BTreeMap<u64, Entry>, va: u64, n: usize) -> Vec<Entry> {
     let mut below: Vec<Entry> = m.range(..=va).rev().take(n).map(|(_, e)| *e).collect();
     below.reverse();
@@ -216,13 +222,7 @@ unsafe extern "system" fn map_x(this: *mut c_void, sub: u32, range: *const c_voi
 }
 
 unsafe extern "system" fn get_gpu_va_x(this: *mut c_void) -> u64 {
-    let orig = original_for(&ORIGINAL, this);
-    let va = if orig == 0 {
-        0
-    } else {
-        let f: unsafe extern "system" fn(*mut c_void) -> u64 = unsafe { core::mem::transmute(orig) };
-        unsafe { f(this) }
-    };
+    let va = unsafe { host_buffer_base(this) };
     if va != 0 {
         return va + crate::placed_offset::bytes(this as usize);
     }
@@ -231,6 +231,21 @@ unsafe extern "system" fn get_gpu_va_x(this: *mut c_void) -> u64 {
     } else {
         0
     }
+}
+
+/// Obtain the host buffer base before the guest-visible placement offset.
+pub(crate) unsafe fn host_buffer_base(res: *mut c_void) -> u64 {
+    let original = original_for(&ORIGINAL, res);
+    let slot = if original != 0 {
+        original
+    } else {
+        unsafe { *(*(res as *const *const usize)).add(RESOURCE_GET_GPU_VA) }
+    };
+    if slot == 0 || slot == get_gpu_va_x as usize {
+        return 0;
+    }
+    let get: unsafe extern "system" fn(*mut c_void) -> u64 = unsafe { core::mem::transmute(slot) };
+    unsafe { get(res) }
 }
 
 pub fn expose_texture_va() -> bool {

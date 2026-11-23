@@ -275,11 +275,16 @@ fn hw_scarlett_memory_slots_write_and_wait() {
 
         let flag = buffer(g.dev, HEAP_DEFAULT, 256, FLAG_UAV, ST_COMMON);
         let out = buffer(g.dev, HEAP_READBACK, 256, 0, ST_COPY_DEST);
+        let flag_alias = 0x214_0000_0000;
+        let out_alias = flag_alias + 0x1_0000;
+        for (start, res) in [(flag_alias, flag.res), (out_alias, out.res)] {
+            crate::gpu_va::insert(crate::gpu_va::Entry { start, len: 256, res, buffer: true });
+        }
         let value = 0x1234_5678_9abc_def0;
         let waiter = title_list(g.dev);
         let real_waiter = crate::cmdlist_wrap::unwrap(waiter);
-        write32(real_waiter, out.va, 7, 0, 0);
-        wait64(real_waiter, flag.va, FUNC_GREATER_EQUAL, value, 1);
+        write32(real_waiter, out_alias, 7, 0, 0);
+        wait64(real_waiter, flag_alias, FUNC_GREATER_EQUAL, value, 1);
         call!(waiter, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), out.res, 8, flag.res, 0, 8);
         assert!(call!(waiter, X_CLOSE, () -> i32) >= 0);
         assert_eq!(chain_len(waiter), 2);
@@ -289,7 +294,7 @@ fn hw_scarlett_memory_slots_write_and_wait() {
         assert_eq!((rd(&out, 0), rd(&out, 8)), (7, 0));
 
         let writer = title_list(g.dev);
-        write64(crate::cmdlist_wrap::unwrap(writer), flag.va, value, 0, 0);
+        write64(crate::cmdlist_wrap::unwrap(writer), flag_alias, value, 0, 0);
         assert!(call!(writer, X_CLOSE, () -> i32) >= 0);
         let write_done = fence(g.dev);
         submit(g.b, writer, write_done, 1);
