@@ -180,13 +180,13 @@ fn global_routing_and_refusals() {
     w.push(S_ENDPGM);
     let e = translate(&cs_extract(&w, 64)).err().unwrap_or_default();
     assert!(e.contains("scratch"), "{e}");
-    for (op, mnemonic, why) in [(0x52, "flat_atomic_add_x2", "64-bit"), (0x34, "flat_atomic_csub", "not modelled")] {
+    for (op, mnemonic) in [(0x52, "flat_atomic_add_x2"), (0x5f, "flat_atomic_fmin_x2")] {
         let mut p = Prog::new();
         p.raw(&g(op, 2, 0, 1, 2, 20, 3));
         let mut w = p.w.clone();
         w.push(S_ENDPGM);
         let e = translate(&cs_extract(&w, 64)).err().expect("unsupported atomic must be refused");
-        assert!(e.contains(mnemonic) && e.contains("not lowered") && e.contains(why), "{e}");
+        assert!(e.contains(mnemonic) && e.contains("not lowered") && e.contains("64-bit"), "{e}");
     }
     // an opcode that is not in the table at all is still reported as unsupported
     let mut p = Prog::new();

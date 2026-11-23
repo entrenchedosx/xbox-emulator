@@ -368,6 +368,48 @@ unsafe extern "system" fn get_descriptor_increment(this: *mut DeviceWrapper, hea
 #[derive(Clone, Copy)]
 struct AllocInfo { size: u64, align: u64 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AllocInfo1 {
+    offset: u64,
+    align: u64,
+    size: u64,
+}
+
+/// Slot 108 has the GetResourceAllocationInfo1 ABI. In addition to the 16-byte
+/// sret result, it fills one layout per resource when `details` is supplied.
+unsafe extern "system" fn get_resource_alloc_info1_x(
+    this: *mut DeviceWrapper, visible_mask: u32, num_descs: u32, descs: *const u32, details: *mut AllocInfo1,
+) -> AllocInfo {
+    if num_descs == 0 {
+        return AllocInfo { size: 0, align: 1 };
+    }
+    let failed = AllocInfo { size: 0, align: 0 };
+    if descs.is_null() {
+        return failed;
+    }
+    let mut total = AllocInfo { size: 0, align: 1 };
+    let mut layouts = Vec::new();
+    for i in 0..num_descs as usize {
+        let desc = unsafe { descs.cast::<u8>().add(i * crate::device_console_fix::RES_DESC_SIZE).cast() };
+        let part = unsafe { get_resource_alloc_info(this, visible_mask, 1, desc) };
+        if !part.align.is_power_of_two() {
+            return failed;
+        }
+        let mask = part.align - 1;
+        let Some(offset) = total.size.checked_add(mask).map(|v| v & !mask) else { return failed };
+        let Some(size) = offset.checked_add(part.size) else { return failed };
+        total = AllocInfo { size, align: total.align.max(part.align) };
+        if !details.is_null() {
+            layouts.push(AllocInfo1 { offset, align: part.align, size: part.size });
+        }
+    }
+    if !details.is_null() {
+        unsafe { core::ptr::copy_nonoverlapping(layouts.as_ptr(), details, layouts.len()) };
+    }
+    total
+}
+
 /// Intercept GetResourceAllocationInfo to see pResourceDescs (the crash is a null
 /// deref inside the real method), dump the desc, and avoid crashing on a null/bad
 /// desc. Rust's sret for a 16-byte return matches the PC ABI
@@ -2397,6 +2439,7 @@ pub(crate) fn vtable() -> *const usize {
         v[74] = crate::device_x::register_page_pool_x as usize;
         v[75] = crate::device_x::unregister_page_pool_x as usize;
         v[87] = crate::device_x::device87_release_x as usize;
+        v[108] = get_resource_alloc_info1_x as usize;
         v[127] = create_committed_resource3_x as usize; // CreateCommittedResource3 shape (see fn)
         v[133] = create_resource_from_address_x as usize; // buffer resource over mapped title memory (see fn)
         crate::device_ext_a::install(&mut v);
@@ -2450,6 +2493,27 @@ pub(crate) fn wrapper_qi(real: *mut c_void, riid: *const Guid, ppv: *mut *mut c_
 
 fn unregister_wrapper(w: usize) {
     WRAPPED.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| e.1 != w);
+}
+
+#[cfg(test)]
+#[test]
+fn device_slot_108_writes_the_aggregate_and_each_resource_layout() {
+    type Query = unsafe extern "system" fn(*mut DeviceWrapper, u32, u32, *const u32, *mut AllocInfo1) -> AllocInfo;
+    let query: Query = unsafe { core::mem::transmute(*vtable().add(108)) };
+    // Two row-major buffers with explicit 64 KiB alignment.
+    let descs = [[1u64, 0x10000, 0x10000, 0x0001_0001_0000_0001, 1 << 32, 1 << 32, 0]; 2];
+    let mut details = [AllocInfo1 { offset: u64::MAX, align: 0, size: 0 }; 2];
+    let device = core::ptr::null_mut();
+    let total = unsafe { query(device, 1, 2, descs.as_ptr().cast(), details.as_mut_ptr()) };
+    assert_eq!((total.size, total.align), (0x20000, 0x10000));
+    assert_eq!(details, [
+        AllocInfo1 { offset: 0, align: 0x10000, size: 0x10000 },
+        AllocInfo1 { offset: 0x10000, align: 0x10000, size: 0x10000 },
+    ]);
+    let total = unsafe { query(device, 1, 2, descs.as_ptr().cast(), core::ptr::null_mut()) };
+    assert_eq!((total.size, total.align), (0x20000, 0x10000));
+    let failed = unsafe { query(device, 1, 1, core::ptr::null(), details.as_mut_ptr()) };
+    assert_eq!((failed.size, failed.align), (0, 0));
 }
 
 #[cfg(test)]

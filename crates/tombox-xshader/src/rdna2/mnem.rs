@@ -381,7 +381,7 @@ pub fn lookup(enc: Enc, op: u32) -> Option<&'static str> {
             0x1f => Some("flat_store_dwordx3"),
             // FLAT/GLOBAL atomics (RDNA2 opcode map; the 64-bit forms sit 0x20 higher).
             0x30 => Some("flat_atomic_swap"), 0x31 => Some("flat_atomic_cmpswap"), 0x32 => Some("flat_atomic_add"),
-            0x33 => Some("flat_atomic_sub"), 0x34 => Some("flat_atomic_csub"), 0x35 => Some("flat_atomic_smin"),
+            0x33 => Some("flat_atomic_sub"), 0x35 => Some("flat_atomic_smin"),
             0x36 => Some("flat_atomic_umin"), 0x37 => Some("flat_atomic_smax"), 0x38 => Some("flat_atomic_umax"),
             0x39 => Some("flat_atomic_and"), 0x3a => Some("flat_atomic_or"), 0x3b => Some("flat_atomic_xor"),
             0x3c => Some("flat_atomic_inc"), 0x3d => Some("flat_atomic_dec"), 0x3e => Some("flat_atomic_fcmpswap"),

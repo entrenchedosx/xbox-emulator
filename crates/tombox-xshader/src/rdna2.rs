@@ -172,7 +172,7 @@ pub fn disassemble(isa: &[u8]) -> Vec<Insn> {
         let total = (base_len + if lit { 1 } else { 0 }).min(words.len() - i).max(1);
         let raw: Vec<u32> = words[i..i + total].to_vec();
         let op = opcode_field(enc, w) | if enc == Enc::Mtbuf { ((words.get(i + 1).copied().unwrap_or(0) >> 21) & 1) << 3 } else { 0 };
-        let mnemonic = mnemonic_for(enc, op);
+        let mnemonic = mnemonic_for(enc, op, w);
         let (dst, src, aux) = decode_operands(enc, &raw);
         let insn = Insn { offset: i * 4, dwords: total, enc, op, raw, mnemonic, dst, src, aux };
         // Do not stop at `s_endpgm`: programs can end early on one path and continue
@@ -504,7 +504,7 @@ fn opcode_field(enc: Enc, w: u32) -> u32 {
 
 /// Known mnemonics for the opcodes we rely on (control flow + common scalar). The rest are
 /// tagged by family+opcode so the output is honest about what is and isn't yet named.
-fn mnemonic_for(enc: Enc, op: u32) -> String {
+fn mnemonic_for(enc: Enc, op: u32, word: u32) -> String {
     // MIMG sample (0x20..0x3f) / gather4 (0x40..0x5f) names are regular: base + [_c] +
     // modifier + [_o], so generate them instead of tabulating all 64.
     if enc == Enc::Mimg && (0x20..0x60).contains(&op) && !(op >= 0x40 && matches!(op & 7, 2 | 3)) {
@@ -512,7 +512,11 @@ fn mnemonic_for(enc: Enc, op: u32) -> String {
         let modi = ["", "_cl", "_d", "_d_cl", "_l", "_b", "_b_cl", "_lz"][(op & 7) as usize];
         return format!("{base}{}{modi}{}", if op & 8 != 0 { "_c" } else { "" }, if op & 0x10 != 0 { "_o" } else { "" });
     }
-    match mnem::lookup(enc, op) {
+    // The shared FLAT encoding only defines atomics for the flat and global segments.
+    let known = mnem::lookup(enc, op).filter(|name| {
+        !name.starts_with("flat_atomic_") || matches!((word >> 14) & 3, 0 | 2)
+    });
+    match known {
         Some(s) => s.to_string(),
         None => format!("{:?}<{:#x}>", enc, op).to_lowercase(),
     }
