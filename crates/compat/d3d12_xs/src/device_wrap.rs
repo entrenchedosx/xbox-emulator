@@ -2189,6 +2189,70 @@ dev_notimpl_stubs!(
     (n151,151),(n152,152),(n153,153),(n154,154),(n155,155),(n156,156),(n157,157),(n158,158),(n159,159),
 );
 
+/// Legacy resource state for a `D3D12_BARRIER_LAYOUT` (enhanced-barrier initial
+/// layout). Only the layouts with a one-to-one legacy state are mapped; `UNDEFINED`
+/// and `COMMON` start in COMMON. The second value is false for a layout this table
+/// does not know, which is treated as COMMON and reported.
+pub(crate) fn layout_to_state(layout: u32) -> (u32, bool) {
+    match layout {
+        0 | 0xffff_ffff => (0, true),   // COMMON / PRESENT / UNDEFINED
+        1 => (0xac3, true),             // GENERIC_READ
+        2 => (0x4, true),               // RENDER_TARGET
+        3 => (0x8, true),               // UNORDERED_ACCESS
+        4 => (0x10, true),              // DEPTH_STENCIL_WRITE -> DEPTH_WRITE
+        5 => (0x20, true),              // DEPTH_STENCIL_READ -> DEPTH_READ
+        6 => (0xc0, true),              // SHADER_RESOURCE -> NON_PIXEL | PIXEL
+        7 => (0x800, true),             // COPY_SOURCE
+        8 => (0x400, true),             // COPY_DEST
+        9 => (0x2000, true),            // RESOLVE_SOURCE
+        10 => (0x1000, true),           // RESOLVE_DEST
+        _ => (0, false),
+    }
+}
+
+/// Scarlett `ID3D12Device11`-layout device slot 127 (vtable +0x3F8): the
+/// `ID3D12Device10::CreateCommittedResource3` shape.
+///
+/// Evidence: the call at EXE+0x193E1B4 passes `(this, D3D12_HEAP_PROPERTIES*, 8,
+/// D3D12_RESOURCE_DESC*, layout, clear, 0, (dword)0, 0, IID_ID3D12Resource, &out)` -
+/// the layout in place of a state, then a protected session (pointer), a castable
+/// format count (dword) and list (pointer), then riid and the out pointer. It
+/// follows a `GetResourceAllocationInfo` for a 33 MB texture, so it creates a
+/// committed texture. `D3D12_RESOURCE_DESC1` starts with the same 0x38 bytes as the
+/// legacy desc, so the call is translated into the legacy committed-resource path
+/// (slot 27) with the layout turned into a state: every console descriptor fixup
+/// and the GPU-VA/backing registration are shared. A protected session or castable
+/// formats cannot be expressed there and are refused, not ignored.
+unsafe extern "system" fn create_committed_resource3_x(
+    this: *mut DeviceWrapper, pheap: *const u32, heap_flags: u32, pdesc: *const u32, layout: u32,
+    pclear: *const c_void, protected: *const c_void, num_castable: u32, castable: *const u32,
+    riid: *const Guid, ppv: *mut *mut c_void,
+) -> i32 {
+    static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if !protected.is_null() || num_castable != 0 || !castable.is_null() {
+        record("d3d12_xs", "CreateCommittedResource3X", &format!(
+            "#{n} protected={protected:p} castable={num_castable} ({castable:p}) cannot be expressed by the PC committed-resource path -> E_NOTIMPL, nothing created"));
+        return 0x8000_4001u32 as i32;
+    }
+    let (state, known) = layout_to_state(layout);
+    if !known {
+        record("d3d12_xs", "CreateCommittedResource3X", &format!("#{n} initial layout {layout:#x} has no legacy state mapping; created in COMMON"));
+    }
+    let hr = unsafe { create_committed_resource(this, pheap, heap_flags, pdesc, state, pclear, riid, ppv) };
+    if hr < 0 || n < 8 {
+        let (heap_type, dim, width) = if pheap.is_null() || pdesc.is_null() {
+            (u32::MAX, u32::MAX, 0)
+        } else {
+            unsafe { (*pheap, *pdesc, core::ptr::read_unaligned((pdesc as *const u8).add(0x10) as *const u64)) }
+        };
+        let res = if ppv.is_null() { core::ptr::null_mut() } else { unsafe { *ppv } };
+        record("d3d12_xs", "CreateCommittedResource3X", &format!(
+            "#{n} heapType={heap_type} flags={heap_flags:#x} dim={dim} width={width:#x} layout={layout:#x}->state {state:#x} -> hr={hr:#010x} res={res:p} (served by the CreateCommittedResource path, slot 27)"));
+    }
+    hr
+}
+
 /// Initial state a PC buffer is created in for the console's "no state" value.
 /// The console does not track resource states for buffers, so a title passes
 /// 0xFFFFFFFF; the PC runtime rejects that, and a buffer created in COMMON
@@ -2293,6 +2357,7 @@ pub(crate) fn vtable() -> *const usize {
         v[74] = crate::device_x::register_page_pool_x as usize;
         v[75] = crate::device_x::unregister_page_pool_x as usize;
         v[87] = crate::device_x::device87_release_x as usize;
+        v[127] = create_committed_resource3_x as usize; // CreateCommittedResource3 shape (see fn)
         v[133] = create_resource_from_address_x as usize; // buffer resource over mapped title memory (see fn)
         crate::device_ext_a::install(&mut v);
         if crate::rtcap::enabled() || crate::passcap::on() || crate::blendclamp::lazy() {
@@ -2398,6 +2463,35 @@ mod slot133_tests {
         for i in 91..160 {
             assert_ne!(at(i), dev_stub as usize, "slot {i} still silent");
         }
+    }
+
+    #[test]
+    fn committed_resource3_layouts_map_to_legacy_states() {
+        assert_eq!(layout_to_state(0), (0, true));
+        assert_eq!(layout_to_state(0xffff_ffff), (0, true), "UNDEFINED starts in COMMON");
+        assert_eq!(layout_to_state(2), (0x4, true), "RENDER_TARGET");
+        assert_eq!(layout_to_state(3), (0x8, true), "UNORDERED_ACCESS");
+        assert_eq!(layout_to_state(4), (0x10, true), "DEPTH_STENCIL_WRITE");
+        assert_eq!(layout_to_state(6), (0xc0, true), "SHADER_RESOURCE");
+        assert_eq!(layout_to_state(8), (0x400, true), "COPY_DEST");
+        assert_eq!(layout_to_state(30), (0, false), "a layout with no legacy state is reported, not guessed");
+    }
+
+    /// Slot 127 was the silent stub too: the title's texture creation got E_NOTIMPL,
+    /// its allocator returned null, and it crashed dereferencing the result.
+    #[test]
+    fn slot_127_is_the_committed_resource3_shape_and_refuses_what_it_cannot_express() {
+        let v = vtable();
+        assert_eq!(unsafe { *v.add(127) }, create_committed_resource3_x as usize);
+        let mut out: *mut c_void = core::ptr::null_mut();
+        let some = 0x1000usize as *const c_void;
+        let notimpl = 0x8000_4001u32 as i32;
+        // a protected session, or castable formats, cannot be passed on to the legacy path
+        let hr = unsafe { create_committed_resource3_x(core::ptr::null_mut(), core::ptr::null(), 0, core::ptr::null(), 0, core::ptr::null(), some, 0, core::ptr::null(), &IID_ID3D12RESOURCE, &mut out) };
+        assert_eq!(hr, notimpl);
+        let hr = unsafe { create_committed_resource3_x(core::ptr::null_mut(), core::ptr::null(), 0, core::ptr::null(), 0, core::ptr::null(), core::ptr::null(), 2, some as *const u32, &IID_ID3D12RESOURCE, &mut out) };
+        assert_eq!(hr, notimpl);
+        assert!(out.is_null());
     }
 
     #[test]
