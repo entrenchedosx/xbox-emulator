@@ -697,13 +697,21 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
     let lists = [st.list];
     vcall!(queue, 10, fn(u32, *const *mut c_void) -> (), 1, lists.as_ptr());
     st.fence_value += 1;
-    vcall!(queue, 14, fn(*mut c_void, u64) -> i32, st.fence, st.fence_value);
+    let signal_hr = vcall!(queue, 14, fn(*mut c_void, u64) -> i32, st.fence, st.fence_value);
     let hr = crate::perf::timed(crate::perf::PFLIP, || vcall!(st.swapchain, 8, fn(u32, u32) -> i32, 0, present_flags()));
     if hr < 0 {
         crate::dred::on_failure(hr, "swapchain Present");
         return Err(format!("swapchain Present hr={hr:#010x}"));
     }
     st.frames += 1;
+    // First-frame diagnostics need their result even if the title stops before another PresentX.
+    if crate::present_probe::pending_first_frame() {
+        if signal_hr >= 0 && crate::present_wait::wait_fence(st.fence, st.fence_value, 1000) {
+            crate::present_probe::collect();
+        } else {
+            record("d3d12_xs", "PresentX.probe", "first-frame readback fence did not complete");
+        }
+    }
     Ok(())
 }
 
