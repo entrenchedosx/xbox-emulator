@@ -228,6 +228,7 @@ impl<'a> Emitter<'a> {
         let fmt = ufmt(ins.aux.imm2 as u32).ok_or_else(|| format!("mtbuf at {:#x}: invalid buffer format {}", ins.offset, ins.aux.imm2))?;
         let writes = ins.mnemonic.starts_with("tbuffer_store") || self.uav_force.contains(&slot);
         let kind = self.kind_at(table, off, writes)?;
+        let kind = self.kind_for_slot(slot, kind, writes);
         let is_uav = match kind {
             Some(0) => false,
             Some(1) => true,

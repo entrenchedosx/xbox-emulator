@@ -1000,13 +1000,15 @@ pub(crate) unsafe extern "system" fn scarlett_queue_submit(
     if count != 0 && lists.is_null() {
         return 0x8007_0057u32 as i32;
     }
-    if flags != 0 {
+    // Scarlett uses 0 for the auxiliary list and 3 for the frame's list array.
+    // Both carry closed command lists that the host queue can execute in order.
+    if !matches!(flags, 0 | 3) {
         record("d3d12_xs", "queue.submit", &format!("unsupported submission flags {flags:#x}"));
         return 0x8000_4001u32 as i32;
     }
-    static CALLS: AtomicUsize = AtomicUsize::new(0);
-    if CALLS.fetch_add(1, Ordering::Relaxed) < 4 {
-        record("d3d12_xs", "queue.submit", &format!("Scarlett slot 35 submits {count} command lists, frame token {token}"));
+    static CALLS: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+    if CALLS[usize::from(flags == 3)].fetch_add(1, Ordering::Relaxed) < 4 {
+        record("d3d12_xs", "queue.submit", &format!("Scarlett slot 35 submits {count} command lists, frame token {token}, flags {flags:#x}"));
     }
     unsafe { exec_lists_x(queue, count, lists) };
     unsafe { crate::ecl_probe::removed_reason(queue) }.unwrap_or(0)

@@ -328,8 +328,16 @@ pub unsafe fn emit_uav(real: *mut c_void, plan: ViewPlan, dest: usize) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(vfn(real, PC_CREATE_UAV)) };
     match plan {
         ViewPlan::Null => unsafe { f(real, core::ptr::null_mut(), core::ptr::null_mut(), NULL_UAV.as_ptr(), dest) },
-        ViewPlan::Default(r) => unsafe { f(real, r as *mut c_void, core::ptr::null_mut(), core::ptr::null(), dest) },
-        ViewPlan::Desc(r, d, c, _) => unsafe { f(real, r as *mut c_void, c as *mut c_void, d.as_ptr(), dest) },
+        ViewPlan::Default(r) => unsafe {
+            crate::depth_uav::with_shadow_uav(r as *mut c_void, core::ptr::null_mut(), core::ptr::null(), |res, counter, desc| {
+                f(real, res, counter, desc, dest);
+            });
+        },
+        ViewPlan::Desc(r, d, c, _) => unsafe {
+            crate::depth_uav::with_shadow_uav(r as *mut c_void, c as *mut c_void, d.as_ptr(), |res, counter, desc| {
+                f(real, res, counter, desc, dest);
+            });
+        },
     }
 }
 

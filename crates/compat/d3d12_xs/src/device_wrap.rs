@@ -663,33 +663,26 @@ unsafe extern "system" fn create_committed_resource(
         heap_words = crate::device_console_fix::pc_heap_words(heap_words);
         heap_words.as_ptr()
     };
-    let depth_uav = if pdesc.is_null() || !crate::depth_uav::enabled() { crate::depth_uav::Plan::None } else { crate::depth_uav::plan(&desc_copy[..0x38]) };
+    let depth_uav = if pdesc.is_null() { crate::depth_uav::Plan::None } else { crate::depth_uav::resource_plan(&desc_copy[..0x38]) };
     let title_state = init_state;
-    let init_state = if depth_uav == crate::depth_uav::Plan::None {
-        init_state
-    } else {
+    if depth_uav != crate::depth_uav::Plan::None {
         let d = crate::depth_uav::depth_desc(desc_copy[..0x38].try_into().unwrap());
         desc_copy[..0x38].copy_from_slice(&d);
-        crate::depth_uav::d_real(init_state)
-    };
+    }
+    let init_state = depth_uav.host_depth_state(title_state);
     let pooled = if depth_uav == crate::depth_uav::Plan::None { unsafe { crate::res_pool::try_create(real, pheap, heap_flags, desc_ptr, init_state, pclear, ppv) } } else { None };
     let hr = match pooled {
         Some(hr) => hr,
         None => unsafe { f(real, pheap, heap_flags, desc_ptr, init_state, pclear, use_riid, ppv) },
     };
     if hr >= 0 && !ppv.is_null() {
-        crate::map_x::ensure_patched(unsafe { *ppv });
         let res = unsafe { *ppv };
-        crate::depth_uav::forget(res as usize);
-        match &depth_uav {
-            crate::depth_uav::Plan::Pair(fm) => {
-                let d: [u8; 0x38] = desc_copy[..0x38].try_into().unwrap();
-                if let Err(e) = unsafe { crate::depth_uav::register(real, res, &d, &heap_words, title_state, *fm) } {
-                    crate::depth_uav::refuse(res as usize, &e);
-                }
+        if !res.is_null() {
+            let d = desc_copy[..0x38].try_into().unwrap();
+            if let Err(hr) = unsafe { finish_depth_uav_resource(real, ppv, d, &heap_words, title_state, &depth_uav) } {
+                return hr;
             }
-            crate::depth_uav::Plan::Refuse(why) => crate::depth_uav::refuse(res as usize, why),
-            crate::depth_uav::Plan::None => {}
+            crate::map_x::ensure_patched(res);
         }
     }
     if hr >= 0 && !ppv.is_null() && !pdesc.is_null() {
@@ -1896,7 +1889,18 @@ unsafe extern "system" fn create_compute_pso_sync(
     }
     let p = u64::from_le_bytes(desc[8..16].try_into().unwrap()) as *const u8;
     let n = u64::from_le_bytes(desc[16..24].try_into().unwrap()) as usize;
-    let code = match crate::frame_ev::time(crate::frame_ev::XLAT, || unsafe { crate::shader_xlat::translate(p, n) }) {
+    let root = u64::from_le_bytes(desc[0..8].try_into().unwrap()) as *mut c_void;
+    let code = match crate::frame_ev::time(crate::frame_ev::XLAT, || unsafe {
+        if !root.is_null() && !p.is_null() && (32..=0x40_0000).contains(&n) {
+            let blob = core::slice::from_raw_parts(p, n);
+            if crate::shader_xlat::needs_external_root_data(blob) {
+                if let Some(source) = crate::shader_xlat::pipeline_root_data(root) {
+                    return crate::shader_xlat::translate_with_root(blob, &source, [0; 8], &crate::shader_xlat::no_link());
+                }
+            }
+        }
+        crate::shader_xlat::translate(p, n)
+    }) {
         Ok(c) => c,
         Err(e) => {
             if FAIL.fetch_add(1, Ordering::Relaxed) < 6 {
@@ -2087,6 +2091,23 @@ unsafe extern "system" fn create_placed_resource(
     hr
 }
 
+unsafe fn finish_depth_uav_resource(
+    real: *mut c_void, out: *mut *mut c_void, desc: &[u8; 0x38],
+    heap: &[u32; 5], title_state: u32, plan: &crate::depth_uav::Plan,
+) -> Result<(), i32> {
+    let res = unsafe { *out };
+    if let Err(e) = unsafe { crate::depth_uav::register_resource(real, res, desc, heap, title_state, plan) } {
+        record("d3d12_xs", "depth_uav", &format!("depth/UAV pair creation failed: {e}"));
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(*real_vtbl(res).add(2)) };
+        unsafe {
+            *out = core::ptr::null_mut();
+            release(res);
+        }
+        return Err(0x8000_4005u32 as i32);
+    }
+    Ok(())
+}
+
 /// Xbox slot 44 `CreatePlacedResourceX` (see placed.rs for evidence and model).
 unsafe extern "system" fn create_placed_resource_x(
     this: *mut DeviceWrapper, va: u64, pdesc: *const u8, init_state: u32,
@@ -2105,11 +2126,19 @@ unsafe extern "system" fn create_placed_resource_x(
     let orig: [u8; 0x38] = unsafe { core::slice::from_raw_parts(pdesc, 0x38) }.try_into().unwrap();
     let mut d = orig;
     let dim = u32::from_le_bytes(d[0..4].try_into().unwrap());
-    let init_state = crate::xone_barrier::initial_state(dim, init_state);
+    let title_state = crate::xone_barrier::initial_state(dim, init_state);
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
     d[8..16].copy_from_slice(&0u64.to_le_bytes()); // Alignment: let the host choose
     d[0x2c..0x30].copy_from_slice(&(if dim == 1 { 1u32 } else { 0u32 }).to_le_bytes()); // Layout: ROW_MAJOR for buffers, UNKNOWN for textures (Xbox tile modes have no PC meaning)
     d[0x30..0x34].copy_from_slice(&(flags & 0xFF).to_le_bytes());
+    let depth_uav = match crate::depth_uav::resource_plan(&d) {
+        paired @ crate::depth_uav::Plan::Pair(_) => {
+            d = crate::depth_uav::depth_desc(&d);
+            paired
+        }
+        _ => crate::depth_uav::Plan::None,
+    };
+    let init_state = depth_uav.host_depth_state(title_state);
     let heap: [u32; 5] = [1 /* DEFAULT */, 0, 0, 1, 1];
     let f: unsafe extern "system" fn(*mut c_void, *const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(27)) };
@@ -2134,6 +2163,11 @@ unsafe extern "system" fn create_placed_resource_x(
     if hr >= 0 {
         // One reference for the placement registry (released by upload.rs).
         let res = unsafe { *ppv };
+        if depth_uav != crate::depth_uav::Plan::None {
+            if let Err(hr) = unsafe { finish_depth_uav_resource(real, ppv, &d, &heap, title_state, &depth_uav) } {
+                return hr;
+            }
+        }
         crate::map_x::ensure_patched(res);
         let addref: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(*real_vtbl(res).add(1)) };
         unsafe { addref(res) };

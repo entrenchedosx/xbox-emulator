@@ -554,10 +554,7 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
         let k = stage_rtfmt(ty, (n, f));
         let k = if ty == SUB_PS { crate::centroid_bind::tag_rtfmt(root, k) } else { k };
         if root != 0 && crate::shader_xlat::needs_external_root_data(b) {
-            let data = root_data.get_or_init(|| {
-                crate::console_slots_mesh::root_data(root as *mut c_void).map(Arc::<[u8]>::from)
-                    .or_else(|| crate::pso_lib::root_info(root as usize).map(|(_, blob, _)| blob))
-            });
+            let data = root_data.get_or_init(|| crate::shader_xlat::pipeline_root_data(root as *mut c_void));
             if let Some(data) = data {
                 return crate::shader_xlat::translate_with_root(b, data, k, &link).map_err(|e| e.to_string());
             }
@@ -584,6 +581,7 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
     let hr = f(dev2, &d, riid, ppv);
     if hr < 0 {
         record("d3d12_xs", "CreatePipelineState", &format!("PC driver rejected stream hr={hr:#010x} subs=[{}]", stream_summary(&out)));
+        probe_rejected_stream(dev2, f, &out, riid);
     }
     if hr >= 0 && !(*ppv).is_null() && parse(stream).is_ok_and(|s| s.iter().any(|(t, o)| *t == SUB_AS && bytecode(stream, *o).0 != 0)) {
         crate::console_slots_mesh::note_as_pso(*ppv as usize);
@@ -595,6 +593,95 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
     rel(dev2);
     drop(keep);
     hr
+}
+
+/// The host driver names no reason for E_INVALIDARG without the SDK debug layer, which is not installed
+/// here. For the first few rejected streams, say which subobject the rejection depends on: create the
+/// pipeline again with each subobject left out in turn and log the ones whose removal changes the result.
+/// (A pipeline that is created by this probe is released at once; nothing the title sees changes.)
+unsafe fn probe_rejected_stream(
+    dev2: *mut c_void,
+    create: unsafe extern "system" fn(*mut c_void, *const [u64; 2], *const c_void, *mut *mut c_void) -> i32,
+    out: &[u8],
+    riid: *const c_void,
+) {
+    static PROBES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if PROBES.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 3 {
+        return;
+    }
+    let Ok(subs) = parse(out) else { return };
+    if let Ok(dir) = std::env::var("TOMBOX_PSO_PROBE_DUMP") {
+        // keep the shaders the host refused, for offline disassembly/validation
+        let n = PROBES.load(core::sync::atomic::Ordering::Relaxed);
+        for &(ty, inner) in &subs {
+            if matches!(ty, SUB_VS | SUB_PS) {
+                let (p, len) = bytecode(out, inner);
+                if p != 0 && len != 0 {
+                    let bytes = core::slice::from_raw_parts(p as *const u8, len as usize);
+                    let _ = std::fs::write(format!("{dir}\\rejected{n}_{}.dxil", if ty == SUB_VS { "vs" } else { "ps" }), bytes);
+                }
+            }
+        }
+    }
+    if let Some(&(_, o)) = subs.iter().find(|(t, _)| *t == SUB_ROOT_SIGNATURE) {
+        let rs = u64::from_le_bytes(out[o..o + 8].try_into().unwrap()) as usize;
+        match crate::pso_lib::root_info(rs) {
+            Some((mask, blob, via_real)) => {
+                let parsed = tombox_xshader::parse_root_signature(&blob);
+                record("d3d12_xs", "CreatePipelineState", &format!("rejection probe: root signature {rs:#x} mask={mask:#x} via_real={via_real} console blob {} bytes: {parsed:?}", blob.len()));
+            }
+            None => record("d3d12_xs", "CreatePipelineState", &format!("rejection probe: root signature {rs:#x} is not in the console registry")),
+        }
+    }
+    let mut verdicts = Vec::new();
+    for &(ty, inner) in &subs {
+        let Some((a, n)) = inner_layout(ty) else { continue };
+        let start = inner - align(4, a);
+        let end = align(inner + n, 8).min(out.len());
+        let mut v = Vec::with_capacity(out.len());
+        v.extend_from_slice(&out[..start]);
+        v.extend_from_slice(&out[end..]);
+        let d = [v.len() as u64, v.as_ptr() as u64];
+        let mut pso: *mut c_void = core::ptr::null_mut();
+        let hr = create(dev2, &d, riid, &mut pso);
+        if hr >= 0 && !pso.is_null() {
+            let vt = *(pso as *const *const usize);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*vt.add(2));
+            rel(pso);
+        }
+        verdicts.push(format!("without {ty}: {hr:#010x}"));
+    }
+    // Combined variants: which of the two shaders (with the root signature) does the host accept on its own?
+    let variant = |remove: &[u32], zero_rtv: bool| -> i32 {
+        let mut v = Vec::with_capacity(out.len());
+        for &(ty, inner) in &subs {
+            let Some((a, n)) = inner_layout(ty) else { continue };
+            let start = inner - align(4, a);
+            let end = align(inner + n, 8).min(out.len());
+            if remove.contains(&ty) {
+                continue;
+            }
+            let at = v.len();
+            v.extend_from_slice(&out[start..end]);
+            if zero_rtv && ty == 15 {
+                let o = at + (inner - start);
+                v[o..o + 36].fill(0);
+            }
+        }
+        let d = [v.len() as u64, v.as_ptr() as u64];
+        let mut pso: *mut c_void = core::ptr::null_mut();
+        let hr = create(dev2, &d, riid, &mut pso);
+        if hr >= 0 && !pso.is_null() {
+            let vt = *(pso as *const *const usize);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*vt.add(2));
+            rel(pso);
+        }
+        hr
+    };
+    verdicts.push(format!("VS only (no PS, no render targets): {:#010x}", variant(&[2], true)));
+    verdicts.push(format!("VS only, no input layout: {:#010x}", variant(&[2, 12], true)));
+    verdicts.push(format!("VS only, no input layout, no root signature: {:#010x}", variant(&[2, 12, 0], true)));
+    record("d3d12_xs", "CreatePipelineState", &format!("rejection probe (one subobject left out at a time): {}", verdicts.join("; ")));
 }
 
 pub fn dispatch_mesh_args_ok(_x: u32, y: u32, z: u32) -> bool {

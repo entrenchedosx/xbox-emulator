@@ -25,16 +25,14 @@ use compat_common::record;
 use crate::device_wrap::{Guid, IID_XBOX_GRAPHICS_COMMAND_LIST};
 const E_POINTER: i32 = 0x8000_4003u32 as i32;
 const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
+const E_NOTIMPL: i32 = 0x8000_4001u32 as i32;
 
 extern "system" {
     fn VirtualProtect(addr: *mut c_void, size: usize, new_protect: u32, old_protect: *mut u32) -> i32;
 }
 const PAGE_READWRITE: u32 = 0x04;
 
-/// Number of Xbox vtable slots we materialize. The highest slot seen from a retail
-/// title so far is 132 (a command-list call in GTA VI at EXE+0x2478b9e); 160 leaves
-/// headroom, and every slot past the mapped range gets a logging probe so an
-/// out-of-range call can never read past the table and jump to zero.
+/// Number of Xbox vtable slots we materialize, including Scarlett extensions.
 const N: usize = 160;
 static XBOX_VT: [AtomicUsize; N] = [const { AtomicUsize::new(0) }; N];
 static BUILT: AtomicBool = AtomicBool::new(false);
@@ -45,6 +43,7 @@ pub(crate) unsafe fn real_list_slot(slot: usize) -> usize {
 }
 static INSERTED_HITS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) const CONSOLE_NULL_SLOT: usize = 66;
+pub(crate) const SCARLETT_RESET_SLOT: usize = 139;
 
 pub(crate) unsafe fn real_slot_ptr(slot: usize) -> *mut usize {
     let p = unsafe { REAL_VT_PTR };
@@ -75,6 +74,34 @@ pub(crate) fn vt_get(i: usize) -> usize {
 
 pub(crate) fn vt_set(i: usize, f: usize) {
     XBOX_VT[i].store(f, Ordering::Relaxed);
+}
+
+pub(crate) fn install_scarlett_reset() {
+    vt_set(SCARLETT_RESET_SLOT, scarlett_reset as usize);
+}
+
+unsafe extern "system" fn scarlett_reset(
+    list: *mut c_void,
+    allocator: *mut c_void,
+    option0: u64,
+    option1: u64,
+) -> i32 {
+    // The Scarlett pool calls this slot with the frame allocator and both options zero.
+    if option0 != 0 || option1 != 0 {
+        return E_NOTIMPL;
+    }
+
+    // Use the Xbox Reset slot so the recording hooks reset their state too.
+    let reset: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(vt_get(10)) };
+    let hr = unsafe { reset(list, allocator, core::ptr::null_mut()) };
+    static OK: AtomicUsize = AtomicUsize::new(0);
+    static FAILED: AtomicUsize = AtomicUsize::new(0);
+    let calls = if hr >= 0 { &OK } else { &FAILED };
+    if calls.fetch_add(1, Ordering::Relaxed) < 8 {
+        record("d3d12_xs", "cmdlist.scarlett_reset", &format!("list={list:p} hr={hr:#010x}"));
+    }
+    hr
 }
 
 pub(crate) fn map_slot(i: usize) -> Option<usize> {
@@ -462,6 +489,7 @@ pub fn apply(real_list: *mut c_void) {
             crate::gpuprof::install_ops(&XBOX_VT);
             if crate::shader_xlat::title_name_pub().eq_ignore_ascii_case("game_scarlett_master") {
                 crate::cl_ext::install_scarlett_memory_ops(&XBOX_VT);
+                install_scarlett_reset();
             }
             XBOX_VT[0].store(shim_qi as usize, Ordering::Relaxed);
             XBOX_VT[CONSOLE_NULL_SLOT].store(0, Ordering::Relaxed);

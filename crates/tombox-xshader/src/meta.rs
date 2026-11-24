@@ -272,19 +272,18 @@ pub fn parse_rts0(body: &[u8]) -> Result<RootSig, String> {
             0 => {
                 let nranges = u32_at(body, off)? as usize;
                 let roff = u32_at(body, off + 4)? as usize;
-                if nranges > 64 {
-                    return Err(format!("implausible range count {nranges}"));
-                }
                 let stride = if v11 { 24 } else { 20 };
+                let table = nranges.checked_mul(stride)
+                    .and_then(|len| body.get(roff..).unwrap_or_default().get(..len))
+                    .ok_or_else(|| format!("RTS0 descriptor table at {roff:#x} with {nranges} ranges exceeds its {}-byte body", body.len()))?;
                 let mut ranges = Vec::with_capacity(nranges);
-                for r in 0..nranges {
-                    let q = roff + r * stride;
+                for range in table.chunks_exact(stride) {
                     ranges.push(RootRange {
-                        range_type: u32_at(body, q)?,
-                        num: u32_at(body, q + 4)?,
-                        base_register: u32_at(body, q + 8)?,
-                        space: u32_at(body, q + 12)?,
-                        offset_in_table: u32_at(body, q + if v11 { 20 } else { 16 })?,
+                        range_type: u32_at(range, 0)?,
+                        num: u32_at(range, 4)?,
+                        base_register: u32_at(range, 8)?,
+                        space: u32_at(range, 12)?,
+                        offset_in_table: u32_at(range, stride - 4)?,
                     });
                 }
                 RootParamKind::Table(ranges)
@@ -335,6 +334,30 @@ pub fn parse_rts0(body: &[u8]) -> Result<RootSig, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_signature_parses_large_descriptor_tables_within_the_blob() {
+        let count = 261u32;
+        let mut body = Vec::new();
+        // Version 1.1, one table parameter at 24, table header at 36, ranges at 44.
+        for word in [2, 1, 24, 0, 0, 0, 0, 0, 36, count, 44] {
+            body.extend(word.to_le_bytes());
+        }
+        for register in 0..count {
+            for word in [0, 1, register, 0, 0, register] {
+                body.extend(word.to_le_bytes());
+            }
+        }
+
+        let root = parse_rts0(&body).expect("parse the complete descriptor table");
+        let RootParamKind::Table(ranges) = &root.params[0].kind else {
+            panic!("expected a descriptor table");
+        };
+        assert_eq!(ranges.len(), count as usize);
+        let last = ranges.last().unwrap();
+        assert_eq!((last.base_register, last.offset_in_table), (count - 1, count - 1));
+        assert!(parse_rts0(&body[..body.len() - 1]).is_err());
+    }
 
     #[test]
     fn parses_both_24byte_isgn_and_32byte_isg1_signatures() {

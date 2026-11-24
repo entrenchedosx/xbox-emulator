@@ -195,11 +195,15 @@ unsafe fn buffer(dev: usize, heap: u32, size: u64, flags: u32, state: u32) -> Bu
 }
 
 unsafe fn raw_list(dev: usize) -> *mut c_void {
+    unsafe { raw_list_with_allocator(dev).0 }
+}
+
+unsafe fn raw_list_with_allocator(dev: usize) -> (*mut c_void, *mut c_void) {
     let mut a: *mut c_void = core::ptr::null_mut();
     assert!(call!(dev, 9, (u32, *const Guid, *mut *mut c_void) -> i32, 0, &IID_ALLOCATOR, &mut a) >= 0);
     let mut l: *mut c_void = core::ptr::null_mut();
     assert!(call!(dev, 12, (u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32, 0, 0, a, core::ptr::null_mut(), &IID_LIST, &mut l) >= 0);
-    l
+    (l, a)
 }
 
 unsafe fn title_list(dev: usize) -> *mut c_void {
@@ -235,6 +239,42 @@ unsafe fn rd(b: &Buf, off: usize) -> u32 {
     unsafe { core::ptr::read_volatile(b.cpu.add(off) as *const u32) }
 }
 
+#[test]
+#[ignore = "requires D3D12 hardware or WARP"]
+fn scarlett_reset_reopens_command_list_for_recording() {
+    let g = gpu();
+    unsafe {
+        let (raw, allocator) = raw_list_with_allocator(g.dev);
+        let list = crate::cmdlist_wrap::wrap(raw);
+        crate::cmdlist_wrap::install_scarlett_reset();
+        let reset = crate::cmdlist_wrap::SCARLETT_RESET_SLOT;
+        let upload = buffer(g.dev, HEAP_UPLOAD, 256, 0, ST_GENERIC_READ);
+        let readback = buffer(g.dev, HEAP_READBACK, 256, 0, ST_COPY_DEST);
+        let f = fence(g.dev);
+        assert_eq!(call!(list, X_CLOSE, () -> i32), 0);
+
+        for (index, value) in [0x3141_5926u32, 0x5358_9793].into_iter().enumerate() {
+            let offset = index * size_of::<u32>();
+            let signal = index as u64 + 1;
+            core::ptr::write(upload.cpu.add(offset).cast::<u32>(), value);
+            assert_eq!(call!(allocator, 8, () -> i32), 0);
+            assert_eq!(call!(list, reset, (*mut c_void, u64, u64) -> i32, allocator, 0, 0), 0);
+            call!(list, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (),
+                readback.res, offset as u64, upload.res, offset as u64, size_of::<u32>() as u64);
+            assert_eq!(call!(list, X_CLOSE, () -> i32), 0);
+            submit(g.a, list, f, signal);
+            assert!(reached(f, signal, Duration::from_secs(5)));
+            assert_eq!(rd(&readback, offset), value);
+        }
+
+        call!(list, 2, () -> u32);
+        call!(allocator, 2, () -> u32);
+        call!(f, 2, () -> u32);
+        call!(upload.res, 2, () -> u32);
+        call!(readback.res, 2, () -> u32);
+    }
+}
+
 unsafe fn compute_pso(dev: usize, hlsl: &str, rs: Option<*mut c_void>) -> (*mut c_void, *mut c_void) {
     let code = tombox_xshader::dxc::compile(hlsl, "cs_6_0").expect("dxc");
     let rs = rs.unwrap_or_else(|| {
@@ -258,21 +298,72 @@ fn chain_len(shim: *mut c_void) -> usize {
 
 #[test]
 #[ignore = "requires a D3D12 device or WARP"]
+fn root_buffer_descriptors_translate_title_aliases() {
+    let g = gpu();
+    unsafe {
+        let (rs, pso) = compute_pso(g.dev, r#"
+            ByteAddressBuffer src : register(t0);
+            RWByteAddressBuffer dst : register(u0);
+            [RootSignature("SRV(t0), UAV(u0)")]
+            [numthreads(1, 1, 1)]
+            void main() { dst.Store(0, src.Load(0)); }
+        "#, None);
+        let src = buffer(g.dev, HEAP_UPLOAD, 256, 0, ST_GENERIC_READ);
+        let dst = buffer(g.dev, HEAP_DEFAULT, 256, FLAG_UAV, ST_UAV);
+        let readback = buffer(g.dev, HEAP_READBACK, 256, 0, ST_COPY_DEST);
+        let mut desc = [0u8; 56];
+        desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+        desc[0x10..0x18].copy_from_slice(&256u64.to_le_bytes());
+        let src_alias = 0x072c_1000_0000;
+        let dst_alias = 0x072c_2000_0000;
+        let device = g.dev as *mut c_void;
+        crate::gpu_va::note_resource(device, src.res as *mut c_void, &desc, ST_GENERIC_READ, Some(src_alias));
+        crate::gpu_va::note_resource(device, dst.res as *mut c_void, &desc, ST_UAV, Some(dst_alias));
+        let value = 0x1abc_092du32;
+        core::ptr::write(src.cpu.add(128).cast::<u32>(), value);
+
+        let list = title_list(g.dev);
+        call!(list, X_SET_COMPUTE_ROOT_SIGNATURE, (*mut c_void) -> (), rs);
+        call!(list, X_SET_PSO, (*mut c_void) -> (), pso);
+        call!(list, 43, (u32, u64) -> (), 0, src_alias + 128);
+        call!(list, 45, (u32, u64) -> (), 1, dst_alias + 32);
+        call!(list, X_DISPATCH, (u32, u32, u32) -> (), 1, 1, 1);
+        raw_barrier(list, dst.res, ST_UAV, ST_COPY_SOURCE);
+        call!(list, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), readback.res, 0, dst.res, 32, 4);
+        assert_eq!(call!(list, X_CLOSE, () -> i32), 0);
+        let done = fence(g.dev);
+        submit(g.a, list, done, 1);
+        assert!(reached(done, 1, Duration::from_secs(5)));
+        assert_eq!(rd(&readback, 0), value);
+
+        call!(list, 2, () -> u32);
+        call!(rs, 2, () -> u32);
+        call!(pso, 2, () -> u32);
+        call!(done, 2, () -> u32);
+        call!(src.res, 2, () -> u32);
+        call!(dst.res, 2, () -> u32);
+        call!(readback.res, 2, () -> u32);
+    }
+}
+
+#[test]
+#[ignore = "requires a D3D12 device or WARP"]
 fn hw_scarlett_queue_submit_executes_wrapped_lists() {
     let g = gpu();
     unsafe {
         let out = buffer(g.dev, HEAP_READBACK, 256, 0, ST_COPY_DEST);
-        let lists = [title_list(g.dev), title_list(g.dev)];
+        let lists = [title_list(g.dev), title_list(g.dev), title_list(g.dev)];
         for (i, list) in lists.into_iter().enumerate() {
             call!(list, crate::cl_ext::CL_WRITE32_BOTTOM_OF_PIPE, (u64, u32, u32, u32) -> (), out.va + 4 * i as u64, (i + 1) as u32, 0, 0);
             assert!(call!(list, X_CLOSE, () -> i32) >= 0);
         }
         let queue = g.a as *mut c_void;
-        assert_eq!(crate::present::scarlett_queue_submit(queue, lists.len() as u32, lists.as_ptr(), 7, 0), 0);
+        assert_eq!(crate::present::scarlett_queue_submit(queue, 1, lists.as_ptr(), 7, 0), 0);
+        assert_eq!(crate::present::scarlett_queue_submit(queue, 2, lists.as_ptr().add(1), 7, 3), 0);
         let done = fence(g.dev);
         assert_eq!(call!(queue, 14, (*mut c_void, u64) -> i32, done, 1), 0);
         assert!(reached(done, 1, Duration::from_secs(5)));
-        assert_eq!((rd(&out, 0), rd(&out, 4)), (1, 2));
+        assert_eq!((rd(&out, 0), rd(&out, 4), rd(&out, 8)), (1, 2, 3));
     }
 }
 

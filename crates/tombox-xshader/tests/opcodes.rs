@@ -1,5 +1,5 @@
 use tombox_xshader::hlsl::translate;
-use tombox_xshader::meta::{RootParam, RootParamKind, RootRange, RootSig, SigElement};
+use tombox_xshader::meta::{PsvResource, RootParam, RootParamKind, RootRange, RootSig, SigElement, StaticSampler};
 use tombox_xshader::rdna2::{disassemble, Opnd};
 use tombox_xshader::{ShaderExtract, Stage};
 
@@ -639,6 +639,44 @@ fn image_get_lod_reads_both_lods() {
         root,
         &["tex0.CalculateLevelOfDetail(samp0, float2(asfloat(v1), asfloat(v2)))", "tex0.CalculateLevelOfDetailUnclamped(samp0,"],
     );
+}
+
+#[test]
+fn rdna_literal_sampler_uses_the_declared_static_binding() {
+    let sampler = StaticSampler {
+        filter: 0x14,
+        address_u: 3,
+        address_v: 3,
+        address_w: 3,
+        max_anisotropy: 1,
+        comparison_func: 1,
+        border_color: 0,
+        min_lod_bits: 0,
+        max_lod_bits: 12.0f32.to_bits(),
+        register: 3,
+        space: 1,
+        visibility: 0,
+    };
+    let root = RootSig {
+        version: 2,
+        flags: 0,
+        params: vec![table(0, 1)],
+        num_static_samplers: 2,
+        static_samplers: vec![StaticSampler { register: 2, ..sampler }, sampler],
+    };
+    let mut ex = shader(&program(&[
+        0xf40c_0004, 0xfa00_0000, // s_load_dwordx8 s[0:7], s8, 0
+        sopk(0, 12, 0x92),
+        sop1(3, 13, LIT), 0x00c0_0000,
+        sop1(3, 14, LIT), 0x1450_0000,
+        sop1(3, 15, 128),
+        0xf090_0f08, 0x0060_0001, // image_sample_l v[0:3], v[1:3], s[0:7], s[12:15]
+    ]), Some(root));
+    ex.has_psv0 = true;
+    ex.resources.push(PsvResource { res_type: 1, space: 1, lower: 3, upper: 3, kind: 14 });
+    let translated = translate(&ex).expect("literal sampler resolves to s3 in space1");
+    assert!(translated.hlsl.contains("register(s3, space1)"), "{}", translated.hlsl);
+    assert!(!translated.hlsl.contains("register(s2, space1)"));
 }
 
 fn flat_dword0(op: u32, seg: u32, dlc: u32, glc: u32, slc: u32, offset: i32) -> u32 {

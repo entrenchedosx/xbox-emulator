@@ -21,11 +21,19 @@ pub const D_UAV_STATE: u32 = ST_DEPTH_READ | ST_NON_PIXEL_SR;
 pub const S_READ_STATE: u32 = ST_NON_PIXEL_SR | ST_PIXEL_SR;
 pub const ALL_SUBRESOURCES: u32 = u32::MAX;
 const BARRIER_BEGIN_ONLY: u32 = 0x1;
+const ST_COMMON: u32 = 0;
+const ST_COPY_DEST: u32 = 0x400;
+const ST_COPY_SOURCE: u32 = 0x800;
 
 const FMT_R32_TYPELESS: u32 = 39;
 const FMT_R32_FLOAT: u32 = 41;
 const FMT_R32_UINT: u32 = 42;
 const FMT_R32_SINT: u32 = 43;
+const FMT_R16_TYPELESS: u32 = 53;
+const FMT_R16_FLOAT: u32 = 54;
+const FMT_D16_UNORM: u32 = 55;
+const FMT_R16_UNORM: u32 = 56;
+const FMT_R16_SINT: u32 = 59;
 
 const DEV_CREATE_GFX_PSO: usize = 10;
 const DEV_CREATE_COMPUTE_PSO: usize = 11;
@@ -42,6 +50,8 @@ const HEAP_GPU_START: usize = 10;
 
 const PC_DRAW: usize = 12;
 const PC_DISPATCH: usize = 14;
+const PC_COPY_TEXTURE_REGION: usize = 16;
+const PC_COPY_RESOURCE: usize = 17;
 const PC_TOPOLOGY: usize = 20;
 const PC_VIEWPORTS: usize = 21;
 const PC_SCISSORS: usize = 22;
@@ -62,6 +72,7 @@ const IID_RESOURCE: Guid = Guid { d1: 0x6964_42be, d2: 0xa72e, d3: 0x4059, d4: [
 const IID_ROOT_SIGNATURE: Guid = Guid { d1: 0xc54a_6b66, d2: 0x72df, d3: 0x4ee8, d4: [0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14] };
 const IID_PSO: Guid = Guid { d1: 0x765a_30f3, d2: 0xf624, d3: 0x4c6f, d4: [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45] };
 const IID_DESCRIPTOR_HEAP: Guid = Guid { d1: 0x8efb_471d, d2: 0x616c, d3: 0x4f49, d4: [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51] };
+const IID_UNKNOWN: Guid = Guid { d1: 0, d2: 0, d3: 0, d4: [0xc0, 0, 0, 0, 0, 0, 0, 0x46] };
 const KEY_SHADOW: Guid = Guid { d1: 0x5d0b_7a11, d2: 0x3e2c, d3: 0x4f6d, d4: [0x9a, 0x51, 0x0c, 0x7e, 0x22, 0xd4, 0x8b, 0x13] };
 
 pub fn d_real(title: u32) -> u32 {
@@ -79,10 +90,17 @@ pub struct Formats {
     pub planes: u32,
 }
 
+impl Formats {
+    fn uses_texture_copy(self) -> bool {
+        self.dsv == FMT_D16_UNORM
+    }
+}
+
 pub fn formats(fmt: u32) -> Option<Formats> {
     match fmt {
         19 | 20 => Some(Formats { dsv: 20, d_srv: 21, planes: 2 }),
         39 | 40 => Some(Formats { dsv: 40, d_srv: 41, planes: 1 }),
+        FMT_R16_TYPELESS | FMT_D16_UNORM => Some(Formats { dsv: FMT_D16_UNORM, d_srv: FMT_R16_UNORM, planes: 1 }),
         _ => None,
     }
 }
@@ -92,6 +110,16 @@ pub enum Plan {
     None,
     Pair(Formats),
     Refuse(String),
+}
+
+impl Plan {
+    pub fn host_depth_state(&self, state: u32) -> u32 {
+        match self {
+            Self::None => state,
+            Self::Pair(f) if f.uses_texture_copy() && state & ST_UAV != 0 => ST_COMMON,
+            _ => d_real(state),
+        }
+    }
 }
 
 fn u32_at(d: &[u8], o: usize) -> u32 {
@@ -108,55 +136,99 @@ pub fn plan(desc: &[u8]) -> Plan {
     }
     let fmt = u32_at(desc, 0x20);
     let Some(f) = formats(fmt) else {
-        return Plan::Refuse(format!("format {fmt} is not a D32_FLOAT or D32_FLOAT_S8X24_UINT family"));
+        return Plan::Refuse(format!("format {fmt} is outside the supported D16 and D32 families"));
     };
     let (dim, depth, mips, samples) = (u32_at(desc, 0), u16_at(desc, 0x1c), u16_at(desc, 0x1e), u32_at(desc, 0x24));
-    if dim != 3 || depth != 1 || mips != 1 || samples != 1 {
-        return Plan::Refuse(format!("dimension {dim}, {depth} slice(s), {mips} mip(s), {samples} sample(s): only 2D with one slice, one mip and one sample is shadowed"));
+    if dim != 3 || depth == 0 || mips != 1 || samples != 1 || (!f.uses_texture_copy() && depth != 1) {
+        return Plan::Refuse(format!("unsupported depth/UAV texture: dimension {dim}, {depth} slice(s), {mips} mip(s), {samples} sample(s)"));
     }
     Plan::Pair(f)
+}
+
+pub fn resource_plan(desc: &[u8]) -> Plan {
+    match mode() {
+        Mode::Off => Plan::None,
+        Mode::All => plan(desc),
+        Mode::D16 if desc.len() >= 0x38 && matches!(u32_at(desc, 0x20), FMT_R16_TYPELESS | FMT_D16_UNORM) => {
+            match plan(desc) {
+                paired @ Plan::Pair(_) => paired,
+                _ => Plan::None,
+            }
+        }
+        Mode::D16 => Plan::None,
+    }
 }
 
 pub fn depth_desc(desc: &[u8; 0x38]) -> [u8; 0x38] {
     let mut d = *desc;
     let flags = u32_at(&d, 0x30) & !FLAG_UAV;
     d[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+    if u32_at(&d, 0x20) == FMT_D16_UNORM {
+        d[0x20..0x24].copy_from_slice(&FMT_R16_TYPELESS.to_le_bytes());
+    }
     d
 }
 
-pub fn shadow_desc(desc: &[u8; 0x38]) -> [u8; 0x38] {
+fn shadow_desc(desc: &[u8; 0x38], f: Formats) -> [u8; 0x38] {
     let mut d = *desc;
     d[8..16].copy_from_slice(&0u64.to_le_bytes());
-    d[0x20..0x24].copy_from_slice(&FMT_R32_TYPELESS.to_le_bytes());
+    let format = if f.uses_texture_copy() { FMT_R16_TYPELESS } else { FMT_R32_TYPELESS };
+    d[0x20..0x24].copy_from_slice(&format.to_le_bytes());
     d[0x28..0x2c].copy_from_slice(&0u32.to_le_bytes());
     d[0x2c..0x30].copy_from_slice(&0u32.to_le_bytes());
     d[0x30..0x34].copy_from_slice(&FLAG_UAV.to_le_bytes());
     d
 }
 
-pub fn shadow_uav_desc(title: Option<&[u8; 0x28]>) -> Result<[u8; 0x28], String> {
+fn default_shadow_uav(f: Formats, slices: u32) -> [u8; 0x28] {
     let mut d = [0u8; 0x28];
-    d[0..4].copy_from_slice(&FMT_R32_FLOAT.to_le_bytes());
-    d[4..8].copy_from_slice(&4u32.to_le_bytes());
-    let Some(t) = title else { return Ok(d) };
+    let format = if f.uses_texture_copy() { FMT_R16_UNORM } else { FMT_R32_FLOAT };
+    d[0..4].copy_from_slice(&format.to_le_bytes());
+    if slices == 1 {
+        d[4..8].copy_from_slice(&4u32.to_le_bytes()); // TEXTURE2D
+    } else {
+        d[4..8].copy_from_slice(&5u32.to_le_bytes()); // TEXTURE2DARRAY
+        d[16..20].copy_from_slice(&slices.to_le_bytes());
+    }
+    d
+}
+
+fn shadow_uav_desc(f: Formats, slices: u32, title: Option<&[u8; 0x28]>) -> Result<[u8; 0x28], String> {
+    let Some(t) = title else { return Ok(default_shadow_uav(f, slices)) };
     let fmt = u32_at(t, 0);
     let dim = u32_at(t, 4);
-    if dim != 4 && dim != 5 {
-        return Err(format!("UAV view dimension {dim} on a shadowed depth texture (only TEXTURE2D / TEXTURE2DARRAY)"));
+    if (dim != 4 && dim != 5) || (dim == 4 && slices != 1) {
+        return Err(format!("UAV view dimension {dim} on a shadowed depth texture with {slices} slice(s)"));
     }
     if u32_at(t, 8) != 0 {
         return Err(format!("UAV view of mip {} on a one-mip shadowed depth texture", u32_at(t, 8)));
     }
-    d.copy_from_slice(t);
-    let view_fmt = match fmt {
-        FMT_R32_FLOAT | FMT_R32_UINT | FMT_R32_SINT => fmt,
-        0 | 19 | 20 | 21 | 39 | 40 => FMT_R32_FLOAT,
-        other => return Err(format!("UAV view format {other} on a 32-bit depth texture")),
+    let mut d = *t;
+    let view_fmt = if f.uses_texture_copy() {
+        match fmt {
+            FMT_R16_FLOAT | FMT_R16_UNORM..=FMT_R16_SINT => fmt,
+            0 | FMT_R16_TYPELESS | FMT_D16_UNORM => FMT_R16_UNORM,
+            _ => return Err(format!("UAV view format {fmt} on a 16-bit depth texture")),
+        }
+    } else {
+        match fmt {
+            FMT_R32_FLOAT | FMT_R32_UINT | FMT_R32_SINT => fmt,
+            0 | 19 | 20 | 21 | 39 | 40 => FMT_R32_FLOAT,
+            _ => return Err(format!("UAV view format {fmt} on a 32-bit depth texture")),
+        }
     };
     d[0..4].copy_from_slice(&view_fmt.to_le_bytes());
     if dim == 4 {
         d[12..16].copy_from_slice(&0u32.to_le_bytes());
     } else {
+        let first = u32_at(t, 12);
+        let count = u32_at(t, 16);
+        let available = slices.saturating_sub(first);
+        let count = if count == u32::MAX { available } else { count };
+        if count == 0 || count > available {
+            return Err(format!("UAV slices {first}+{count} exceed the depth texture's {slices} slices"));
+        }
+        d[16..20].copy_from_slice(&count.to_le_bytes());
         d[20..24].copy_from_slice(&0u32.to_le_bytes());
     }
     Ok(d)
@@ -168,6 +240,7 @@ struct Pair {
     slot: u32,
     width: u32,
     height: u32,
+    slices: u32,
     f: Formats,
 }
 
@@ -177,7 +250,7 @@ static NEXT_SLOT: AtomicU32 = AtomicU32::new(0);
 static LIVE_PAIRS: AtomicUsize = AtomicUsize::new(0);
 
 fn pair_of(res: usize) -> Option<Pair> {
-    if res == 0 {
+    if res == 0 || LIVE_PAIRS.load(Ordering::Acquire) == 0 {
         return None;
     }
     PAIRS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&res).copied())
@@ -216,6 +289,56 @@ unsafe fn release(o: *mut c_void) {
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(vslot(o, 2)) };
         unsafe { f(o) };
     }
+}
+
+#[repr(C)]
+struct ShadowOwner {
+    vtable: &'static ShadowOwnerVtable,
+    refs: AtomicU32,
+    depth: usize,
+    shadow: *mut c_void,
+}
+
+#[repr(C)]
+struct ShadowOwnerVtable {
+    query: unsafe extern "system" fn(*mut ShadowOwner, *const Guid, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut ShadowOwner) -> u32,
+    release: unsafe extern "system" fn(*mut ShadowOwner) -> u32,
+}
+
+static SHADOW_OWNER_VTABLE: ShadowOwnerVtable = ShadowOwnerVtable {
+    query: shadow_owner_query,
+    add_ref: shadow_owner_add_ref,
+    release: shadow_owner_release,
+};
+
+unsafe extern "system" fn shadow_owner_query(this: *mut ShadowOwner, iid: *const Guid, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return 0x8000_4003u32 as i32; // E_POINTER
+    }
+    if iid.is_null() || unsafe { *iid } != IID_UNKNOWN {
+        unsafe { *out = core::ptr::null_mut() };
+        return 0x8000_4002u32 as i32; // E_NOINTERFACE
+    }
+    unsafe {
+        *out = this.cast();
+        shadow_owner_add_ref(this);
+    }
+    0
+}
+
+unsafe extern "system" fn shadow_owner_add_ref(this: *mut ShadowOwner) -> u32 {
+    unsafe { (*this).refs.fetch_add(1, Ordering::Relaxed) + 1 }
+}
+
+unsafe extern "system" fn shadow_owner_release(this: *mut ShadowOwner) -> u32 {
+    let refs = unsafe { (*this).refs.fetch_sub(1, Ordering::AcqRel) } - 1;
+    if refs == 0 {
+        let owner = unsafe { Box::from_raw(this) };
+        forget(owner.depth);
+        unsafe { release(owner.shadow) };
+    }
+    refs
 }
 
 unsafe fn pc(list: *mut c_void, slot: usize) -> usize {
@@ -415,45 +538,64 @@ fn uav_desc(fmt: u32) -> [u8; 40] {
     d
 }
 
-pub unsafe fn register(dev: *mut c_void, d: *mut c_void, desc: &[u8; 0x38], heap: &[u32; 5], title_state: u32, f: Formats) -> Result<(), String> {
-    let p = pass(dev)?;
-    let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
-    if slot >= MAX_PAIRS {
-        return Err(format!("more than {MAX_PAIRS} depth/UAV textures"));
-    }
-    let sd = shadow_desc(desc);
+unsafe fn register(dev: *mut c_void, d: *mut c_void, desc: &[u8; 0x38], heap: &[u32; 5], title_state: u32, f: Formats) -> Result<(), String> {
+    let (pass, slot) = if f.uses_texture_copy() {
+        (None, 0)
+    } else {
+        let pass = pass(dev)?;
+        let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+        if slot >= MAX_PAIRS {
+            return Err(format!("more than {MAX_PAIRS} depth/UAV textures"));
+        }
+        (Some(pass), slot)
+    };
+    let sd = shadow_desc(desc, f);
+    let shadow_state = if f.uses_texture_copy() && title_state & ST_UAV == 0 {
+        ST_COMMON
+    } else {
+        s_real(title_state)
+    };
     let mk: unsafe extern "system" fn(*mut c_void, *const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(vslot(dev, DEV_CREATE_COMMITTED)) };
     let mut s: *mut c_void = core::ptr::null_mut();
-    let hr = unsafe { mk(dev, heap.as_ptr(), 0, sd.as_ptr(), s_real(title_state), core::ptr::null(), &IID_RESOURCE, &mut s) };
+    let hr = unsafe { mk(dev, heap.as_ptr(), 0, sd.as_ptr(), shadow_state, core::ptr::null(), &IID_RESOURCE, &mut s) };
     if hr < 0 || s.is_null() {
         return Err(format!("shadow CreateCommittedResource hr={hr:#010x}"));
     }
+    let owner = Box::into_raw(Box::new(ShadowOwner {
+        vtable: &SHADOW_OWNER_VTABLE,
+        refs: AtomicU32::new(1),
+        depth: d as usize,
+        shadow: s,
+    }));
     let set: unsafe extern "system" fn(*mut c_void, *const Guid, *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(d, OBJ_SET_PRIVATE_IFACE)) };
-    let hr = unsafe { set(d, &KEY_SHADOW, s) };
-    unsafe { release(s) };
+    let hr = unsafe { set(d, &KEY_SHADOW, owner.cast()) };
+    unsafe { shadow_owner_release(owner) };
     if hr < 0 {
         return Err(format!("SetPrivateDataInterface hr={hr:#010x}"));
     }
-    let srv: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, u64) = unsafe { core::mem::transmute(vslot(dev, DEV_CREATE_SRV)) };
-    let uav: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const u8, u64) = unsafe { core::mem::transmute(vslot(dev, DEV_CREATE_UAV)) };
-    let dsv: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, u64) = unsafe { core::mem::transmute(vslot(dev, DEV_CREATE_DSV)) };
-    let at = |k: u64| p.cpu + (slot as u64 * 4 + k) * p.inc;
-    unsafe {
-        srv(dev, d, srv_desc(f.d_srv).as_ptr(), at(0));
-        uav(dev, s, core::ptr::null_mut(), uav_desc(FMT_R32_UINT).as_ptr(), at(1));
-        srv(dev, s, srv_desc(FMT_R32_UINT).as_ptr(), at(2));
-        uav(dev, s, core::ptr::null_mut(), uav_desc(FMT_R32_UINT).as_ptr(), at(3));
-        let mut dd = [0u8; 24];
-        dd[0..4].copy_from_slice(&f.dsv.to_le_bytes());
-        dd[4..8].copy_from_slice(&3u32.to_le_bytes());
-        dsv(dev, d, dd.as_ptr(), p.dsv_cpu + slot as u64 * p.dsv_inc);
+    if let Some(p) = pass {
+        let srv: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, u64) = unsafe { core::mem::transmute(vslot(dev, DEV_CREATE_SRV)) };
+        let uav: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const u8, u64) = unsafe { core::mem::transmute(vslot(dev, DEV_CREATE_UAV)) };
+        let dsv: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, u64) = unsafe { core::mem::transmute(vslot(dev, DEV_CREATE_DSV)) };
+        let at = |k: u64| p.cpu + (slot as u64 * 4 + k) * p.inc;
+        unsafe {
+            srv(dev, d, srv_desc(f.d_srv).as_ptr(), at(0));
+            uav(dev, s, core::ptr::null_mut(), uav_desc(FMT_R32_UINT).as_ptr(), at(1));
+            srv(dev, s, srv_desc(FMT_R32_UINT).as_ptr(), at(2));
+            uav(dev, s, core::ptr::null_mut(), uav_desc(FMT_R32_UINT).as_ptr(), at(3));
+            let mut dd = [0u8; 24];
+            dd[0..4].copy_from_slice(&f.dsv.to_le_bytes());
+            dd[4..8].copy_from_slice(&3u32.to_le_bytes());
+            dsv(dev, d, dd.as_ptr(), p.dsv_cpu + slot as u64 * p.dsv_inc);
+        }
     }
     let pair = Pair {
         shadow: s as usize,
         slot,
         width: u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap()) as u32,
         height: u32_at(desc, 0x18),
+        slices: u32::from(u16_at(desc, 0x1c)),
         f,
     };
     {
@@ -464,7 +606,27 @@ pub unsafe fn register(dev: *mut c_void, d: *mut c_void, desc: &[u8; 0x38], heap
     }
     static N: AtomicUsize = AtomicUsize::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 8 {
-        record(M, TAG, &format!("depth texture {:#x} {}x{} fmt {} has UAV access on the console: PC depth texture without UAV + R32 UAV shadow {s:p}", d as usize, pair.width, pair.height, u32_at(desc, 0x20)));
+        let shadow_fmt = u32_at(&sd, 0x20);
+        record(M, TAG, &format!("depth/UAV pair {d:p} + {s:p}: {}x{}x{} depth format {}, shadow format {shadow_fmt}", pair.width, pair.height, pair.slices, f.dsv));
+    }
+    Ok(())
+}
+
+pub unsafe fn register_resource(dev: *mut c_void, res: *mut c_void, desc: &[u8; 0x38], heap: &[u32; 5], title_state: u32, plan: &Plan) -> Result<(), String> {
+    if mode() == Mode::All {
+        forget(res as usize);
+    }
+    match plan {
+        Plan::Pair(f) => {
+            if let Err(e) = unsafe { register(dev, res, desc, heap, title_state, *f) } {
+                if f.uses_texture_copy() {
+                    return Err(e);
+                }
+                refuse(res as usize, &e);
+            }
+        }
+        Plan::Refuse(why) => refuse(res as usize, why),
+        Plan::None => {}
     }
     Ok(())
 }
@@ -474,47 +636,60 @@ static PREV_UAV: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn create_uav(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const u8, dest: u64) {
     let prev: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const u8, u64) = unsafe { core::mem::transmute(PREV_UAV.load(Ordering::Relaxed)) };
+    unsafe { with_shadow_uav(res, counter, desc, |res, counter, desc| prev(this, res, counter, desc, dest)) };
+}
+
+pub unsafe fn with_shadow_uav(
+    res: *mut c_void,
+    counter: *mut c_void,
+    desc: *const u8,
+    emit: impl FnOnce(*mut c_void, *mut c_void, *const u8),
+) {
     static N: AtomicUsize = AtomicUsize::new(0);
     if let Some(p) = pair_of(res as usize) {
         let title = if desc.is_null() { None } else { Some(unsafe { core::ptr::read_unaligned(desc as *const [u8; 0x28]) }) };
-        match shadow_uav_desc(title.as_ref()) {
-            Ok(d) => return unsafe { prev(this, p.shadow as *mut c_void, counter, d.as_ptr(), dest) },
+        match shadow_uav_desc(p.f, p.slices, title.as_ref()) {
+            Ok(d) => emit(p.shadow as *mut c_void, core::ptr::null_mut(), d.as_ptr()),
             Err(e) => {
                 if N.fetch_add(1, Ordering::Relaxed) < 8 {
                     record(M, TAG, &format!("CreateUnorderedAccessView on depth texture {res:p}: {e}; null view written"));
                 }
-                return unsafe { null_uav(this, prev, dest) };
+                let d = default_shadow_uav(p.f, p.slices);
+                emit(core::ptr::null_mut(), core::ptr::null_mut(), d.as_ptr());
             }
         }
-    }
-    if is_refused(res as usize) {
+    } else if mode() == Mode::All && is_refused(res as usize) {
         if N.fetch_add(1, Ordering::Relaxed) < 8 {
             record(M, TAG, &format!("CreateUnorderedAccessView on depth texture {res:p} without a shadow: refused, null view written"));
         }
-        return unsafe { null_uav(this, prev, dest) };
+        let d = uav_desc(FMT_R32_FLOAT);
+        emit(core::ptr::null_mut(), core::ptr::null_mut(), d.as_ptr());
+    } else {
+        emit(res, counter, desc);
     }
-    unsafe { prev(this, res, counter, desc, dest) }
 }
 
-unsafe fn null_uav(this: *mut c_void, prev: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const u8, u64), dest: u64) {
-    let d = uav_desc(FMT_R32_FLOAT);
-    unsafe { prev(this, core::ptr::null_mut(), core::ptr::null_mut(), d.as_ptr(), dest) };
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Off,
+    D16,
+    All,
 }
 
-pub fn enabled() -> bool {
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| {
+fn mode() -> Mode {
+    static MODE: OnceLock<Mode> = OnceLock::new();
+    *MODE.get_or_init(|| {
         let raw = std::env::var("TOMBOX_DEPTH_UAV").ok().or_else(|| compat_common::cfg("depth_uav"));
-        let on = matches!(raw.as_deref().map(str::trim), Some("1") | Some("on"));
-        if on {
-            record(M, TAG, "depth_uav=on: depth textures that also allow UAV access get an R32 shadow texture");
+        match raw.as_deref().map(str::trim) {
+            Some("0" | "off") => Mode::Off,
+            Some("1" | "on") => Mode::All,
+            _ => Mode::D16,
         }
-        on
     })
 }
 
 pub fn hook_device(v: &mut [usize]) {
-    if !enabled() || v.len() <= DEV_CREATE_UAV || v[DEV_CREATE_UAV] == create_uav as usize {
+    if mode() == Mode::Off || v.len() <= DEV_CREATE_UAV || v[DEV_CREATE_UAV] == create_uav as usize {
         return;
     }
     PREV_UAV.store(v[DEV_CREATE_UAV], Ordering::Relaxed);
@@ -537,7 +712,7 @@ unsafe extern "system" fn clear_uav_float(this: *mut c_void, gpu: u64, cpu: u64,
 }
 
 pub fn install_cmdlist(vt: &[AtomicUsize]) {
-    if !enabled() || vt.len() <= XBOX_CLEAR_UAV_FLOAT {
+    if mode() == Mode::Off || vt.len() <= XBOX_CLEAR_UAV_FLOAT {
         return;
     }
     for (i, (slot, f)) in [(XBOX_CLEAR_UAV_UINT, clear_uav_uint as usize), (XBOX_CLEAR_UAV_FLOAT, clear_uav_float as usize)].into_iter().enumerate() {
@@ -571,9 +746,10 @@ pub enum Step {
     Barrier([u8; 32]),
     CopyIn(usize),
     CopyOut(usize),
+    CopyTexture { dst: usize, src: usize, subresource: u32 },
 }
 
-pub fn plan_barriers(src: &[u8], shadow_of: &dyn Fn(usize) -> Option<(usize, u32)>, note: &mut dyn FnMut(String)) -> Option<Vec<Step>> {
+fn plan_barriers(src: &[u8], shadow_of: &dyn Fn(usize) -> Option<(usize, Formats)>, note: &mut dyn FnMut(String)) -> Option<Vec<Step>> {
     let ptr = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap()) as usize;
     let touches = src.chunks_exact(32).any(|b| matches!(u32_at(b, 0), 0 | 2) && shadow_of(ptr(b, 8)).is_some());
     if !touches {
@@ -588,7 +764,7 @@ pub fn plan_barriers(src: &[u8], shadow_of: &dyn Fn(usize) -> Option<(usize, u32
     for b in src.chunks_exact(32) {
         let b: [u8; 32] = b.try_into().unwrap();
         let res = ptr(&b, 8);
-        let Some((s, planes)) = (if matches!(u32_at(&b, 0), 0 | 2) { shadow_of(res) } else { None }) else {
+        let Some((s, format)) = (if matches!(u32_at(&b, 0), 0 | 2) { shadow_of(res) } else { None }) else {
             out.push(Step::Barrier(b));
             continue;
         };
@@ -601,9 +777,29 @@ pub fn plan_barriers(src: &[u8], shadow_of: &dyn Fn(usize) -> Option<(usize, u32
             continue;
         }
         let (sub, before, after) = (u32_at(&b, 16), u32_at(&b, 20), u32_at(&b, 24));
-        let whole = sub == ALL_SUBRESOURCES || (planes == 1 && sub == 0);
         let enter = after & ST_UAV != 0 && before & ST_UAV == 0;
         let leave = before & ST_UAV != 0 && after & ST_UAV == 0;
+        if format.uses_texture_copy() {
+            // D16 has one plane and both resources use R16_TYPELESS, so the
+            // same subresource identifies the same slice and the copy is bit-exact.
+            if enter {
+                push_t(&mut out, res, sub, before, ST_COPY_SOURCE);
+                push_t(&mut out, s, sub, ST_COMMON, ST_COPY_DEST);
+                out.push(Step::CopyTexture { dst: s, src: res, subresource: sub });
+                push_t(&mut out, res, sub, ST_COPY_SOURCE, ST_COMMON);
+                push_t(&mut out, s, sub, ST_COPY_DEST, ST_UAV);
+            } else if leave {
+                push_t(&mut out, s, sub, ST_UAV, ST_COPY_SOURCE);
+                push_t(&mut out, res, sub, ST_COMMON, ST_COPY_DEST);
+                out.push(Step::CopyTexture { dst: res, src: s, subresource: sub });
+                push_t(&mut out, s, sub, ST_COPY_SOURCE, ST_COMMON);
+                push_t(&mut out, res, sub, ST_COPY_DEST, after);
+            } else if before & ST_UAV == 0 {
+                push_t(&mut out, res, sub, before, after);
+            }
+            continue;
+        }
+        let whole = sub == ALL_SUBRESOURCES || (format.planes == 1 && sub == 0);
         if !whole {
             if enter || leave {
                 note(format!("depth texture {res:#x}: UAV transition of subresource {sub} only; contents are not converted between depth and the UAV shadow"));
@@ -643,7 +839,7 @@ pub unsafe fn barriers(list: *mut c_void, n: u32, barriers: *const u8, real: uns
             record(M, TAG, &s);
         }
     };
-    let Some(steps) = plan_barriers(src, &|r| pair_of(r).map(|p| (p.shadow, p.f.planes)), &mut note) else { return false };
+    let Some(steps) = plan_barriers(src, &|r| pair_of(r).map(|p| (p.shadow, p.f)), &mut note) else { return false };
     let mut pending: Vec<u8> = Vec::new();
     let flush = |pending: &mut Vec<u8>| {
         if !pending.is_empty() {
@@ -666,10 +862,32 @@ pub unsafe fn barriers(list: *mut c_void, n: u32, barriers: *const u8, real: uns
                     unsafe { run_pass(list, &p, false) };
                 }
             }
+            Step::CopyTexture { dst, src, subresource } => {
+                flush(&mut pending);
+                unsafe { copy_texture(list, dst, src, subresource) };
+            }
         }
     }
     flush(&mut pending);
     true
+}
+
+unsafe fn copy_texture(list: *mut c_void, dst: usize, src: usize, subresource: u32) {
+    if subresource == ALL_SUBRESOURCES {
+        let copy: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) =
+            unsafe { core::mem::transmute(pc(list, PC_COPY_RESOURCE)) };
+        unsafe { copy(list, dst as *mut c_void, src as *mut c_void) };
+    } else {
+        let location = |resource: usize| {
+            let mut loc = [0u64; 6]; // D3D12_TEXTURE_COPY_LOCATION, SUBRESOURCE_INDEX
+            loc[0] = resource as u64;
+            loc[2] = u64::from(subresource);
+            loc
+        };
+        let copy: unsafe extern "system" fn(*mut c_void, *const u64, u32, u32, u32, *const u64, *const c_void) =
+            unsafe { core::mem::transmute(pc(list, PC_COPY_TEXTURE_REGION)) };
+        unsafe { copy(list, location(dst).as_ptr(), 0, 0, 0, location(src).as_ptr(), core::ptr::null()) };
+    }
 }
 
 unsafe fn run_pass(list: *mut c_void, p: &Pair, copy_in: bool) {
@@ -740,6 +958,7 @@ mod tests {
     fn plan_pairs_supported_depth_uav_textures_only() {
         assert_eq!(plan(&tex(19, 0x6, 1, 1, 1)), Plan::Pair(Formats { dsv: 20, d_srv: 21, planes: 2 }));
         assert_eq!(plan(&tex(40, 0x1000006, 1, 1, 1)), Plan::Pair(Formats { dsv: 40, d_srv: 41, planes: 1 }));
+        assert_eq!(plan(&tex(53, 0x80300006, 1, 6, 1)), Plan::Pair(formats(55).unwrap()));
         assert_eq!(plan(&tex(19, 0x2, 1, 1, 1)), Plan::None);
         assert_eq!(plan(&tex(19, 0x4, 1, 1, 1)), Plan::None);
         assert!(matches!(plan(&tex(45, 0x6, 1, 1, 1)), Plan::Refuse(_)));
@@ -752,7 +971,7 @@ mod tests {
     fn depth_and_shadow_descs() {
         let t = tex(19, 0x1000006, 1, 1, 1);
         assert_eq!(u32_at(&depth_desc(&t), 0x30), 0x1000002);
-        let s = shadow_desc(&t);
+        let s = shadow_desc(&t, formats(19).unwrap());
         assert_eq!(u32_at(&s, 0x20), FMT_R32_TYPELESS);
         assert_eq!(u32_at(&s, 0x30), FLAG_UAV);
         assert_eq!(u32_at(&s, 0x18), 1024);
@@ -760,18 +979,19 @@ mod tests {
 
     #[test]
     fn shadow_uav_views_are_32_bit_single_plane() {
-        let d = shadow_uav_desc(None).unwrap();
+        let f = formats(19).unwrap();
+        let d = shadow_uav_desc(f, 1, None).unwrap();
         assert_eq!((u32_at(&d, 0), u32_at(&d, 4)), (FMT_R32_FLOAT, 4));
         let mut t = [0u8; 0x28];
         t[0..4].copy_from_slice(&21u32.to_le_bytes());
         t[4..8].copy_from_slice(&4u32.to_le_bytes());
         t[12..16].copy_from_slice(&1u32.to_le_bytes());
-        let d = shadow_uav_desc(Some(&t)).unwrap();
+        let d = shadow_uav_desc(f, 1, Some(&t)).unwrap();
         assert_eq!((u32_at(&d, 0), u32_at(&d, 12)), (FMT_R32_FLOAT, 0));
         t[0..4].copy_from_slice(&FMT_R32_UINT.to_le_bytes());
-        assert_eq!(u32_at(&shadow_uav_desc(Some(&t)).unwrap(), 0), FMT_R32_UINT);
+        assert_eq!(u32_at(&shadow_uav_desc(f, 1, Some(&t)).unwrap(), 0), FMT_R32_UINT);
         t[4..8].copy_from_slice(&1u32.to_le_bytes());
-        assert!(shadow_uav_desc(Some(&t)).is_err());
+        assert!(shadow_uav_desc(f, 1, Some(&t)).is_err());
     }
 
     #[test]
@@ -792,7 +1012,7 @@ mod tests {
     fn run(src: &[[u8; 32]]) -> (Option<Vec<Step>>, Vec<String>) {
         let bytes: Vec<u8> = src.iter().flatten().copied().collect();
         let mut notes = Vec::new();
-        let r = plan_barriers(&bytes, &|r| (r == D).then_some((S, 2)), &mut |s| notes.push(s));
+        let r = plan_barriers(&bytes, &|r| (r == D).then_some((S, formats(19).unwrap())), &mut |s| notes.push(s));
         (r, notes)
     }
 
@@ -964,7 +1184,7 @@ mod tests {
         let s = p.shadow as *mut c_void;
         let ps = PASS.get().unwrap().as_ref().unwrap();
         let dsv = ps.dsv_cpu + p.slot as u64 * ps.dsv_inc;
-        let (fp_s, total_s) = g.footprint(&shadow_desc(&dd));
+        let (fp_s, total_s) = g.footprint(&shadow_desc(&dd, f));
         let (fp_d, total_d) = g.footprint(&dd);
         let rb_s = g.buffer(3, total_s, 0x400);
         let rb_d = g.buffer(3, total_d, 0x400);

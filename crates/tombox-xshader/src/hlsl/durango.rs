@@ -153,14 +153,7 @@ impl Emitter<'_> {
             return Ok(None);
         }
         let Some(rs) = self.ex.root_sig.as_ref() else { return Ok(None) };
-        let vis = match self.ex.stage {
-            crate::Stage::Vertex => 1,
-            crate::Stage::Hull => 2,
-            crate::Stage::Domain => 3,
-            crate::Stage::Geometry => 4,
-            crate::Stage::Pixel => 5,
-            _ => 0,
-        };
+        let vis = self.sampler_visibility();
         let cands: Vec<_> = rs.static_samplers.iter().filter(|s| s.visibility == 0 || s.visibility == vis).collect();
         let pick = match cands.len() {
             0 => return Ok(None),
@@ -179,6 +172,52 @@ impl Emitter<'_> {
             }
         };
         Ok(Some(super::Binding::register(pick.register, pick.space)))
+    }
+
+    fn sampler_visibility(&self) -> u32 {
+        match self.ex.stage {
+            crate::Stage::Vertex => 1,
+            crate::Stage::Hull => 2,
+            crate::Stage::Domain => 3,
+            crate::Stage::Geometry => 4,
+            crate::Stage::Pixel => 5,
+            crate::Stage::Amplification => 6,
+            crate::Stage::Mesh => 7,
+            _ => 0,
+        }
+    }
+
+    pub(super) fn rdna_static_sampler(&self, start: usize, idx: usize, ss: u16) -> Result<Option<super::Binding>, String> {
+        let Some(root) = self.ex.root_sig.as_ref() else { return Ok(None) };
+        let Ok(base) = u8::try_from(ss) else { return Ok(None) };
+        // Resolve locally constructed S# values only when the shader declares a
+        // matching static sampler. Stop at a block boundary or an unknown write.
+        let literal = |dword| {
+            let reg = base.checked_add(dword)?;
+            Self::sgpr_const_in(&self.insns, start, idx, reg)
+        };
+        let (Some(w0), Some(w1), Some(w2), Some(_)) = (literal(0), literal(1), literal(2), literal(3)) else {
+            return Ok(None);
+        };
+        let decoded = decode_ssharp(w0, Some(w1), Some(w2), is_compare_sample(&self.insns[idx].mnemonic));
+        let vis = self.sampler_visibility();
+        let candidates: Vec<_> = root.static_samplers.iter().filter(|s| {
+            (s.visibility == 0 || s.visibility == vis)
+                && decoded.filter == Some(s.filter & 0x7f)
+                && decoded.max_aniso.is_none_or(|a| a == s.max_anisotropy)
+                && decoded.lod == Some((lod_fixed(s.min_lod_bits), lod_fixed(s.max_lod_bits)))
+                && hard_match(&decoded, s)
+                && self.ex.resources.iter().any(|r| {
+                    r.res_type == 1 && r.space == s.space && (r.lower..=r.upper).contains(&s.register)
+                })
+        }).copied().collect();
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let pick = pick_static_sampler(&decoded, &candidates)
+            .map_err(|why| format!("literal sampler s{ss} at {:#x}: {why}", self.insns[idx].offset))?;
+        let sampler = candidates[pick];
+        Ok(Some(super::Binding::register(sampler.register, sampler.space)))
     }
 }
 

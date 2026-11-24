@@ -1032,6 +1032,13 @@ pub fn needs_external_root_data(blob: &[u8]) -> bool {
         })
 }
 
+pub unsafe fn pipeline_root_data(root: *mut core::ffi::c_void) -> Option<Arc<[u8]>> {
+    // The translator needs the console layout. The COM copy may include the
+    // CBV-to-SRV rewrite and descriptor aliases added for the host.
+    crate::pso_lib::root_info(root as usize).map(|(_, blob, _)| blob)
+        .or_else(|| crate::console_slots_mesh::root_data(root).map(Arc::from))
+}
+
 pub fn translate_with_root(blob: &[u8], root: &[u8], rtfmt: [u8; 8], link: &InputInterp) -> Cached {
     let hash = fnv1a(blob);
     crate::shader_dump::note(blob, hash, &rtfmt, Some(root));

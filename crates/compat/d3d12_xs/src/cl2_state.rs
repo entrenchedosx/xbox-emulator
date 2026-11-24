@@ -30,6 +30,7 @@ const X_G1: usize = 38;
 const X_CN: usize = 39;
 const X_GN: usize = 40;
 const X_VIEW_FIRST: usize = 41;
+const X_ROOT_SRV_FIRST: usize = 43;
 const X_VIEW_LAST: usize = 46;
 const X_IB: usize = 47;
 const X_VB: usize = 48;
@@ -555,7 +556,10 @@ macro_rules! view_wrappers {
             unsafe extern "system" fn $name(this: *mut c_void, i: u32, va: u64) {
                 let side = (($slot - X_VIEW_FIRST) % 2) as u8;
                 rec(this, |s| { s.args.insert((side, i), RootArg::View($slot, va)); });
-                fwd!($slot, fn(u32, u64), this, i, va)
+                // Root SRV/UAV methods take a native GPU VA. Keep the title VA
+                // for replay, where the same mapping will be applied.
+                let host_va = if $slot >= X_ROOT_SRV_FIRST { crate::gpu_va::translate_buffer_va(va) } else { va };
+                fwd!($slot, fn(u32, u64), this, i, host_va)
             }
         )*
         fn view_wrapper(slot: usize) -> usize {

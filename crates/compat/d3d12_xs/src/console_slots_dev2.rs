@@ -225,46 +225,63 @@ unsafe fn place_at(this: *mut c_void, va: u64, rdesc: *const u8, state: u32) -> 
     (hr >= 0 && !out.is_null()).then_some(out as usize)
 }
 
-unsafe fn resolve(this: *mut c_void, va: u64, rdesc: *const u8, view: &mut [u8], at: BufferView, state: u32, what: &str) -> Option<usize> {
+unsafe fn resolve(this: *mut c_void, va: u64, rdesc: *const u8, view: &mut [u8], at: BufferView, what: &str) -> *mut c_void {
+    // Zero describes an unbound view. Allocating a resource would impose its
+    // format and mip limits on the descriptor even though it has no backing.
+    if va == 0 || rdesc.is_null() {
+        return core::ptr::null_mut();
+    }
+    note_rules(rdesc, at == SRV_BUFFER, what);
     let rd: [u8; 0x38] = unsafe { core::ptr::read_unaligned(rdesc as *const [u8; 0x38]) };
     let is_buffer = rd32(&rd, 0) == 1;
     if let Target::Existing(res, off) = choose_target(crate::gpu_va::lookup_gpu(va), is_buffer) {
         if !is_buffer || rebase_buffer_view(view, at, off) {
-            return Some(res);
+            return res as *mut c_void;
         }
     }
-    let made = unsafe { place_at(this, va, rdesc, state) };
+    let made = unsafe { place_at(this, va, rdesc, 0) };
     static N: AtomicUsize = AtomicUsize::new(0);
     if made.is_none() || once(&N, 8) {
         record("d3d12_xs", what, &format!("va={va:#x} dim={} format={} -> placement at the view address {:?}", rd32(&rd, 0), rd32(&rd, 0x20), made.map(|r| r as *const c_void)));
     }
-    made
+    made.map_or(core::ptr::null_mut(), |res| res as *mut c_void)
 }
 
-fn null_view_dimension(resource_dim: u32, srv: bool) -> u32 {
-    match (resource_dim, srv) {
-        (1, _) => 1,
-        (2, _) => 2,
-        (4, true) => 7,
-        (4, false) => 8,
+fn null_view_dimension(resource_dim: u32) -> u32 {
+    match resource_dim {
+        1 => 1,
+        2 => 2,
+        4 => 8,
         _ => 4,
     }
 }
 
-unsafe fn null_view(this: *mut c_void, rdesc: *const u8, dest: usize, srv: bool) {
-    let real = unsafe { real_device(this) };
-    let (dim, fmt) = if rdesc.is_null() { (3, 0) } else { unsafe { (core::ptr::read_unaligned(rdesc as *const u32), core::ptr::read_unaligned(rdesc.add(0x20) as *const u32)) } };
+unsafe fn default_null_view(rdesc: *const u8, srv: bool) -> [u8; 0x28] {
+    let (dim, fmt) = if rdesc.is_null() {
+        (3, 0)
+    } else {
+        unsafe { (core::ptr::read_unaligned(rdesc.cast::<u32>()), core::ptr::read_unaligned(rdesc.add(0x20).cast::<u32>())) }
+    };
+    let fmt = match (dim, fmt) {
+        (1, _) => DXGI_R32_UINT,
+        (_, 0) => 28, // R8G8B8A8_UNORM
+        (_, 20) => 21, // R32_FLOAT_X8X24_TYPELESS
+        (_, 40) => 41, // R32_FLOAT
+        (_, 45) => 46, // R24_UNORM_X8_TYPELESS
+        (_, 55) => 56, // R16_UNORM
+        (_, fmt) => crate::device_ext_a::typed_view_format(fmt),
+    };
     let mut d = [0u8; 0x28];
     d[0..4].copy_from_slice(&fmt.to_le_bytes());
-    d[4..8].copy_from_slice(&null_view_dimension(dim, srv).to_le_bytes());
+    d[4..8].copy_from_slice(&null_view_dimension(dim).to_le_bytes());
     if srv {
         d[8..12].copy_from_slice(&0x1688u32.to_le_bytes());
-        let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(slot(real, DEV_CREATE_SRV)) };
-        unsafe { f(real, core::ptr::null_mut(), d.as_ptr(), dest) };
-    } else {
-        let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(slot(real, DEV_CREATE_UAV)) };
-        unsafe { f(real, core::ptr::null_mut(), core::ptr::null_mut(), d.as_ptr(), dest) };
+        let count = if dim == 1 { 0x18 } else { 0x14 }; // NumElements or MipLevels
+        d[count..count + 4].copy_from_slice(&1u32.to_le_bytes());
+    } else if matches!(dim, 1 | 4) {
+        d[0x10..0x14].copy_from_slice(&1u32.to_le_bytes()); // NumElements or WSize
     }
+    d
 }
 
 pub fn placed_view_rule_breaks(flags: u32, srv: bool) -> Vec<&'static str> {
@@ -286,40 +303,29 @@ fn note_rules(rdesc: *const u8, srv: bool, what: &str) {
 }
 
 unsafe extern "system" fn placed_srv_x(this: *mut c_void, rdesc: *const u8, desc: *const u8, dest: usize) {
-    if desc.is_null() || rdesc.is_null() {
-        unsafe { null_view(this, rdesc, dest, true) };
-        return;
-    }
-    note_rules(rdesc, true, "CreatePlacedRawShaderResourceViewX");
-    let x: [u8; 0x48] = unsafe { core::ptr::read_unaligned(desc as *const [u8; 0x48]) };
-    let mut view: [u8; 0x28] = x[..0x28].try_into().unwrap();
-    let va = rd64(&x, 0x28);
-    let Some(res) = (unsafe { resolve(this, va, rdesc, &mut view, SRV_BUFFER, 0, "CreatePlacedRawShaderResourceViewX") }) else {
-        unsafe { null_view(this, rdesc, dest, true) };
-        return;
+    let (mut view, va) = if desc.is_null() {
+        (unsafe { default_null_view(rdesc, true) }, 0)
+    } else {
+        let x = unsafe { core::ptr::read_unaligned(desc.cast::<[u8; 0x48]>()) };
+        (x[..0x28].try_into().unwrap(), rd64(&x, 0x28))
     };
+    let res = unsafe { resolve(this, va, rdesc, &mut view, SRV_BUFFER, "CreatePlacedRawShaderResourceViewX") };
     let real = unsafe { real_device(this) };
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(slot(real, DEV_CREATE_SRV)) };
-    unsafe { f(real, res as *mut c_void, view.as_ptr(), dest) };
+    unsafe { f(real, res, view.as_ptr(), dest) };
 }
 
 unsafe extern "system" fn placed_uav_x(this: *mut c_void, rdesc: *const u8, desc: *const u8, dest: usize) {
-    if desc.is_null() || rdesc.is_null() {
-        unsafe { null_view(this, rdesc, dest, false) };
-        return;
-    }
-    note_rules(rdesc, false, "CreatePlacedUnorderedAccessViewX");
-    let x: [u8; 0x40] = unsafe { core::ptr::read_unaligned(desc as *const [u8; 0x40]) };
-    let mut view: [u8; 0x28] = x[..0x28].try_into().unwrap();
-    let va = rd64(&x, 0x28);
-    let counter_va = rd64(&x, 0x30);
-    let Some(res) = (unsafe { resolve(this, va, rdesc, &mut view, UAV_BUFFER, 0, "CreatePlacedUnorderedAccessViewX") }) else {
-        unsafe { null_view(this, rdesc, dest, false) };
-        return;
+    let (mut view, va, counter_va) = if desc.is_null() {
+        (unsafe { default_null_view(rdesc, false) }, 0, 0)
+    } else {
+        let x = unsafe { core::ptr::read_unaligned(desc.cast::<[u8; 0x40]>()) };
+        (x[..0x28].try_into().unwrap(), rd64(&x, 0x28), rd64(&x, 0x30))
     };
+    let res = unsafe { resolve(this, va, rdesc, &mut view, UAV_BUFFER, "CreatePlacedUnorderedAccessViewX") };
+    let buffer = rd32(&view, 4) == 1;
     let counter = match counter_va {
-        0 | u64::MAX => core::ptr::null_mut(),
-        cva => match crate::gpu_va::lookup_gpu(cva) {
+        cva if buffer && !res.is_null() && !matches!(cva, 0 | u64::MAX) => match crate::gpu_va::lookup_gpu(cva) {
             Some((e, off)) if e.buffer => {
                 view[0x18..0x20].copy_from_slice(&off.to_le_bytes());
                 e.res as *mut c_void
@@ -329,10 +335,16 @@ unsafe extern "system" fn placed_uav_x(this: *mut c_void, rdesc: *const u8, desc
                 core::ptr::null_mut()
             }
         },
+        _ => core::ptr::null_mut(),
     };
+    if buffer && counter.is_null() {
+        view[0x18..0x20].fill(0);
+    }
     let real = unsafe { real_device(this) };
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(slot(real, DEV_CREATE_UAV)) };
-    unsafe { f(real, res as *mut c_void, counter, view.as_ptr(), dest) };
+    unsafe { crate::depth_uav::with_shadow_uav(res, counter, view.as_ptr(), |res, counter, view| {
+        f(real, res, counter, view, dest);
+    }) };
 }
 
 unsafe extern "system" fn committed_x(
@@ -719,10 +731,9 @@ mod tests {
         assert_eq!(placed_view_rule_breaks(0xb, true), vec!["ALLOW_RENDER_TARGET", "ALLOW_DEPTH_STENCIL", "DENY_SHADER_RESOURCE"]);
         assert_eq!(placed_view_rule_breaks(0, false), vec!["missing ALLOW_UNORDERED_ACCESS"]);
         assert!(placed_view_rule_breaks(4, false).is_empty());
-        assert_eq!(null_view_dimension(1, true), 1);
-        assert_eq!(null_view_dimension(4, true), 7);
-        assert_eq!(null_view_dimension(4, false), 8);
-        assert_eq!(null_view_dimension(3, false), 4);
+        assert_eq!(null_view_dimension(1), 1);
+        assert_eq!(null_view_dimension(4), 8);
+        assert_eq!(null_view_dimension(3), 4);
     }
 
     #[test]

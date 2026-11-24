@@ -304,7 +304,7 @@ fn timer_thread() {
             continue;
         }
         let now = qpc();
-        let mut best: Option<(i64, usize)> = None;
+        let mut deadlines = [(0, 0); TYPES];
         for (i, (ty, off, _, _)) in pl.events.iter().enumerate() {
             let (mut d, _) = next_deadline(pl.base, pl.interval, *off, now - 1);
             if uncapped && last[*ty] > i64::MIN / 2 {
@@ -312,21 +312,25 @@ fn timer_thread() {
             } else if d - last[*ty] < pl.interval / 2 {
                 d += pl.interval;
             }
-            if best.map(|b| d < b.0).unwrap_or(true) {
-                best = Some((d, i));
+            deadlines[i] = (d, i);
+        }
+        let deadlines = &mut deadlines[..pl.events.len()];
+        deadlines.sort_unstable();
+        if !sleep_until(timer, wake, deadlines[0].0) {
+            continue;
+        }
+        // Use the deadlines from before the wait. Recalculating after only one
+        // event would skip every other event scheduled at the same offset.
+        let awake = qpc();
+        for &(deadline, idx) in deadlines.iter().take_while(|(deadline, _)| *deadline <= awake) {
+            let (ty, _, internal, dups) = &pl.events[idx];
+            if !with(|p| p.generation == pl.generation && p.types[*ty].scheduled) {
+                break;
             }
+            let fired = qpc();
+            last[*ty] = if uncapped { fired } else { deadline };
+            fire(*ty, *internal, dups, fired, deadline, &mut origins);
         }
-        let Some((deadline, idx)) = best else { continue };
-        if !sleep_until(timer, wake, deadline) {
-            continue;
-        }
-        let (ty, _, internal, dups) = &pl.events[idx];
-        let still = with(|p| p.generation == pl.generation && p.types[*ty].scheduled);
-        if !still {
-            continue;
-        }
-        last[*ty] = if uncapped { qpc() } else { deadline };
-        fire(*ty, *internal, dups, qpc(), deadline, &mut origins);
     }
 }
 
@@ -755,4 +759,23 @@ mod tests {
     }
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn events_at_the_same_offset_both_signal_every_interval() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset();
+        let waits = unsafe {
+            let this = core::ptr::null_mut();
+            assert_eq!(set_frame_interval_x(this, core::ptr::null_mut(), 33333, 3, 0), S_FALSE);
+            assert!(schedule_frame_event_x(this, 0, 0, core::ptr::null(), 0) >= 0);
+            assert!(schedule_frame_event_x(this, 2, 0, core::ptr::null(), 0) >= 0);
+            core::array::from_fn::<_, 4, _>(|_| {
+                let origin = wait_frame_event_x(this, 0, 300, core::ptr::null(), 0, core::ptr::null_mut());
+                let secondary = wait_frame_event_x(this, 2, 300, core::ptr::null(), 0, core::ptr::null_mut());
+                (origin, secondary)
+            })
+        };
+        reset();
+        assert_eq!(waits, [(S_OK, S_OK); 4]);
+    }
 }

@@ -1139,3 +1139,37 @@ fn global_atomic_translation_is_deterministic() {
 fn scalar_global_loads_compile_to_dxil() {
     dxil_of(&scalar_cs(&pointer_from_root_constants(), constants(2)).expect("translates"));
 }
+
+fn srv_and_cbv_table() -> RootSig {
+    RootSig {
+        version: 2,
+        flags: 0,
+        params: vec![RootParam { visibility: 0, kind: RootParamKind::Table(vec![
+            RootRange { range_type: 0, num: 1, base_register: 2, space: 1, offset_in_table: u32::MAX },
+            RootRange { range_type: 2, num: 1, base_register: 0, space: 1, offset_in_table: u32::MAX },
+        ]) }],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    }
+}
+
+/// The console reads a table's descriptors by position and does not check them against the declared ranges: a shader
+/// that loads descriptor slot 3 (`s_load_dwordx4 s8, s4, 0x60`, 32-byte slots) of a table that declares one descriptor
+/// and reads a constant buffer through it must bind that slot by position, in the table's own register space, so the
+/// host root signature (which gives every table positional ranges there) matches. It used to fall back to
+/// `register(b3)` in space 0, which no root signature had: the host driver rejected the pipeline.
+#[test]
+fn constant_buffer_in_a_slot_beyond_the_declared_table_binds_by_position() {
+    let words = [
+        0xf408_0202, 0xfa00_0060, // s_load_dwordx4 s8, s4 [0x60]
+        S_WAITCNT,
+        0xf428_0304, 0xfa00_0000, // s_buffer_load_dwordx4 s12, s[8:11] [0x0]
+        S_WAITCNT,
+        S_ENDPGM,
+    ];
+    let t = scalar_cs(&words, srv_and_cbv_table()).expect("translates");
+    let h = &t.hlsl;
+    assert!(h.contains("register(b3, space60000)"), "slot 3 of table parameter 0 is register 3 of its positional space: {h}");
+    assert!(!h.contains("register(b3)"), "{h}");
+    dxil_of(&t);
+}

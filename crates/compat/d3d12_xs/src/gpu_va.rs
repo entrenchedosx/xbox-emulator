@@ -14,12 +14,14 @@ pub struct Entry {
     pub buffer: bool,
 }
 
+#[derive(Default)]
 struct Tables {
     ranges: Vec<BTreeMap<u64, Entry>>,
     cpu: Vec<BTreeMap<u64, Entry>>,
     texture_va: HashMap<usize, u64>,
     state: HashMap<usize, u32>,
     width: HashMap<usize, u64>,
+    host_buffer_bases: HashMap<usize, u64>,
 }
 
 static T: Mutex<Option<Tables>> = Mutex::new(None);
@@ -27,7 +29,7 @@ static NEXT_SYNTH: AtomicU64 = AtomicU64::new(SYNTHETIC_TEXTURE_BASE);
 
 fn with<R>(f: impl FnOnce(&mut Tables) -> R) -> R {
     let mut g = T.lock().unwrap_or_else(|e| e.into_inner());
-    let t = g.get_or_insert_with(|| Tables { ranges: Vec::new(), cpu: Vec::new(), texture_va: HashMap::new(), state: HashMap::new(), width: HashMap::new() });
+    let t = g.get_or_insert_with(Tables::default);
     f(t)
 }
 
@@ -138,11 +140,21 @@ pub fn near(va: u64, n: usize) -> Vec<Entry> {
 }
 
 pub fn lookup_buffer(va: u64) -> Option<(Entry, u64)> {
+    with(|t| find_buffer(&t.ranges, va))
+}
+
+fn find_buffer(ranges: &[BTreeMap<u64, Entry>], va: u64) -> Option<(Entry, u64)> {
+    ranges.iter()
+        .filter_map(|m| m.range(..=va).next_back().map(|(_, e)| *e).filter(|e| e.buffer && va < e.start.saturating_add(e.len)))
+        .min_by_key(|e| e.len)
+        .map(|e| crate::placed_offset::true_entry(e, va))
+}
+
+/// Resolve a guest buffer alias to the address that a PC root descriptor can use.
+pub fn translate_buffer_va(va: u64) -> u64 {
     with(|t| {
-        t.ranges.iter()
-            .filter_map(|m| m.range(..=va).next_back().map(|(_, e)| *e).filter(|e| e.buffer && va < e.start.saturating_add(e.len)))
-            .min_by_key(|e| e.len)
-            .map(|e| crate::placed_offset::true_entry(e, va))
+        let Some((entry, offset)) = find_buffer(&t.ranges, va) else { return va };
+        t.host_buffer_bases.get(&entry.res).and_then(|base| base.checked_add(offset)).unwrap_or(va)
     })
 }
 
@@ -385,14 +397,19 @@ pub unsafe fn note_resource(real_device: *mut c_void, res: *mut c_void, desc: &[
     }
     set_state(res as usize, init_state);
     let buffer = u32::from_le_bytes(desc[0..4].try_into().unwrap()) == 1;
-    let rvt = unsafe { *(res as *const *const usize) };
-    let real_get: unsafe extern "system" fn(*mut c_void) -> u64 = unsafe { core::mem::transmute(*rvt.add(RESOURCE_GET_GPU_VA)) };
     if buffer {
         let width = u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap());
-        with(|t| { t.width.insert(res as usize, width); });
         unsafe { ensure_patched(res) };
-        let pc_va = unsafe { real_get(res) };
-        let pc_va = if pc_va == 0 || real_get as usize == get_gpu_va_x as usize { pc_va } else { pc_va + crate::placed_offset::bytes(res as usize) };
+        let host_base = unsafe { host_buffer_base(res) };
+        with(|t| {
+            t.width.insert(res as usize, width);
+            if host_base != 0 {
+                t.host_buffer_bases.insert(res as usize, host_base);
+            } else {
+                t.host_buffer_bases.remove(&(res as usize));
+            }
+        });
+        let pc_va = if host_base != 0 { host_base + crate::placed_offset::bytes(res as usize) } else { 0 };
         if pc_va != 0 {
             insert(Entry { start: pc_va, len: width, res: res as usize, buffer: true });
         }

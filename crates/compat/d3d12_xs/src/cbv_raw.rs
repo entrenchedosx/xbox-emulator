@@ -176,7 +176,10 @@ pub fn patch_rts0_with(b: &mut [u8], roots: bool) -> Result<RsPatch, String> {
 pub fn alias_blob(blob: &[u8]) -> Result<Option<Vec<u8>>, String> {
     let (o, n) = crate::console_slots_mesh::rts0_range(blob).ok_or("root signature blob has no RTS0 part")?;
     let body = blob.get(o..o + n).ok_or("RTS0 chunk out of bounds")?;
-    match crate::bl_alias::add_aliases(body)? {
+    let aliased = crate::bl_alias::add_aliases(body)?;
+    let current = aliased.as_deref().unwrap_or(body);
+    let positional = crate::bl_alias::add_positional(current, false)?;
+    match positional.or(aliased) {
         Some(b) => Ok(Some(crate::bl_alias::replace_rts0(blob, &b)?)),
         None => Ok(None),
     }
@@ -203,6 +206,11 @@ fn patch_blob_with(blob: &[u8], roots: bool) -> Result<Option<(Vec<u8>, RsPatch)
     let mut body = blob.get(o..o + n).ok_or("RTS0 chunk out of bounds")?.to_vec();
     let mut p = patch_rts0_with(&mut body, roots)?;
     if let Some(b) = crate::bl_alias::add_aliases(&body)? {
+        body = b;
+        p.aliased = true;
+    }
+    // constant buffers in tables became raw SRVs above, so their positional range is one too
+    if let Some(b) = crate::bl_alias::add_positional(&body, true)? {
         body = b;
         p.aliased = true;
     }
@@ -312,7 +320,9 @@ unsafe extern "system" fn create_cbv(this: *mut c_void, pdesc: *const u8, dest: 
     match raw_view(loc, size, &crate::gpu_va::lookup) {
         Ok((res, d)) => {
             let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(vslot(real, DEVICE_CREATE_SRV)) };
-            unsafe { f(real, res as *mut c_void, d.as_ptr(), dest) };
+            // raw_view resolves FirstElement against the host buffer, so validation
+            // must see the host width including any page prefix.
+            crate::placed_offset::with_true_desc(|| unsafe { f(real, res as *mut c_void, d.as_ptr(), dest) });
             unsafe { crate::ecl_probe::after_device_call(real, "CreateConstantBufferView (raw SRV)", || format!("BufferLocation={loc:#x} size {size} res={res:#x} dest={dest:#x}")) };
         }
         Err(e) => {
@@ -699,7 +709,18 @@ void main() {
         assert!(copy_on() && !enabled());
         let console = crate::device_wrap::wrap_root_signature(&body);
         let given = crate::rs_xbox::pc_blob(&console).unwrap_or(console);
-        assert_eq!(Some(plain.clone()), alias_blob(&given).unwrap());
+        // the same ranges either way; only the positional constant-buffer range differs (a raw SRV in copy mode,
+        // a real CBV when constant buffers stay constant buffers)
+        let aliased_only = alias_blob(&given).unwrap().expect("an unbounded range gets aliases");
+        assert_eq!(Some(plain.clone()), table_blob(&given).unwrap().map(|(b, _)| b));
+        let kinds = |b: &[u8]| {
+            let (o, n) = crate::console_slots_mesh::rts0_range(b).unwrap();
+            let p = tombox_xshader::meta::parse_rts0(&b[o..o + n]).unwrap();
+            let tombox_xshader::meta::RootParamKind::Table(r) = &p.params[0].kind else { panic!() };
+            r.iter().filter(|x| x.space >= tombox_xshader::hlsl::TB_TABLE_FALLBACK_SPACE && x.space < 100_000).map(|x| (x.range_type, x.num, x.base_register, x.offset_in_table)).collect::<Vec<_>>()
+        };
+        assert_eq!(kinds(&aliased_only), vec![(0, u32::MAX, 0, 0), (1, u32::MAX, 0, 0), (2, u32::MAX, 0, 0)], "positional SRV, UAV and CBV ranges");
+        assert_eq!(kinds(&plain), vec![(0, u32::MAX, 0, 0), (1, u32::MAX, 0, 0)], "copy mode: the constant-buffer one lives in the raw-SRV space");
         assert_eq!(root_cbv_params(&plain), root_cbv_params(&given));
         assert_eq!(root_cbv_params(&plain).len(), 1);
         let only_cbv = rts0(2, &[[2, 1, 0, 0]], true);

@@ -159,12 +159,20 @@ pub fn in_table(t: &[(u32, u32, u32)], reg: u32, space: u32) -> bool {
     t.iter().any(|&(b, n, s)| s == space && reg >= b && reg - b < n)
 }
 
+/// A register space of the positional table ranges (`TB_TABLE_FALLBACK_SPACE + table parameter index`): every
+/// descriptor table has a raw-SRV constant-buffer range there, so a constant buffer bound by slot position is a
+/// table constant buffer like a declared one.
+pub fn is_positional_space(space: u32) -> bool {
+    (crate::hlsl::TB_TABLE_FALLBACK_SPACE..crate::hlsl::TB_TABLE_FALLBACK_SPACE + 4096).contains(&space)
+}
+
 pub fn rewrite_tables(h: &str, rs: Option<&crate::meta::RootSig>) -> Result<String, String> {
     let t = table_cbv_ranges(rs);
-    if t.is_empty() {
+    let has_table = rs.is_some_and(|r| r.params.iter().any(|p| matches!(p.kind, crate::meta::RootParamKind::Table(_))));
+    if t.is_empty() && !has_table {
         return Ok(h.to_string());
     }
-    rewrite_hlsl_where(h, &|r, sp| in_table(&t, r, sp))
+    rewrite_hlsl_where(h, &|r, sp| in_table(&t, r, sp) || (has_table && is_positional_space(sp)))
 }
 
 pub fn rewrite_hlsl_where(h: &str, pick: &dyn Fn(u32, u32) -> bool) -> Result<String, String> {

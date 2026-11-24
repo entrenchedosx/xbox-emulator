@@ -147,13 +147,167 @@ fn hw_slot44_sub_page_placements_at_title_vas_share_bytes_on_the_gpu() {
 
 const IID_DESC_HEAP: Guid = Guid { d1: 0x8efb_471d, d2: 0x616c, d3: 0x4f49, d4: [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51] };
 
-unsafe fn uav_table(dev: usize) -> (usize, usize) {
-    let d: [u32; 4] = [0, 4, 0, 0];
+unsafe fn descriptor_heap(dev: usize, d: [u32; 4]) -> (usize, usize) {
     let mut h: *mut c_void = core::ptr::null_mut();
     assert!(call!(dev, 14, (*const u32, *const Guid, *mut *mut c_void) -> i32, d.as_ptr(), &IID_DESC_HEAP, &mut h) >= 0 && !h.is_null());
     let mut cpu = 0usize;
     call!(h, 9, (*mut usize) -> *mut usize, &mut cpu);
     (h as usize, cpu)
+}
+
+unsafe fn uav_table(dev: usize) -> (usize, usize) {
+    unsafe { descriptor_heap(dev, [0, 4, 0, 0]) }
+}
+
+#[test]
+fn placed_zero_address_is_a_null_srv() {
+    let g = gpu();
+    let w = wrapped();
+    unsafe {
+        let mut resource = bdesc(32);
+        resource[0..4].copy_from_slice(&3u32.to_le_bytes());
+        resource[0x18..0x1c].copy_from_slice(&32u32.to_le_bytes());
+        resource[0x20..0x24].copy_from_slice(&40u32.to_le_bytes());
+        resource[0x2c..0x30].fill(0);
+        resource[0x30..0x34].copy_from_slice(&2u32.to_le_bytes());
+        let mut view = [0u8; 0x48];
+        view[0..4].copy_from_slice(&41u32.to_le_bytes());
+        view[4..8].copy_from_slice(&4u32.to_le_bytes());
+        view[8..12].copy_from_slice(&0x1688u32.to_le_bytes());
+        view[0x14..0x18].copy_from_slice(&7u32.to_le_bytes());
+        let (heap, cpu) = uav_table(g.dev);
+        call!(w, crate::console_slots_dev2::SLOT_PLACED_SRV, (*const u8, *const u8, usize) -> (), resource.as_ptr(), view.as_ptr(), cpu);
+        assert_eq!(call!(g.dev, 37, () -> i32), 0);
+        call!(heap, 2, () -> u32);
+    }
+}
+
+#[test]
+fn placed_null_buffer_views_keep_the_device() {
+    let g = gpu();
+    let w = wrapped();
+    unsafe {
+        let resource = bdesc(16);
+        let (heap, cpu) = uav_table(g.dev);
+        for slot in [crate::console_slots_dev2::SLOT_PLACED_SRV, crate::console_slots_dev2::SLOT_PLACED_UAV] {
+            call!(w, slot, (*const u8, *const u8, usize) -> (), resource.as_ptr(), core::ptr::null(), cpu);
+            assert_eq!(call!(g.dev, 37, () -> i32), 0, "device after a null buffer view at slot {slot}");
+        }
+        let mut view = [0u8; 0x40];
+        view[0..4].copy_from_slice(&42u32.to_le_bytes()); // DXGI_FORMAT_R32_UINT
+        view[4..8].copy_from_slice(&1u32.to_le_bytes()); // buffer
+        view[0x10..0x14].copy_from_slice(&4u32.to_le_bytes());
+        view[0x18..0x20].copy_from_slice(&4096u64.to_le_bytes());
+        call!(w, crate::console_slots_dev2::SLOT_PLACED_UAV, (*const u8, *const u8, usize) -> (), resource.as_ptr(), view.as_ptr(), cpu);
+        assert_eq!(call!(g.dev, 37, () -> i32), 0, "an unbound UAV has no counter range");
+        call!(heap, 2, () -> u32);
+    }
+}
+
+#[test]
+#[ignore = "needs a D3D12 device; run: cargo test -p d3d12_xs --lib hw_ -- --ignored --test-threads=1 (TOMBOX_HW_ADAPTER=warp for WARP)"]
+fn hw_placed_constant_buffer_view_uses_the_host_buffer_width() {
+    let g = gpu();
+    let w = wrapped();
+    let va = 0x7350_0000_f580u64;
+    let size = 144u32;
+    unsafe {
+        let (hr, res) = placed_x(w, va, u64::from(size), &IID_RESOURCE);
+        assert_eq!(hr, 0, "placement failed: {hr:#010x}");
+        assert!(!res.is_null());
+        assert_eq!(crate::placed_offset::unpatched_width(res), Some(0xf610));
+
+        let mut cbv = [0u8; 16];
+        cbv[..8].copy_from_slice(&va.to_le_bytes());
+        cbv[8..12].copy_from_slice(&size.to_le_bytes());
+        let (heap, cpu) = uav_table(g.dev);
+        call!(w, 17, (*const u8, usize) -> (), cbv.as_ptr(), cpu);
+        let reason = call!(g.dev, 37, () -> i32);
+        assert_eq!(reason, 0, "raw CBV view removed the device: {reason:#010x}");
+        call!(heap, 2, () -> u32);
+        call!(res, 2, () -> u32);
+    }
+}
+
+#[test]
+#[ignore = "needs a D3D12 device; run: cargo test -p d3d12_xs --lib hw_ -- --ignored --test-threads=1 (TOMBOX_HW_ADAPTER=warp for WARP)"]
+fn hw_addressed_depth_array_can_start_in_uav_state() {
+    use crate::depth_uav::{ALL_SUBRESOURCES, ST_DEPTH_WRITE, ST_UAV};
+
+    const WIDTH: u32 = 768;
+    const SLICES: u32 = 6;
+    const ROW_PITCH: u32 = WIDTH * 2;
+    const SLICE_BYTES: u64 = ROW_PITCH as u64 * WIDTH as u64;
+    const D16_UNORM: u32 = 55;
+    const R16_UINT: u32 = 57;
+
+    let g = gpu();
+    let w = wrapped();
+    let va = 0x7360_0000_0000u64;
+    let mut d = bdesc(u64::from(WIDTH));
+    d[0..4].copy_from_slice(&3u32.to_le_bytes());
+    d[0x18..0x1c].copy_from_slice(&WIDTH.to_le_bytes());
+    d[0x1c..0x1e].copy_from_slice(&(SLICES as u16).to_le_bytes());
+    d[0x20..0x24].copy_from_slice(&53u32.to_le_bytes()); // DXGI_FORMAT_R16_TYPELESS
+    d[0x2c..0x30].fill(0);
+    d[0x30..0x34].copy_from_slice(&0x8030_0006u32.to_le_bytes());
+    let clear = [D16_UNORM, 1.0f32.to_bits(), 0, 0, 0];
+    let mut resource: *mut c_void = core::ptr::null_mut();
+    unsafe {
+        let hr = call!(w, 133, (u64, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32,
+            va, d.as_ptr(), 3, clear.as_ptr().cast(), &IID_RESOURCE, &mut resource);
+        assert!(hr >= 0 && !resource.is_null(), "addressed depth/UAV array hr={hr:#010x}");
+
+        let (depth_heap, depth_cpu) = descriptor_heap(g.dev, [3, 1, 0, 0]);
+        let dsv = [D16_UNORM, 4, 0, 0, 0, SLICES]; // DSV Texture2DArray
+        call!(w, 21, (*mut c_void, *const u32, usize) -> (), resource, dsv.as_ptr(), depth_cpu);
+
+        let (visible_heap, visible_cpu) = descriptor_heap(g.dev, [0, 1, 1, 0]);
+        let (cpu_heap, cpu) = uav_table(g.dev);
+        let mut visible_gpu = 0u64;
+        let returned = call!(visible_heap, 10, (*mut u64) -> u64, &mut visible_gpu);
+        let visible_gpu = crate::depth_uav::heap_start_result(returned, &visible_gpu as *const u64 as u64, visible_gpu);
+        // Create the same two-slice UAV through both entry points.
+        let view = [R16_UINT, 5, 0, 2, 2, 0, 0, 0, 0, 0, va as u32, (va >> 32) as u32, 0, 0, 0, 0];
+        call!(w, 19, (*mut c_void, *mut c_void, *const u32, usize) -> (), resource, core::ptr::null_mut(), view.as_ptr(), visible_cpu);
+        call!(w, crate::console_slots_dev2::SLOT_PLACED_UAV, (*const u8, *const u32, usize) -> (), d.as_ptr(), view.as_ptr(), cpu);
+        assert_eq!(call!(g.dev, 37, () -> i32), 0);
+
+        let readback = buffer(g.dev, HEAP_READBACK, SLICE_BYTES * 2, 0, ST_COPY_DEST);
+        run(g, |list| {
+            let transition = |subresource, before, after| {
+                let barrier = [0, resource as u64,
+                    u64::from(subresource) | (u64::from(before) << 32), u64::from(after)];
+                call!(list, X_BARRIER, (u32, *const u64) -> (), 1, barrier.as_ptr());
+            };
+            transition(ALL_SUBRESOURCES, ST_UAV, ST_DEPTH_WRITE);
+            call!(list, 51, (usize, u32, f32, u8, u32, *const c_void) -> (), depth_cpu, 1, 1.0, 0, 0, core::ptr::null());
+            transition(ALL_SUBRESOURCES, ST_DEPTH_WRITE, ST_UAV);
+
+            call!(list, 32, (u32, *const usize) -> (), 1, &visible_heap);
+            let contents = [0x1234u32, 0, 0, 0];
+            call!(list, 53, (u64, usize, *mut c_void, *const u32, u32, *const c_void) -> (),
+                visible_gpu, cpu, resource, contents.as_ptr(), 0, core::ptr::null());
+
+            for (i, slice) in [2u32, 5].into_iter().enumerate() {
+                transition(slice, ST_UAV, ST_COPY_SOURCE);
+                let src = [resource as u64, 0, u64::from(slice), 0, 0, 0];
+                let dst = [readback.res as u64, 1, SLICE_BYTES * i as u64,
+                    u64::from(R16_UINT) | (u64::from(WIDTH) << 32),
+                    u64::from(WIDTH) | (1u64 << 32), u64::from(ROW_PITCH)];
+                call!(list, 16, (*const u64, u32, u32, u32, *const u64, *const c_void) -> (),
+                    dst.as_ptr(), 0, 0, 0, src.as_ptr(), core::ptr::null());
+            }
+        });
+        assert_eq!(call!(g.dev, 37, () -> i32), 0);
+        for (i, expected) in [0x1234u16, 0xffff].into_iter().enumerate() {
+            let pixels = core::slice::from_raw_parts(readback.cpu.add(SLICE_BYTES as usize * i).cast::<u16>(), (WIDTH * WIDTH) as usize);
+            assert!(pixels.iter().all(|&pixel| pixel == expected), "slice {i}: wanted {expected:#06x}, first pixel was {:#06x}", pixels[0]);
+        }
+        for object in [readback.res, cpu_heap, visible_heap, depth_heap, resource as usize] {
+            call!(object, 2, () -> u32);
+        }
+    }
 }
 
 #[test]

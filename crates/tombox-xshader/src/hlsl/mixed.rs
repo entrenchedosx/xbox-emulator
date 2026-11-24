@@ -23,6 +23,15 @@ impl Emitter<'_> {
         None
     }
 
+    /// A slot that no declared range covers is bound by position (see `TB_TABLE_FALLBACK_SPACE`); what the table holds
+    /// there is whatever the title wrote, so the use decides: a store or atomic needs a UAV, a read an SRV.
+    pub(super) fn kind_for_slot(&self, slot: super::Binding, kind: Option<u32>, writes: bool) -> Option<u32> {
+        match (kind, slot) {
+            (None, super::Binding::Static(r)) if (super::TB_TABLE_FALLBACK_SPACE..super::TB_TABLE_FALLBACK_SPACE + 4096).contains(&r.space) => Some(u32::from(writes)),
+            (k, _) => k,
+        }
+    }
+
     pub(super) fn kind_at(&self, table: u8, off: u32, writes: bool) -> Result<Option<u32>, String> {
         match self.mixed_range_kind(table, off) {
             Some(0) if writes => Err(format!("descriptor at table s{table} offset {off:#x} is in an SRV range but is written")),

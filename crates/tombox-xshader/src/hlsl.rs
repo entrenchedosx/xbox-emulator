@@ -668,6 +668,14 @@ const OP_WAVE_SCAN: u32 = 0x7ff1;
 pub const TB_MIP_SPACE: u32 = 4_000_000;
 pub const TB_GMEM_SPACE: u32 = 4_000_001;
 pub const TB_BLALIAS_SPACE: u32 = 4_200_000;
+/// Register spaces `TB_TABLE_FALLBACK_SPACE + <root parameter index>` hold, for every descriptor table of a root
+/// signature, one unbounded SRV, UAV and (raw) constant-buffer range per descriptor type starting at the first
+/// descriptor of the table: register N is table slot N. The console addresses a table's descriptors by position and
+/// does not check a shader's reads against the root signature's declared ranges (the retail title's UI shaders read
+/// slots 2..5 of a table that declares two descriptors, and read a texture from a slot declared as a CBV), so a slot
+/// that no declared range of the right type covers is bound by position in this space. Below 65,536 (the slot name packs the space above a 16-bit register) and below the 100,000 spaces
+/// the constant-buffer rewrite accepts.
+pub const TB_TABLE_FALLBACK_SPACE: u32 = 60_000;
 pub const BL_ALIASES: u32 = 6;
 
 pub fn bl_alias_space(k: u32, space: u32) -> u32 {
@@ -1575,10 +1583,23 @@ impl<'a> Emitter<'a> {
                         return Ok(Binding::register(register, r.space));
                     }
                 }
-                fallback
+                Binding::register(idx, TB_TABLE_FALLBACK_SPACE + p as u32)
             }
             _ => fallback,
         })
+    }
+
+    /// The slot's own position in its table (see `TB_TABLE_FALLBACK_SPACE`), for a use whose descriptor type is not the
+    /// type of the range that declares the slot.
+    fn positional_id(&self, table: u8, off: u32, stride: u32) -> Result<Binding, String> {
+        if off & BINDLESS == 0 && self.rm_bind(table)?.is_none() {
+            if let Some((p, 0)) = self.root_param_at(table, self.user_base()) {
+                if matches!(self.ex.root_sig.as_ref().and_then(|r| r.params.get(p)).map(|x| &x.kind), Some(crate::meta::RootParamKind::Table(_))) {
+                    return Ok(Binding::register(off / stride, TB_TABLE_FALLBACK_SPACE + p as u32));
+                }
+            }
+        }
+        self.bind_id(table, off, stride)
     }
 
     fn sgpr_const_in(insns: &[Insn], start: usize, idx: usize, reg: u8) -> Option<u32> {
@@ -2202,6 +2223,7 @@ impl<'a> Emitter<'a> {
         }
         let writes = ins.mnemonic.contains("store") || ins.mnemonic.contains("atomic") || self.uav_force.contains(&slot);
         let kind = self.kind_at(table, off, writes)?;
+        let kind = self.kind_for_slot(slot, kind, writes);
         if matches!(slot, Binding::Indexed(_)) && kind.is_some_and(|k| k <= 1) {
             if kind == Some(1) { self.bl_uav.insert(slot); } else { self.bl_srv.insert(slot); }
         }
@@ -2614,7 +2636,10 @@ impl<'a> Emitter<'a> {
                     for (ttable, off) in &tex_c {
                         let tslot = self.bind_id(*ttable, *off, 32)?;
                         let writes = ins.mnemonic.contains("store") || ins.mnemonic.contains("atomic") || self.uav_force.contains(&tslot);
-                        let is_uav = self.kind_at(*ttable, *off, writes)? == Some(1);
+                        let kind = self.kind_at(*ttable, *off, writes)?;
+                        let is_uav = kind == Some(1);
+                        // A texture read from a slot the root signature declares as a CBV: bind it by position.
+                        let tslot = if kind == Some(2) && !is_uav { self.positional_id(*ttable, *off, 32)? } else { tslot };
                         let dim = self.gcn_image_dim(*ttable, *off, is_uav, da_dim);
                         if !is_uav && dim == 1 && msaa_dim_on() && ins.mnemonic == "image_load" && *off & BINDLESS == 0 && *off >= 32 && self.gcn_image_dim(*ttable, *off - 32, false, 1) == 6 {
                             let ms = self.bind_id(*ttable, *off - 32, 32)?;
@@ -2648,7 +2673,15 @@ impl<'a> Emitter<'a> {
                     }
                     let mut samp_res: Vec<(u32, Res)> = Vec::new();
                     if ins.mnemonic.starts_with("image_sample") || ins.mnemonic.starts_with("image_gather") || ins.mnemonic == "image_get_lod" {
-                        let fixed = if sym.get(&ss).is_none() && written.contains(&ss) { self.dg_static_sampler(idx, ss)? } else { None };
+                        let fixed = if !sym.contains_key(&ss) && written.contains(&ss) {
+                            if self.dg().is_some() {
+                                self.dg_static_sampler(idx, ss)?
+                            } else {
+                                self.rdna_static_sampler(block_start, idx, ss)?
+                            }
+                        } else {
+                            None
+                        };
                         let samp_c = match fixed {
                             Some(_) => vec![(0xffu8, 0)],
                             None => self.desc_candidates(sym.get(&ss), 16).ok_or_else(|| {
