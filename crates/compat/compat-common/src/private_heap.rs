@@ -14,6 +14,78 @@ extern "system" {
     fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
     fn ReleaseMutex(h: *mut c_void) -> i32;
     fn GetCurrentProcessId() -> u32;
+    fn OutputDebugStringA(s: *const u8);
+    fn Sleep(ms: u32);
+    fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16;
+    fn GetModuleHandleExW(flags: u32, addr: *const c_void, module: *mut *mut c_void) -> i32;
+}
+
+/// `HeapAlloc` / `HeapReAlloc` that waits for memory instead of failing at once. The system grows its page file on demand
+/// (a few seconds), and a title that has taken most of the machine's commit limit sees transient failures meanwhile;
+/// Rust aborts the whole process on the first null.
+fn retry_for_memory(mut attempt: impl FnMut() -> *mut u8) -> *mut u8 {
+    for _ in 0..400 {
+        unsafe { Sleep(25) };
+        let p = attempt();
+        if !p.is_null() {
+            return p;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// An allocation the private heap could not satisfy: Rust aborts the process on the null that follows, so say what was
+/// asked for and from where (module base + offset of each caller) on the debugger channel, without allocating.
+#[cold]
+#[inline(never)]
+fn alloc_failed(what: &str, size: usize, align: usize) {
+    fn hex(buf: &mut [u8], n: &mut usize, mut v: usize) {
+        let mut tmp = [0u8; 16];
+        let mut k = 0;
+        loop {
+            tmp[k] = b"0123456789abcdef"[v & 15];
+            k += 1;
+            v >>= 4;
+            if v == 0 {
+                break;
+            }
+        }
+        while k > 0 && *n < buf.len() - 1 {
+            k -= 1;
+            buf[*n] = tmp[k];
+            *n += 1;
+        }
+    }
+    fn text(buf: &mut [u8], n: &mut usize, t: &str) {
+        for b in t.bytes() {
+            if *n < buf.len() - 1 {
+                buf[*n] = b;
+                *n += 1;
+            }
+        }
+    }
+    let mut buf = [0u8; 700];
+    let mut n = 0;
+    text(&mut buf, &mut n, "[private_heap] ALLOCATION FAILED ");
+    text(&mut buf, &mut n, what);
+    text(&mut buf, &mut n, " size=0x");
+    hex(&mut buf, &mut n, size);
+    text(&mut buf, &mut n, " align=0x");
+    hex(&mut buf, &mut n, align);
+    text(&mut buf, &mut n, " callers (module base:+offset):");
+    let mut frames = [core::ptr::null_mut::<c_void>(); 14];
+    let got = unsafe { RtlCaptureStackBackTrace(1, 14, frames.as_mut_ptr(), core::ptr::null_mut()) } as usize;
+    for f in &frames[..got] {
+        let mut module: *mut c_void = core::ptr::null_mut();
+        // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT
+        unsafe { GetModuleHandleExW(0x6, *f, &mut module) };
+        text(&mut buf, &mut n, " ");
+        hex(&mut buf, &mut n, module as usize);
+        text(&mut buf, &mut n, ":+");
+        hex(&mut buf, &mut n, (*f as usize).wrapping_sub(module as usize));
+    }
+    buf[n] = 0;
+    unsafe { OutputDebugStringA(buf.as_ptr()) };
 }
 
 const HEAP_ZERO_MEMORY: u32 = 0x8;
@@ -141,11 +213,23 @@ pub fn handle() -> *mut c_void {
 unsafe fn aligned_alloc(layout: Layout, flags: u32) -> *mut u8 {
     let h = heap();
     if layout.align() <= MIN_ALIGN {
-        return unsafe { HeapAlloc(h, flags, layout.size()) } as *mut u8;
+        let p = unsafe { HeapAlloc(h, flags, layout.size()) } as *mut u8;
+        if p.is_null() {
+            let p = retry_for_memory(|| unsafe { HeapAlloc(h, flags, layout.size()) } as *mut u8);
+            if p.is_null() {
+                alloc_failed("alloc", layout.size(), layout.align());
+            }
+            return p;
+        }
+        return p;
     }
     let total = layout.size() + layout.align();
-    let raw = unsafe { HeapAlloc(h, flags, total) } as *mut u8;
+    let mut raw = unsafe { HeapAlloc(h, flags, total) } as *mut u8;
     if raw.is_null() {
+        raw = retry_for_memory(|| unsafe { HeapAlloc(h, flags, total) } as *mut u8);
+    }
+    if raw.is_null() {
+        alloc_failed("alloc(aligned)", layout.size(), layout.align());
         return raw;
     }
     let off = layout.align() - (raw as usize & (layout.align() - 1));
@@ -170,7 +254,14 @@ unsafe impl GlobalAlloc for PrivateHeap {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if layout.align() <= MIN_ALIGN {
-            return unsafe { HeapReAlloc(heap(), 0, ptr as *mut c_void, new_size) } as *mut u8;
+            let mut p = unsafe { HeapReAlloc(heap(), 0, ptr as *mut c_void, new_size) } as *mut u8;
+            if p.is_null() {
+                p = retry_for_memory(|| unsafe { HeapReAlloc(heap(), 0, ptr as *mut c_void, new_size) } as *mut u8);
+            }
+            if p.is_null() {
+                alloc_failed("realloc", new_size, layout.align());
+            }
+            return p;
         }
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
         let n = unsafe { self.alloc(new_layout) };
