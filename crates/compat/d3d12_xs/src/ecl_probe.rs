@@ -88,6 +88,7 @@ pub unsafe fn check(tag: &str, queue: *mut c_void, get_desc: usize, title: &[*mu
         return;
     }
     let after = unsafe { removed_reason(queue) };
+    crate::cmdlist_validate::note_submission(real);
     let n = SEEN.fetch_add(1, Ordering::Relaxed);
     let removed_here = before == Some(0) && after.is_some_and(|h| h != 0);
     if n >= 6 && !removed_here && after == Some(0) {

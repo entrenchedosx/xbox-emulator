@@ -6,8 +6,46 @@ use std::sync::{Mutex, OnceLock};
 
 const M: &str = "d3d12_xs";
 const TAG: &str = "cmdlist.validate";
-const KEEP: usize = 48;
+const KEEP: usize = 200;
 const KEEP_REC: usize = 1024;
+
+static RECENT: Mutex<VecDeque<Vec<usize>>> = Mutex::new(VecDeque::new());
+/// The commands of each list as of its last Close (a closed list's state is dropped; Scarlett re-records the
+/// same list object every frame, so this holds the most recent recording).
+static CLOSED: Mutex<Option<HashMap<usize, Vec<String>>>> = Mutex::new(None);
+
+/// Remember the lists of a submission (the last few are kept for `dump_recent`).
+pub fn note_submission(lists: &[*mut c_void]) {
+    if !enabled() {
+        return;
+    }
+    let mut r = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    r.push_back(lists.iter().map(|&l| l as usize).collect());
+    while r.len() > 6 {
+        r.pop_front();
+    }
+}
+
+/// Log the recorded commands of the lists of the last few submissions, when the device has just been found lost.
+pub fn dump_recent() {
+    if !enabled() {
+        return;
+    }
+    let recent: Vec<Vec<usize>> = RECENT.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
+    let n = recent.len();
+    for (k, lists) in recent.into_iter().enumerate() {
+        let dumps: Vec<(usize, Vec<String>)> = {
+            let g = CLOSED.lock().unwrap_or_else(|e| e.into_inner());
+            lists.iter().filter_map(|&l| g.as_ref().and_then(|m| m.get(&l)).map(|v| (l, v.clone()))).collect()
+        };
+        for (l, log) in dumps {
+            record(M, TAG, &format!("submission -{} of the last {n}: commands of list {l:#x} ({} kept):", n - 1 - k, log.len()));
+            for line in log {
+                record(M, TAG, &format!("  {line}"));
+            }
+        }
+    }
+}
 
 pub fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
@@ -574,6 +612,9 @@ unsafe extern "system" fn h_close(this: *mut c_void) -> i32 {
     note(this, "Close".into(), bad);
     let hr = call!(9, fn(*mut c_void) -> i32, this);
     let st = with(|s| s.lists.remove(&(this as usize)));
+    if let Some(l) = &st {
+        CLOSED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(this as usize, l.log.iter().cloned().collect());
+    }
     if let Some(l) = st {
         if hr < 0 || !l.violations.is_empty() {
             if REPORTS.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -986,15 +1027,48 @@ root_view!(h_gfx_srv, 44, true, Param::Srv, "SetGraphicsRootShaderResourceView")
 root_view!(h_cmp_uav, 45, false, Param::Uav, "SetComputeRootUnorderedAccessView");
 root_view!(h_gfx_uav, 46, true, Param::Uav, "SetGraphicsRootUnorderedAccessView");
 
+/// Where a GPU virtual address the title passed lies, as far as the emulator's resource tables know.
+fn describe_va(va: u64, size: u64, bad: &mut Vec<String>) -> String {
+    if va == 0 {
+        return "(null)".into();
+    }
+    match crate::gpu_va::lookup_gpu(va) {
+        Some((e, off)) => {
+            if !e.buffer {
+                bad.push(format!("{va:#x} lies in a texture resource {:#x}", e.res));
+            } else if off.checked_add(size).is_none_or(|end| end > e.len) {
+                bad.push(format!("{va:#x}+{size:#x} runs past the end of its buffer (offset {off:#x} of {:#x})", e.len));
+            }
+            // what the host driver itself calls this resource's address, for comparison with the address passed in
+            let real = unsafe {
+                let vt = *(e.res as *const *const usize);
+                let get: unsafe extern "system" fn(*mut c_void) -> u64 = core::mem::transmute(*vt.add(11));
+                get(e.res as *mut c_void)
+            };
+            if real.wrapping_add(off) != va {
+                bad.push(format!("{va:#x} is {off:#x} into the resource by the emulator's table, but the host driver puts that byte at {:#x} (resource base {real:#x})", real.wrapping_add(off)));
+            }
+            format!("-> res {:#x} +{off:#x} of {:#x} buffer={} host-gpu-va-of-resource={real:#x} entry.start={:#x}", e.res, e.len, e.buffer, e.start)
+        }
+        None => {
+            bad.push(format!("{va:#x} is not inside any buffer the emulator knows"));
+            "-> UNKNOWN".into()
+        }
+    }
+}
+
 unsafe extern "system" fn h_ib(this: *mut c_void, v: *const u8) {
     let mut bad = Vec::new();
+    let mut what = String::from("IASetIndexBuffer");
     if !v.is_null() {
         let fmt = *(v.add(12) as *const u32);
         if fmt != 42 && fmt != 57 && fmt != 0 {
             bad.push(format!("index format {fmt} is not R16_UINT/R32_UINT"));
         }
+        let (va, size) = (*(v as *const u64), *(v.add(8) as *const u32));
+        what = format!("IASetIndexBuffer va={va:#x} size={size:#x} fmt={fmt} {}", describe_va(va, size as u64, &mut bad));
     }
-    note(this, "IASetIndexBuffer".into(), bad);
+    note(this, what, bad);
     call!(47, fn(*mut c_void, *const u8), this, v)
 }
 
@@ -1003,7 +1077,14 @@ unsafe extern "system" fn h_vbs(this: *mut c_void, start: u32, n: u32, v: *const
     if start as u64 + n as u64 > 32 {
         bad.push(format!("vertex buffer slots {start}+{n} exceed 32"));
     }
-    note(this, format!("IASetVertexBuffers {start}+{n}"), bad);
+    let mut views = String::new();
+    if !v.is_null() {
+        for i in 0..(n as usize).min(8) {
+            let (va, size, stride) = (*(v.add(16 * i) as *const u64), *(v.add(16 * i + 8) as *const u32), *(v.add(16 * i + 12) as *const u32));
+            views.push_str(&format!(" [{}] va={va:#x} size={size:#x} stride={stride} {}", start as usize + i, describe_va(va, size as u64, &mut bad)));
+        }
+    }
+    note(this, format!("IASetVertexBuffers {start}+{n}{views}"), bad);
     call!(48, fn(*mut c_void, u32, u32, *const u8), this, start, n, v)
 }
 

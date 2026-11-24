@@ -100,6 +100,7 @@ pub fn report_once(site: &str, hr: Option<i32>) -> bool {
     }
     let what = hr.map_or(String::new(), |h| format!(" returned {h:#010x} ({})", removed_reason_name(h)));
     record(M, "dred.removed", &format!("first device-removal sign: {site}{what}"));
+    crate::cmdlist_validate::dump_recent();
     unsafe { report(dev, DRED.load(Ordering::Acquire) as *mut c_void) };
     crate::hang_cap::dump_on_removal();
     schedule_exit(hr);

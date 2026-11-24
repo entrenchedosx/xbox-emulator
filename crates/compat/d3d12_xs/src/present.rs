@@ -972,6 +972,9 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
     if real.is_empty() {
         return;
     }
+    if crate::diag_skip::skip_execute() {
+        return;
+    }
     crate::upload::submit_hook(queue);
     crate::sys_ts::note_queue(queue, REAL_QVT[16].load(Ordering::Relaxed), REAL_QVT[17].load(Ordering::Relaxed));
     crate::rtcap::note_submit(queue as usize, &title, &real);
@@ -982,7 +985,7 @@ unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const
     crate::hang_cap::note_exec(queue, &title, &real);
     crate::placed_offset::before_submit(queue, &real, f as usize, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)));
     crate::gpuprof::ecl_begin(queue, f, &real, enter);
-    crate::slowcall::time("queue ExecuteCommandLists", || crate::gpu_wait::submit(queue, &real, f, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)), crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed))));
+    if !crate::diag_skip::skip_lists() { crate::slowcall::time("queue ExecuteCommandLists", || crate::gpu_wait::submit(queue, &real, f, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)), crate::hang_cap::wait_fn(REAL_QVT[15].load(Ordering::Relaxed)))); }
     crate::gpuprof::ecl_end(queue, f);
     crate::placed_offset::after_submit(queue, &real, f as usize, crate::hang_cap::signal_fn(REAL_QVT[14].load(Ordering::Relaxed)));
     crate::ecl_probe::check("ExecuteCommandLists", queue, REAL_QVT[18].load(Ordering::Relaxed), &title, &real, before);
@@ -1173,6 +1176,7 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
             install_qthunks();
             install_qlow();
             crate::hang_cap::install_queue(&QUEUE_VT, &|i| REAL_QVT[i].load(Ordering::Relaxed));
+            crate::diag_queue::install(&QUEUE_VT);
             QUEUE_VT[10].store(q_exec_dispatch as usize, Ordering::Relaxed);
             QUEUE_VT[16].store(q_freq_dispatch as usize, Ordering::Relaxed);
             QUEUE_VT[17].store(q_calib_dispatch as usize, Ordering::Relaxed);

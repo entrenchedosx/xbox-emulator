@@ -50,6 +50,8 @@ mod console_slots;
 mod console_slots_cl2;
 mod cl2_state;
 mod cmdlist_validate;
+mod diag_skip;
+mod diag_queue;
 mod shader_xlat;
 mod mip_bind;
 mod present;

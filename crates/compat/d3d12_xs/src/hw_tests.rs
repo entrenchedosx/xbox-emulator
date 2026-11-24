@@ -1331,3 +1331,107 @@ fn hw_gpuprof_times_a_cross_queue_wait_and_the_submissions_around_it() {
         }
     }
 }
+
+/// The first frame of the retail title hung the GPU (`DXGI_ERROR_DEVICE_HUNG`) because `IASetVertexBuffers` and
+/// `IASetIndexBuffer` handed the host driver the title's own address of the buffer. Here a graphics pipeline reads
+/// its vertices through a vertex buffer the title knows only at an alias address; the vertex shader writes what it
+/// fetched into a buffer, which must hold the vertices (not garbage, not a hang).
+#[test]
+#[ignore = "requires D3D12 hardware or WARP"]
+fn hw_vertex_buffer_views_use_the_host_address_of_a_title_buffer() {
+    let g = gpu();
+    unsafe {
+        let vs_code = tombox_xshader::dxc::compile(r#"
+            RWByteAddressBuffer dst : register(u0);
+            [RootSignature("RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT), UAV(u0)")]
+            float4 main(float4 p : POSITION, uint id : SV_VertexID) : SV_Position {
+                dst.Store4(id * 16u, asuint(p));
+                return p;
+            }
+        "#, "vs_6_0").expect("dxc");
+        let mut rs: *mut c_void = core::ptr::null_mut();
+        assert!(call!(g.dev, 16, (u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32, 0, vs_code.as_ptr(), vs_code.len(), &IID_ROOT_SIGNATURE, &mut rs) >= 0);
+
+        let semantic = b"POSITION\0";
+        let mut element = [0u8; 32];
+        element[0..8].copy_from_slice(&(semantic.as_ptr() as u64).to_le_bytes());
+        element[12..16].copy_from_slice(&2u32.to_le_bytes()); // R32G32B32A32_FLOAT
+        // InputSlotClass 0 = per-vertex data, InstanceDataStepRate 0
+        let u32_at = |d: &mut [u8], o: usize, v: u32| d[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let mut d = [0u8; 656];
+        d[0..8].copy_from_slice(&(rs as u64).to_le_bytes());
+        d[8..16].copy_from_slice(&(vs_code.as_ptr() as u64).to_le_bytes());
+        d[16..24].copy_from_slice(&(vs_code.len() as u64).to_le_bytes());
+        for (o, v) in [(8usize, 2u32), (12, 1), (16, 1), (20, 2), (24, 1), (28, 1), (32, 4)] {
+            u32_at(&mut d, 120 + 8 + o, v); // render target 0 blend: ONE/ZERO/ADD, no logic op
+        }
+        d[120 + 8 + 36] = 0xf;
+        u32_at(&mut d, 448, 0xffff_ffff); // sample mask
+        u32_at(&mut d, 452, 3); // solid
+        u32_at(&mut d, 456, 1); // no culling
+        u32_at(&mut d, 452 + 24, 1); // depth clip
+        u32_at(&mut d, 496 + 4, 1); // depth write mask ALL
+        u32_at(&mut d, 496 + 8, 2); // depth func LESS
+        d[496 + 16] = 0xff;
+        d[496 + 17] = 0xff;
+        for face in [496 + 20, 496 + 36] {
+            for o in [0, 4, 8] {
+                u32_at(&mut d, face + o, 1); // stencil ops KEEP
+            }
+            u32_at(&mut d, face + 12, 8); // stencil func ALWAYS
+        }
+        d[552..560].copy_from_slice(&(element.as_ptr() as u64).to_le_bytes());
+        u32_at(&mut d, 560, 1);
+        u32_at(&mut d, 572, 1); // point topology type
+        u32_at(&mut d, 616, 1); // sample count
+        let mut pso: *mut c_void = core::ptr::null_mut();
+        let hr = call!(g.dev, 10, (*const u8, *const Guid, *mut *mut c_void) -> i32, d.as_ptr(), &IID_PSO, &mut pso);
+        assert!(hr >= 0, "CreateGraphicsPipelineState hr={hr:#010x}");
+
+        let vb = buffer(g.dev, HEAP_UPLOAD, 256, 0, ST_GENERIC_READ);
+        let dst = buffer(g.dev, HEAP_DEFAULT, 256, FLAG_UAV, ST_UAV);
+        let readback = buffer(g.dev, HEAP_READBACK, 256, 0, ST_COPY_DEST);
+        let verts: [f32; 12] = [0.25, 0.5, 0.75, 1.0, -1.0, 2.0, -3.0, 4.0, 8.0, 16.0, 32.0, 64.0];
+        for (i, v) in verts.iter().enumerate() {
+            core::ptr::write(vb.cpu.add(64 + 4 * i).cast::<f32>(), *v);
+        }
+        // the title knows both buffers at addresses of its own
+        let (vb_alias, dst_alias) = (0x072c_3000_0000u64, 0x072c_4000_0000u64);
+        crate::gpu_va::test_note_buffer(vb.res, vb_alias, vb.va, 256);
+        crate::gpu_va::test_note_buffer(dst.res, dst_alias, dst.va, 256);
+
+        let list = title_list(g.dev);
+        call!(list, 34, (*mut c_void) -> (), rs); // SetGraphicsRootSignature
+        call!(list, X_SET_PSO, (*mut c_void) -> (), pso);
+        call!(list, 20, (u32) -> (), 1); // point list
+        let mut view = [0u8; 16];
+        view[0..8].copy_from_slice(&(vb_alias + 64).to_le_bytes());
+        view[8..12].copy_from_slice(&48u32.to_le_bytes());
+        view[12..16].copy_from_slice(&16u32.to_le_bytes());
+        call!(list, 48, (u32, u32, *const u8) -> (), 0, 1, view.as_ptr()); // IASetVertexBuffers
+        call!(list, 46, (u32, u64) -> (), 0, dst_alias); // SetGraphicsRootUnorderedAccessView
+        let viewport = [0f32, 0.0, 1.0, 1.0, 0.0, 1.0];
+        call!(list, 21, (u32, *const f32) -> (), 1, viewport.as_ptr());
+        let scissor = [0i32, 0, 1, 1];
+        call!(list, 22, (u32, *const i32) -> (), 1, scissor.as_ptr());
+        call!(list, 12, (u32, u32, u32, u32) -> (), 3, 1, 0, 0); // DrawInstanced
+        raw_barrier(list, dst.res, ST_UAV, ST_COPY_SOURCE);
+        call!(list, X_COPY_BUFFER_REGION, (usize, u64, usize, u64, u64) -> (), readback.res, 0, dst.res, 0, 48);
+        assert_eq!(call!(list, X_CLOSE, () -> i32), 0);
+        let done = fence(g.dev);
+        submit(g.a, list, done, 1);
+        assert!(reached(done, 1, Duration::from_secs(10)), "the draw did not complete: the vertex buffer address never reached the driver as a valid address");
+        for (i, v) in verts.iter().enumerate() {
+            let got = f32::from_bits(rd(&readback, 4 * i));
+            assert_eq!(got, *v, "vertex float {i}");
+        }
+
+        call!(list, 2, () -> u32);
+        call!(rs, 2, () -> u32);
+        call!(pso, 2, () -> u32);
+        call!(done, 2, () -> u32);
+        call!(vb.res, 2, () -> u32);
+        call!(dst.res, 2, () -> u32);
+        call!(readback.res, 2, () -> u32);
+    }
+}

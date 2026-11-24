@@ -569,16 +569,39 @@ macro_rules! view_wrappers {
 }
 view_wrappers!((w_v41, 41), (w_v42, 42), (w_v43, 43), (w_v44, 44), (w_v45, 45), (w_v46, 46));
 
+/// `D3D12_INDEX_BUFFER_VIEW` / `D3D12_VERTEX_BUFFER_VIEW` (16 bytes each, `BufferLocation` first) with the title's GPU
+/// address of the buffer replaced by the address the host driver gives that byte. The title passes the address its own
+/// allocator handed out; a host driver given that address reads from a virtual address it never mapped and the queue
+/// hangs (`DXGI_ERROR_DEVICE_HUNG` on the first frame, even with every draw skipped).
+pub(crate) fn host_view(view: [u8; 16]) -> [u8; 16] {
+    let va = u64::from_le_bytes(view[0..8].try_into().unwrap());
+    let mut out = view;
+    if va != 0 {
+        out[0..8].copy_from_slice(&crate::gpu_va::translate_buffer_va(va).to_le_bytes());
+    }
+    out
+}
+
 unsafe extern "system" fn w_ib(this: *mut c_void, p: *const u8) {
     let v = if p.is_null() { None } else { Some(unsafe { arr::<16>(p, 0) }) };
     rec(this, |s| s.ib = Some(v));
-    fwd!(X_IB, fn(*const u8), this, p)
+    match v {
+        Some(view) => {
+            let host = host_view(view);
+            fwd!(X_IB, fn(*const u8), this, host.as_ptr())
+        }
+        None => fwd!(X_IB, fn(*const u8), this, p),
+    }
 }
 
 unsafe extern "system" fn w_vb(this: *mut c_void, start: u32, n: u32, p: *const u8) {
     let v: Vec<Option<[u8; 16]>> = (0..n as usize).map(|i| if p.is_null() { None } else { Some(unsafe { arr::<16>(p, i) }) }).collect();
     rec(this, |s| s.set_vbs(start, &v));
-    fwd!(X_VB, fn(u32, u32, *const u8), this, start, n, p)
+    if p.is_null() {
+        return fwd!(X_VB, fn(u32, u32, *const u8), this, start, n, p);
+    }
+    let host: Vec<[u8; 16]> = v.iter().map(|view| host_view(view.unwrap_or([0; 16]))).collect();
+    fwd!(X_VB, fn(u32, u32, *const u8), this, start, n, host.as_ptr() as *const u8)
 }
 
 unsafe extern "system" fn w_so(this: *mut c_void, start: u32, n: u32, p: *const u8) {
@@ -2010,6 +2033,24 @@ pub fn install(vt: &[AtomicUsize], defaults: &[usize]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ia_buffer_views_are_given_to_the_host_driver_with_the_host_address() {
+        let (title, host) = (0x28f0_8400_000u64, 0x2_e000_0000u64);
+        crate::gpu_va::test_note_buffer(0x7e57_0001, title, host, 0x10_0000);
+        let mut view = [0u8; 16];
+        view[0..8].copy_from_slice(&(title + 0x3ef30).to_le_bytes());
+        view[8..12].copy_from_slice(&0xff0u32.to_le_bytes());
+        view[12..16].copy_from_slice(&24u32.to_le_bytes());
+        let out = super::host_view(view);
+        assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), host + 0x3ef30, "the byte keeps its offset in the buffer");
+        assert_eq!(&out[8..], &view[8..], "size and stride are the title's");
+        // a null view stays null, an address nothing knows is passed on unchanged
+        assert_eq!(super::host_view([0; 16]), [0; 16]);
+        let mut unknown = view;
+        unknown[0..8].copy_from_slice(&0x1234_5678_9000u64.to_le_bytes());
+        assert_eq!(super::host_view(unknown), unknown);
+    }
+
     use super::*;
 
     fn combine_query(mode: u32, a: &[u64], b: &[u64]) -> Vec<u64> {

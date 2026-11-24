@@ -487,6 +487,8 @@ pub fn apply(real_list: *mut c_void) {
             crate::cbv_raw::install_draw_check(&XBOX_VT);
             crate::passcap::install(&XBOX_VT);
             crate::gpuprof::install_ops(&XBOX_VT);
+            crate::diag_skip::install();
+            crate::diag_skip::install_slots();
             if crate::shader_xlat::title_name_pub().eq_ignore_ascii_case("game_scarlett_master") {
                 crate::cl_ext::install_scarlett_memory_ops(&XBOX_VT);
                 install_scarlett_reset();

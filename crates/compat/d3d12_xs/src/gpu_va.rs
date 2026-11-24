@@ -158,6 +158,16 @@ pub fn translate_buffer_va(va: u64) -> u64 {
     })
 }
 
+/// Test helper: a buffer the title knows at `title_va` that the host driver knows at `host_va`.
+#[cfg(test)]
+pub(crate) fn test_note_buffer(res: usize, title_va: u64, host_va: u64, len: u64) {
+    insert(Entry { start: title_va, len, res, buffer: true });
+    insert(Entry { start: host_va, len, res, buffer: true });
+    with(|t| {
+        t.host_buffer_bases.insert(res, host_va);
+    });
+}
+
 pub fn lookup_gpu(va: u64) -> Option<(Entry, u64)> {
     with(|t| find_in(&t.ranges, va))
 }
