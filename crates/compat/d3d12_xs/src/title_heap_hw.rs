@@ -132,7 +132,7 @@ fn hw_title_heap_descriptors_written_after_recording_are_read_at_execute() {
         assert!(call!(dev, 14, (*const u32, *const Guid, *mut *mut c_void) -> i32, hdesc.as_ptr(), &IID_HEAP, &mut heap) >= 0);
         let mut mem = vec![[0u32; 8]; 4];
         let memory = mem.as_mut_ptr() as u64;
-        assert_eq!(super::register(heap as usize, memory, 4u64 << 32, super::FAMILY_SCARLETT), 0);
+        assert_eq!(super::register(heap as usize, memory, 4u64 << 32, super::FAMILY_SCARLETT, 4), 0);
         let src_a = buffer(dev, HEAP_UPLOAD, 256, 0, ST_GENERIC_READ);
         let src_b = buffer(dev, HEAP_UPLOAD, 256, 0, ST_GENERIC_READ);
         (src_a.cpu as *mut u32).write_volatile(41);

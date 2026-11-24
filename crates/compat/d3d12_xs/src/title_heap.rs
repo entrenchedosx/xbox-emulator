@@ -16,6 +16,17 @@ pub const KIND_SAMPLER: u8 = 4;
 pub const KIND_DEFAULT: u8 = 0;
 const CHUNK: usize = 64;
 const SAMPLER_HEADER: u64 = 0x10;
+
+/// Largest shader-visible CBV/SRV/UAV heap a PC D3D12 runtime creates
+/// (`D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2`). The console has no such limit: GTA VI asks
+/// for a 1,245,184-slot heap, so the host heap is smaller than the heap the title addresses.
+pub const HOST_DESCRIPTOR_LIMIT: u32 = 1_000_000;
+
+/// Descriptors are remapped a page at a time. A table that fits in one page stays contiguous after
+/// remapping; a table that crosses a page boundary is only usable when both pages are identity.
+const PAGE_SHIFT: u32 = 10;
+const PAGE_SLOTS: u32 = 1 << PAGE_SHIFT;
+const NO_PAGE: u32 = u32::MAX;
 const ROOT_FLAG_DIRECT_RESOURCES: u32 = 0x400;
 const ROOT_FLAG_DIRECT_SAMPLERS: u32 = 0x800;
 const DEFAULT_MAPPING: u32 = 0x1688;
@@ -355,7 +366,10 @@ struct Heap {
     memory: u64,
     slot0: u64,
     ty: u32,
-    num: u32,
+    /// Descriptors in the memory the title addresses (`D3D12_DESCRIPTOR_HEAP_DESC::NumDescriptors`).
+    console: u32,
+    /// Descriptors the PC heap really has. Never above [`HOST_DESCRIPTOR_LIMIT`].
+    host: u32,
     family: u32,
     cpu: u64,
     gpu: u64,
@@ -363,6 +377,16 @@ struct Heap {
     raw: Vec<u32>,
     written: Vec<u8>,
     kinds: Vec<u8>,
+    /// Console page -> host page. `NO_PAGE` until the page is remapped; pages below the host capacity
+    /// are identity and never appear here.
+    pages: Vec<u32>,
+    /// Host pages handed to console pages beyond the host capacity. Their own console page's slots are
+    /// then unhosted (reported), which is what keeps a remap from aliasing a live descriptor.
+    stolen: Vec<bool>,
+    /// Host slot holding the null views an unrepresentable table binds (the last slot of the heap).
+    null_slot: u32,
+    /// Console slots that had no host slot behind them, for the run summary.
+    unhosted: u32,
 }
 
 impl Heap {
@@ -378,6 +402,89 @@ impl Heap {
         } else {
             kind
         }
+    }
+
+    fn host_pages(&self) -> u32 {
+        self.host.div_ceil(PAGE_SLOTS)
+    }
+
+    fn console_pages(&self) -> u32 {
+        self.console.div_ceil(PAGE_SLOTS)
+    }
+
+    /// Whether a host page still holds nothing this run: not stolen, and none of its identity slots was
+    /// ever written. Only such a page can be handed to a console page beyond the host capacity.
+    fn page_is_free(&self, page: u32) -> bool {
+        if page == 0 || page + 1 >= self.host_pages() || self.stolen[page as usize] {
+            return false;
+        }
+        let first = (page as usize) << PAGE_SHIFT;
+        if first >= self.written.len() {
+            return false;
+        }
+        let end = ((first + PAGE_SLOTS as usize).min(self.host as usize)).min(self.written.len());
+        self.written[first..end].iter().all(|w| *w == 0) && self.raw[first * self.words()..end * self.words()].iter().all(|w| *w == 0)
+    }
+
+    /// The host slot a console descriptor lives in. Allocates a host page for a console page beyond the
+    /// host capacity, so a descriptor above the ceiling is translated, not clamped and not aliased.
+    fn host_slot(&mut self, console: u32) -> Option<u32> {
+        if console >= self.console || (self.null_slot != u32::MAX && console == self.null_slot) {
+            return None;
+        }
+        let page = console >> PAGE_SHIFT;
+        let off = console & (PAGE_SLOTS - 1);
+        if page < self.host_pages() && !self.stolen[page as usize] && self.pages[page as usize] == NO_PAGE {
+            let slot = (page << PAGE_SHIFT) + off;
+            if slot < self.host {
+                return Some(slot);
+            }
+            // The last page of the host heap can end in the middle of a console page; the part past
+            // the ceiling needs the whole page remapped, so fall through to the remap below.
+        }
+        let mapped = *self.pages.get(page as usize)?;
+        if mapped != NO_PAGE {
+            return Some((mapped << PAGE_SHIFT) + off);
+        }
+        // A page past the host capacity: give it a host page that no console descriptor is using.
+        let mut candidate = self.host_pages().checked_sub(2)?;
+        while candidate > 0 && !self.page_is_free(candidate) {
+            candidate -= 1;
+        }
+        if candidate == 0 {
+            return None;
+        }
+        self.stolen[candidate as usize] = true;
+        self.pages[page as usize] = candidate;
+        record(M, TAG, &format!(
+            "heap console page {page} (descriptors {}..{}) remapped to host page {candidate}: the host heap has {} slots, the title addresses {}",
+            page << PAGE_SHIFT,
+            ((page + 1) << PAGE_SHIFT).min(self.console),
+            self.host,
+            self.console
+        ));
+        Some((candidate << PAGE_SHIFT) + off)
+    }
+
+    /// The host GPU handle for a descriptor range, when every slot is hosted and the host slots are
+    /// contiguous (a D3D12 descriptor table is one contiguous range). `None` means the range cannot be
+    /// represented; the caller must not hand the driver the console address.
+    fn range_host(&mut self, first: u32, count: u32) -> Option<u64> {
+        let base = self.host_slot(first)?;
+        if count > 1 && count != u32::MAX {
+            for k in 1..count {
+                if self.host_slot(first.saturating_add(k)) != Some(base + k as u32) {
+                    return None;
+                }
+            }
+        } else if count == u32::MAX && base + 1 >= self.host {
+            return None;
+        }
+        Some(self.gpu + base as u64 * self.inc as u64)
+    }
+
+    fn null_handle(&self) -> u64 {
+        self.gpu + self.null_slot as u64 * self.inc as u64
     }
 }
 
@@ -425,7 +532,7 @@ pub fn palette_entry(memory: u64, header_num: u32, ptr: u32) -> u64 {
     memory + ((header_num as u64 * 16 + 0x10 + 0xff) & !0xff) + ptr as u64 * 16
 }
 
-pub unsafe fn register(heap: usize, memory: u64, desc: u64, family: u32) -> i32 {
+pub unsafe fn register(heap: usize, memory: u64, desc: u64, family: u32, host: u32) -> i32 {
     if heap == 0 || memory == 0 {
         return E_INVALIDARG;
     }
@@ -445,13 +552,27 @@ pub unsafe fn register(heap: usize, memory: u64, desc: u64, family: u32) -> i32 
     let kind = if ty == 1 { KIND_SAMPLER } else { KIND_SRV };
     let slot0 = first_slot(memory, ty);
     let words = (console_stride(ty) / 4) as usize;
+    let host_pages = host.div_ceil(PAGE_SLOTS).max(1);
+    let console_pages = num.div_ceil(PAGE_SLOTS).max(1);
     heaps(|m| {
-        m.insert(heap, Heap { device, memory, slot0, ty, num, family, cpu, gpu, inc, raw: vec![0; num as usize * words], written: vec![0; num as usize], kinds: vec![kind; num as usize] });
+        m.insert(heap, Heap {
+            device, memory, slot0, ty, console: num, host, family, cpu, gpu, inc,
+            raw: vec![0; num as usize * words], written: vec![0; num as usize], kinds: vec![kind; num as usize],
+            pages: vec![NO_PAGE; console_pages as usize],
+            stolen: vec![false; host_pages as usize],
+            // Only an oversized heap needs a reserved null descriptor; a normal heap loses nothing.
+            null_slot: if host < num { host.saturating_sub(1) } else { u32::MAX },
+            unhosted: 0,
+        });
     });
     if crate::rtcap::enabled() || crate::passcap::tables_on() {
         crate::bindtrace::note_heap_inc(cpu as usize, gpu, num, inc as usize);
     }
-    record(M, TAG, &format!("heap {heap:#x} type={ty} num={num} over title memory {memory:#x} (slot 0 at {slot0:#x}, console stride {}) -> PC cpu {cpu:#x} gpu {gpu:#x} inc {inc}", console_stride(ty)));
+    record(M, TAG, &format!("heap {heap:#x} type={ty} console slots={num} host slots={host} over title memory {memory:#x} (slot 0 at {slot0:#x}, console stride {}) -> PC cpu {cpu:#x} gpu {gpu:#x} inc {inc}", console_stride(ty)));
+    if host < num {
+        record(M, TAG, &format!(
+            "heap {heap:#x}: the title addresses {num} descriptors but the host heap holds {host}; descriptors above the host ceiling are translated page by page into host slots the title is not using, and anything that cannot be hosted is reported instead of being forwarded to the driver"));
+    }
     0
 }
 
@@ -529,7 +650,7 @@ pub unsafe fn adopt_title_memory(heap: usize, requested: [u32; 4], pc_count: u32
     if from_title == 0 || base == 0 {
         return None;
     }
-    let hr = register(heap, base, (pc_count as u64) << 32 | requested[0] as u64, console_family(device_type));
+    let hr = register(heap, base, (requested[1] as u64) << 32 | requested[0] as u64, console_family(device_type), pc_count);
     if hr < 0 {
         record(M, TAG, &format!("heap {heap:#x}: title supplied descriptor memory {base:#x} ({bytes:#x} bytes) but registering the heap failed hr={hr:#010x}"));
         return None;
@@ -547,7 +668,7 @@ pub fn set_kind(heap: usize, first: u32, count: u32, kind: u8) -> u32 {
         let Some(h) = m.get_mut(&heap) else {
             return 0;
         };
-        let end = (first as u64 + count as u64).min(h.num as u64) as usize;
+        let end = (first as u64 + count as u64).min(h.console as u64) as usize;
         let mut n = 0;
         for i in first as usize..end {
             h.kinds[i] = kind;
@@ -575,8 +696,8 @@ unsafe fn read_f32x4(addr: u64) -> [f32; 4] {
     c
 }
 
-unsafe fn write_slot(h: &Heap, i: usize, words: &[u32], kind: u8) -> bool {
-    let handle = h.cpu + i as u64 * h.inc as u64;
+unsafe fn write_slot(h: &Heap, i: usize, host_slot: u32, words: &[u32], kind: u8) -> bool {
+    let handle = h.cpu + host_slot as u64 * h.inc as u64;
     let dev = h.device;
     if kind == KIND_SAMPLER {
         let f: unsafe extern "system" fn(usize, *const [u8; 52], u64) = core::mem::transmute(vfn(dev, 22));
@@ -659,7 +780,7 @@ unsafe fn write_slot(h: &Heap, i: usize, words: &[u32], kind: u8) -> bool {
 
 unsafe fn sync_range(h: &mut Heap, first: usize, end: usize, kind: u8, failed: &mut Vec<(usize, Vec<u32>)>) -> u32 {
     let w = h.words();
-    let end = end.min(h.num as usize);
+    let end = end.min(h.console as usize);
     let mut buf = [0u32; CHUNK * 8];
     let mut written = 0;
     let mut i = first;
@@ -675,8 +796,17 @@ unsafe fn sync_range(h: &mut Heap, first: usize, end: usize, kind: u8, failed: &
                 if h.written[s] == want && h.raw[s * w..(s + 1) * w] == *words {
                     continue;
                 }
-                if !write_slot(h, s, words, want) {
-                    failed.push((s, words.to_vec()));
+                match h.host_slot(s as u32) {
+                    Some(host_slot) => {
+                        if !write_slot(h, s, host_slot, words, want) {
+                            failed.push((s, words.to_vec()));
+                        }
+                    }
+                    None => {
+                        // No host descriptor behind this console slot: keep the title's words, do not
+                        // write anywhere, and count it so the run reports a real gap instead of a hang.
+                        h.unhosted = h.unhosted.saturating_add(1);
+                    }
                 }
                 h.raw[s * w..(s + 1) * w].copy_from_slice(words);
                 h.written[s] = want;
@@ -711,17 +841,33 @@ pub unsafe fn sync(heap: usize, first: u32, count: u32) -> u32 {
 
 pub fn locate(handle: u64) -> Option<(usize, u32, u64, u32)> {
     let hit = heaps(|m| {
-        m.iter().find_map(|(k, h)| {
+        m.iter_mut().find_map(|(k, h)| {
             let stride = console_stride(h.ty);
-            let len = h.num as u64 * stride;
-            (handle >= h.slot0 && handle < h.slot0 + len).then(|| (*k, ((handle - h.slot0) / stride) as u32, (handle - h.slot0) % stride, h.gpu, h.inc, h.ty))
+            let len = h.console as u64 * stride;
+            (handle >= h.slot0 && handle < h.slot0 + len).then(|| (*k, ((handle - h.slot0) / stride) as u32, (handle - h.slot0) % stride))
         })
     });
-    let (heap, index, rem, gpu, inc, ty) = hit?;
+    let (heap, index, rem) = hit?;
     if rem != 0 {
         record(M, TAG, &format!("GPU handle {handle:#x} is {rem} bytes into console descriptor {index}"));
     }
-    Some((heap, index, gpu + index as u64 * inc as u64, ty))
+    let resolved = heaps(|m| {
+        let h = m.get_mut(&heap)?;
+        let ty = h.ty;
+        let pc = h.host_slot(index).map(|s| h.gpu + s as u64 * h.inc as u64)?;
+        Some((pc, ty))
+    });
+    match resolved {
+        Some((pc, ty)) => Some((heap, index, pc, ty)),
+        None => {
+            // The console slot has no host descriptor. Never hand the driver the console address: it is
+            // outside every heap the PC runtime knows. The null table is a valid handle inside the heap.
+            let null = heaps(|m| m.get(&heap).map(|h| (h.null_handle(), h.ty)));
+            let (pc, ty) = null?;
+            record(M, TAG, &format!("console descriptor {index} of heap {heap:#x} has no host slot behind it; using the heap's null descriptor"));
+            Some((heap, index, pc, ty))
+        }
+    }
 }
 
 pub unsafe fn translate(handle: u64) -> u64 {
@@ -888,6 +1034,30 @@ pub fn on_table(list: usize, side: usize, param: u32, handle: u64) -> u64 {
     };
     let rs = root_of(list, side);
     let ranges = rs.and_then(|rs| roots(|m| m.get(&rs).and_then(|l| l.tables.get(param as usize).cloned().flatten())));
+    // A descriptor table is one contiguous host range. When the console range cannot be hosted
+    // contiguously, bind the heap's null table (a real handle in the heap) and say so: never a
+    // console address and never a live descriptor standing in for another one.
+    let (offset, span) = match &ranges {
+        Some(r) => {
+            let offset = r.iter().map(|t| t.offset).min().unwrap_or(0);
+            let end = r.iter().fold(0u32, |e, t| e.max(if t.count == u32::MAX { u32::MAX } else { t.offset.saturating_add(t.count) }));
+            (offset, end.saturating_sub(offset).max(1))
+        }
+        None => (0, u32::MAX),
+    };
+    let hosted = heaps(|m| m.get_mut(&heap).and_then(|h| h.range_host(index.saturating_add(offset), span)));
+    let pc = match hosted {
+        Some(h) => h,
+        None => {
+            UNREPRESENTABLE_TABLES.fetch_add(1, Ordering::Relaxed);
+            if once(21) {
+                record(M, TAG, &format!(
+                    "descriptor table {handle:#x} (heap {heap:#x}, root parameter {param}) has no contiguous host range ({span} descriptors from console index {}); bound the heap's null table instead",
+                    index.saturating_add(offset)));
+            }
+            heaps(|m| m.get(&heap).map(|h| h.null_handle()).unwrap_or(pc))
+        }
+    };
     let new: Vec<Ref> = match ranges {
         Some(r) => r
             .iter()
@@ -931,6 +1101,8 @@ pub fn on_table(list: usize, side: usize, param: u32, handle: u64) -> u64 {
 }
 
 pub static UNBOUND_TABLES: AtomicUsize = AtomicUsize::new(0);
+/// Descriptor tables that had no contiguous host range (see `on_table`).
+pub static UNREPRESENTABLE_TABLES: AtomicUsize = AtomicUsize::new(0);
 
 pub fn table_heap_bound(bound: &[usize], heap: usize) -> bool {
     bound.contains(&heap)
@@ -967,7 +1139,7 @@ pub fn paint(iv: &[(u32, u32, u8)]) -> (Vec<(u32, u32, u8)>, u32) {
 }
 
 pub unsafe fn sync_for_execute(execute: &[*mut c_void]) -> u32 {
-    let info: HashMap<usize, (u32, u32)> = heaps(|m| m.iter().map(|(k, h)| (*k, (h.num, h.ty))).collect());
+    let info: HashMap<usize, (u32, u32)> = heaps(|m| m.iter().map(|(k, h)| (*k, (h.console, h.ty))).collect());
     if info.is_empty() {
         return 0;
     }
@@ -1018,7 +1190,8 @@ pub unsafe fn sync_for_execute(execute: &[*mut c_void]) -> u32 {
 
 #[no_mangle]
 pub unsafe extern "system" fn TomBoxTitleHeapRegister(heap: usize, memory: u64, desc: u64, family: u32) -> i32 {
-    register(heap, memory, desc, family)
+    // This path creates the PC heap with the console count, so every slot has a host slot.
+    register(heap, memory, desc, family, (desc >> 32) as u32)
 }
 
 #[no_mangle]
@@ -1181,7 +1354,12 @@ mod tests {
         let memory = 0x7700_0000_0000u64;
         let (cpu, gpu, inc, num) = (0x5500_0000usize, 0x6600_0000_0000u64, 32u32, 64u32);
         heaps(|m| {
-            m.insert(0xabc0, Heap { device: 0, memory, slot0: first_slot(memory, 0), ty: 0, num, family: 0, cpu: cpu as u64, gpu, inc, raw: vec![0; num as usize * 8], written: vec![0; num as usize], kinds: vec![KIND_SRV; num as usize] });
+            m.insert(0xabc0, Heap {
+                device: 0, memory, slot0: first_slot(memory, 0), ty: 0, console: num, host: num, family: 0, cpu: cpu as u64, gpu, inc,
+                raw: vec![0; num as usize * 8], written: vec![0; num as usize], kinds: vec![KIND_SRV; num as usize],
+                pages: vec![NO_PAGE; num.div_ceil(PAGE_SLOTS) as usize], stolen: vec![false; num.div_ceil(PAGE_SLOTS) as usize],
+                null_slot: u32::MAX, unhosted: 0,
+            });
         });
         crate::bindtrace::note_heap_inc(cpu, gpu, num, inc as usize);
         let mut view = [0u8; 40];
@@ -1470,7 +1648,7 @@ mod tests {
         let (l1, l2, l3, l4, bundle, l6) = (0x7171_0010usize, 0x7171_0020, 0x7171_0030, 0x7171_0040, 0x7171_0050, 0x7171_0060);
         let ex = |l: &[usize]| unsafe { sync_for_execute(&l.iter().map(|&x| x as *mut c_void).collect::<Vec<_>>()) };
         unsafe {
-            assert_eq!(register(heap, memory, 8u64 << 32, FAMILY_SCARLETT), 0);
+            assert_eq!(register(heap, memory, 8u64 << 32, FAMILY_SCARLETT, 8), 0);
             assert!(note_root_signature(rs, &rts0(0, &[(2, 1, 0), (1, 1, u32::MAX), (0, u32::MAX, u32::MAX)])));
             assert!(note_root_signature(rs_all_srv, &rts0(0, &[(0, u32::MAX, 0)])));
             assert!(note_root_signature(rs_direct, &rts0(0x400, &[])));
@@ -1530,7 +1708,7 @@ mod tests {
             assert_eq!(translate(0x40), 0x40);
             assert!(forget(heap));
             assert_eq!(ex(&[l6]), 0);
-            assert_eq!(register(0, memory, 0, 0), E_INVALIDARG);
+            assert_eq!(register(0, memory, 0, 0, 0), E_INVALIDARG);
         }
     }
 
@@ -1545,7 +1723,7 @@ mod tests {
         smem[2] = [0, 0, 1 << 20, 3 << 30 | 1];
         smem[17] = [0.25f32.to_bits(), 0.5f32.to_bits(), 0.75f32.to_bits(), 1.0f32.to_bits()];
         unsafe {
-            assert_eq!(register(sh, base, 1 | 2u64 << 32, FAMILY_ONE), 0);
+            assert_eq!(register(sh, base, 1 | 2u64 << 32, FAMILY_ONE, 2), 0);
             assert_eq!(locate(base), None);
             assert_eq!(locate(base + 0x10 + 16).map(|x| (x.1, x.2)), Some((1, 0xa000_0000 + 64)));
             let list = 0x7272_0010usize;
@@ -1652,3 +1830,137 @@ mod tests {
 #[cfg(test)]
 #[path = "title_heap_hw.rs"]
 mod hw_tests;
+
+/// The title asks for a 1,245,184-slot shader-visible heap; a PC D3D12 runtime stops at 1,000,000.
+/// These tests pin the translation: identity below the ceiling, a real host slot above it, no host
+/// slot ever outside the PC heap, and nothing that could alias a live descriptor.
+#[cfg(test)]
+mod descriptor_capacity_tests {
+    use super::*;
+
+    const CONSOLE: u32 = 1_245_184;
+    const HOST: u32 = HOST_DESCRIPTOR_LIMIT;
+
+    fn heap(console: u32, host: u32) -> Heap {
+        let memory = 0x4c61_0000u64;
+        Heap {
+            device: 0,
+            memory,
+            slot0: first_slot(memory, 0),
+            ty: 0,
+            console,
+            host,
+            family: FAMILY_SCARLETT,
+            cpu: 0x1000_0000,
+            gpu: 0x7f00_0000_0000,
+            inc: 32,
+            raw: vec![0; console as usize * 8],
+            written: vec![0; console as usize],
+            kinds: vec![KIND_SRV; console as usize],
+            pages: vec![NO_PAGE; console.div_ceil(PAGE_SLOTS) as usize],
+            stolen: vec![false; host.div_ceil(PAGE_SLOTS) as usize],
+            null_slot: if host < console { host - 1 } else { u32::MAX },
+            unhosted: 0,
+        }
+    }
+
+    #[test]
+    fn the_console_heap_is_larger_than_the_host_heap() {
+        assert!(CONSOLE > HOST, "the case this translation exists for");
+        assert_eq!(HOST, 1_000_000, "D3D12 tier-2 shader-visible CBV/SRV/UAV ceiling");
+    }
+
+    #[test]
+    fn every_slot_below_the_ceiling_is_identity() {
+        let mut h = heap(CONSOLE, HOST);
+        assert_eq!(h.host_slot(0), Some(0));
+        assert_eq!(h.host_slot(1), Some(1));
+        assert_eq!(h.host_slot(999_998), Some(999_998));
+        assert_eq!(h.host_slot(999_999), None, "reserved for the null table");
+    }
+
+    /// A console descriptor above the host ceiling gets a host slot of its own: not clamped to the
+    /// last slot, and not aliased onto a descriptor the title may be using.
+    #[test]
+    fn a_descriptor_above_the_host_ceiling_is_translated_into_a_real_host_slot() {
+        let mut h = heap(CONSOLE, HOST);
+        let high = h.host_slot(CONSOLE - 1).expect("the last console descriptor is hosted");
+        assert!(high < HOST, "host slot {high} must be inside the PC heap");
+        assert_ne!(high, 999_999);
+        let first = h.host_slot(1_000_000).expect("first descriptor above the ceiling");
+        assert!(first < HOST);
+        assert_eq!(h.host_slot(1_000_001), Some(first + 1), "one console page is one host page");
+        assert!(h.host_slot(CONSOLE - 1) != h.host_slot(1_000_000), "different descriptors never share a host slot");
+    }
+
+    /// The host page handed to a console page past the ceiling belonged to console descriptors that
+    /// were never written. If the title later uses one of those descriptors it gets a host page of
+    /// its own; it never reads the descriptor that took its page.
+    #[test]
+    fn a_remapped_page_does_not_alias_the_console_slots_it_was_taken_from() {
+        let mut h = heap(CONSOLE, HOST);
+        let high = h.host_slot(1_000_000).unwrap();
+        let stolen_page = high >> PAGE_SHIFT;
+        let identity_slot = stolen_page << PAGE_SHIFT;
+        assert!(h.stolen[stolen_page as usize]);
+        let own = h.host_slot(identity_slot).expect("its own descriptor is still hosted somewhere");
+        assert_ne!(own, high, "console slot {identity_slot} must not read console 1000000's descriptor");
+        assert_eq!(own & (PAGE_SLOTS - 1), 0, "a page-aligned descriptor stays page-aligned");
+        assert!(own < HOST);
+    }
+
+    #[test]
+    fn no_host_slot_is_ever_outside_the_heap() {
+        let mut h = heap(CONSOLE, HOST);
+        for console in (0..CONSOLE).step_by(997) {
+            if let Some(slot) = h.host_slot(console) {
+                assert!(slot < HOST, "console {console} -> host {slot} is outside the {HOST}-slot heap");
+            }
+        }
+        for console in [1_000_000, 1_000_001, 1_100_000, 1_200_000, CONSOLE - 1] {
+            if let Some(slot) = h.host_slot(console) {
+                assert!(slot < HOST);
+            }
+        }
+    }
+
+    #[test]
+    fn a_table_that_fits_in_one_remapped_page_is_contiguous() {
+        let mut h = heap(CONSOLE, HOST);
+        let first = 1_000_016;
+        let base = h.range_host(first, 8).expect("a table inside one page");
+        let slot = h.host_slot(first).unwrap();
+        assert_eq!(base, h.gpu + slot as u64 * 32);
+        for k in 0..8u32 {
+            assert_eq!(h.host_slot(first + k), Some(slot + k));
+        }
+    }
+
+    #[test]
+    fn a_table_that_cannot_be_hosted_contiguously_is_refused() {
+        let mut h = heap(CONSOLE, HOST);
+        // starts in the last identity page and ends in a remapped one
+        assert_eq!(h.range_host(999_996, 16), None);
+    }
+
+    #[test]
+    fn the_null_table_is_a_real_handle_inside_the_heap() {
+        let h = heap(CONSOLE, HOST);
+        assert_eq!(h.null_slot, HOST - 1);
+        let null = h.null_handle();
+        assert!(null >= h.gpu);
+        assert!(null < h.gpu + HOST as u64 * 32);
+        let same = heap(HOST, HOST);
+        assert_eq!(same.null_slot, u32::MAX, "a heap the host can hold keeps every slot");
+    }
+
+    #[test]
+    fn a_heap_the_host_can_hold_has_no_remap_and_loses_nothing() {
+        let mut h = heap(HOST, HOST);
+        for console in (0..HOST).step_by(4093) {
+            assert_eq!(h.host_slot(console), Some(console));
+        }
+        assert_eq!(h.host_slot(HOST), None);
+        assert!(!h.stolen.iter().any(|s| *s));
+    }
+}

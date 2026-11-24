@@ -168,7 +168,7 @@ unsafe extern "system" fn check_feature_support(
 /// development host: 1,000,000 accepted, 1,000,001 refused with E_INVALIDARG,
 /// while the same size without the shader-visible flag is accepted. The console
 /// has no such limit - GTA VI asks for a 1,245,184-slot heap.
-pub(crate) const PC_MAX_SHADER_VISIBLE_CBV_SRV_UAV: u32 = 1_000_000;
+pub(crate) const PC_MAX_SHADER_VISIBLE_CBV_SRV_UAV: u32 = crate::title_heap::HOST_DESCRIPTOR_LIMIT;
 
 /// For a descriptor heap the host refused with E_INVALIDARG, the size to retry
 /// with. `desc` is `{ Type, NumDescriptors, Flags, NodeMask }`. Only the one

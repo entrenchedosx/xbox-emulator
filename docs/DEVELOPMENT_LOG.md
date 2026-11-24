@@ -4,6 +4,36 @@ Reverse chronological. Each entry: what was done, evidence, blockers, next actio
 
 ---
 
+## 2026-11-24 — GTA VI: descriptors past the host heap ceiling, literal sampler bank
+
+- **Descriptor ceiling.** GTA VI creates one shader-visible CBV/SRV/UAV heap with 1,245,184
+  descriptors. A PC D3D12 runtime refuses a shader-visible heap above 1,000,000
+  (`D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2`). Until now the heap was retried at the
+  ceiling and the title kept addressing the missing tail, so a console handle at or above the PC
+  size was sent to the driver untranslated — the invalid-descriptor path that ended in the GPU hang.
+- **Fix.** `title_heap` now keeps the title's slot count (`console`) separate from the PC heap's
+  (`host`), recognises the full console range, and maps console pages past the ceiling onto host
+  pages the title never wrote (page size 1024, no aliasing: a page given away is no longer the
+  identity page of its own console slots). A table that cannot be hosted as one contiguous range
+  binds a reserved null descriptor at the end of the host heap and increments
+  `UNREPRESENTABLE_TABLES`; a console address is never handed to the driver. `HOST_DESCRIPTOR_LIMIT`
+  is the single definition of the ceiling (the heap-retry code uses it too).
+- **Evidence.** `cargo test -p d3d12_xs --lib` → 714 passed, 1 failed (the console-DLL oracle test,
+  which needs `D:\xbox-pc-port\games`; not present on this host). Nine new tests in
+  `title_heap::descriptor_capacity_tests` cover identity below the ceiling, a real host slot above it,
+  no host slot outside the heap, non-aliasing, table contiguity and the null table.
+- **Literal samplers.** A shader that builds its S# in SGPRs has no sampler in the title's root
+  signature. Every title root signature now carries a bank of 116 static samplers in register space
+  70000, and the translator binds the entry that decodes to the shader's S#. `cargo test -p
+  tombox-xshader` unit tests (124) and the DXC integration test `literal_sampler` pass; unrepresented
+  S# combinations are rejected, not guessed (`TOMBOX_LITSAMP_LOG` records them).
+- **Blocker.** Direct heap indexing (`ResourceDescriptorHeap[tb_bi/32]`) still carries the console
+  index, so a descriptor *above* the ceiling that a shader indexes directly needs a shader-side
+  remap (root CBV page table). The host-side translation and the safety gate are in place; the
+  shader ABI change is next.
+
+---
+
 ## 2026-11-21 — past "Checking for updates": login complete, game-mode select
 
 - Backend body logging showed the client requests `grant_type=client_credentials&token_type=eg1`;
