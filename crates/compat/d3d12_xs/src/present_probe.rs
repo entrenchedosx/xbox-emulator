@@ -263,10 +263,22 @@ fn guard() -> std::sync::MutexGuard<'static, Probe> {
 
 pub unsafe fn on_present(src: *mut c_void, plane_count: u32, planes: *const u8) {
     let schedule = schedule();
+    let n = PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if crate::rtcap::enabled() && (n <= 3 || n % 60 == 0) {
+        let draws = crate::rtcap::frame_draws();
+        record(
+            "d3d12_xs",
+            "PresentX.draws",
+            &format!(
+                "present {n} src={src:p} {} | {}",
+                crate::rtcap::label(src as usize),
+                draw_summary(&draws, src as usize, &|r| crate::rtcap::label(r))
+            ),
+        );
+    }
     if schedule == Schedule::Off {
         return;
     }
-    let n = PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
     if !schedule.due(n) {
         return;
     }

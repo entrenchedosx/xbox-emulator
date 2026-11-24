@@ -4,6 +4,34 @@ Reverse chronological. Each entry: what was done, evidence, blockers, next actio
 
 ---
 
+## 2026-11-24 — GTA VI live: no hang, but the title's backbuffer is empty
+
+- **Runs.** Rebuilt `d3d12_xs` with the descriptor translation, the literal sampler bank and a
+  `PresentX.draws` diagnostic. Ran the original `game_scarlett_master.exe` for 120 s and 250 s
+  (`mdbg`, 3840x2160, offline). Both runs ended on the time limit with **no GPU hang, no device
+  removal and no unhandled exception**.
+- **Descriptor ceiling, exercised by the title.** It creates the 1,245,184-slot heap and at t≈7 s
+  writes console pages 976+ (descriptors ≥ 999,424). The log shows page 976 → host page 358,
+  977 → 357, … 1004 → 330: real remapping, not a clamp. No console address reached the driver and
+  no table needed the null fallback in this run. 600 and 1500 frames were presented.
+- **The black screen is now measured, not assumed.** GPU readback (`TOMBOX_PRESENT_SNAP`): the
+  title's presentation texture is **0 of 8,294,400 pixels non-black at frames 1, 10, 30, 60, 400 and
+  1500** (one distinct row). The presented swapchain holds only the emulator's FPS overlay
+  (~0.3%, 13,611–30,950 pixels); `PresentX.draws` reports `draws=0 draws_into_presented=0` for the
+  first present. The title presents a texture it never draws into — the copy to the swapchain is
+  correct, the source is empty.
+- **Translator blocker.** Two shaders fail: `translate: constant-buffer MUBUF form unsupported
+  [buffer_load_format_xy @ 0x60]` (hash `aa564c879df9c2c3`) and the same at 0x1c0 (hash
+  `eac983a93adb437b`). A format load takes its DFMT/NFMT from the V#; a raw PC root CBV has no
+  format, so the binding has to carry it (or the shader needs a typed buffer view).
+- **PSO blocker.** 31 native stream PSOs are rejected by the driver with `E_INVALIDARG`
+  (`subs=[… 15:0x18/0x1a …]`). In 250 s the title also compiled 25,528 PSOs while hitting 25,487
+  cached ones, so its pipeline set is still far from warm.
+- **Next.** Fix the format-load-on-CBV binding, then re-measure `draws_into_presented`; separately
+  decode one rejected stream PSO and compare it with the same stream compiled by the cached path.
+
+---
+
 ## 2026-11-24 — GTA VI: descriptors past the host heap ceiling, literal sampler bank
 
 - **Descriptor ceiling.** GTA VI creates one shader-visible CBV/SRV/UAV heap with 1,245,184
