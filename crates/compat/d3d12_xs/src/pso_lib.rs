@@ -177,6 +177,18 @@ unsafe fn cstr<'a>(p: u64) -> Option<&'a [u8]> {
     None
 }
 
+unsafe fn hash_input_layout(h: &mut Hasher, elements: u64, count: usize) -> Option<()> {
+    if count > 64 || (elements == 0 && count != 0) {
+        return None;
+    }
+    for i in 0..count {
+        let e = unsafe { bytes(elements + (i * 0x20) as u64, 0x20) };
+        h.feed(unsafe { cstr(rd64(e, 0)) }?);
+        h.feed(&e[8..0x20]);
+    }
+    Some(())
+}
+
 pub unsafe fn gfx_key(desc: &[u8], root: u64, mode: &str) -> Option<u128> {
     if desc.len() < GFX_DESC {
         return None;
@@ -212,15 +224,7 @@ pub unsafe fn gfx_key(desc: &[u8], root: u64, mode: &str) -> Option<u128> {
         return None;
     }
     h.feed(unsafe { bytes(st, st_n * 4) });
-    let (il, il_n) = (rd64(desc, 0x228), rd32(desc, 0x230) as usize);
-    if il_n > 64 || (il == 0 && il_n != 0) {
-        return None;
-    }
-    for i in 0..il_n {
-        let e = unsafe { bytes(il + (i * 0x20) as u64, 0x20) };
-        h.feed(unsafe { cstr(rd64(e, 0)) }?);
-        h.feed(&e[8..0x20]);
-    }
+    unsafe { hash_input_layout(&mut h, rd64(desc, 0x228), rd32(desc, 0x230) as usize) }?;
     Some(h.done())
 }
 
@@ -251,6 +255,43 @@ pub fn stream_key(gfx: u128, extra: &str) -> u128 {
     h.feed(&gfx.to_le_bytes());
     h.feed(extra.as_bytes());
     h.done()
+}
+
+/// Fingerprint the final PC stream. Addresses and record alignment padding
+/// change across launches, so hash what each supported subobject describes.
+unsafe fn native_stream_key(stream: &[u8]) -> Option<u128> {
+    let mut h = Hasher::new();
+    h.feed(b"native stream");
+    for (ty, at) in crate::mesh_pso::parse(stream).ok()? {
+        let (_, len) = crate::mesh_pso::inner_layout(ty)?;
+        let d = stream.get(at..at + len)?;
+        h.feed(&ty.to_le_bytes());
+        match ty {
+            0 => h.feed(&root_hash(rd64(d, 0))?.to_le_bytes()),
+            1..=6 | 24 | 25 => {
+                let (ptr, size) = (rd64(d, 0), rd64(d, 8) as usize);
+                if size > 64 << 20 || (ptr == 0 && size != 0) {
+                    return None;
+                }
+                h.feed(&fnv64(unsafe { bytes(ptr, size) }).to_le_bytes());
+            }
+            12 => unsafe { hash_input_layout(&mut h, rd64(d, 0), rd32(d, 8) as usize) }?,
+            // Let CreatePipelineState validate any caller-supplied driver blob.
+            19 if rd64(d, 0) != 0 || rd64(d, 8) != 0 => return None,
+            22 => {
+                let (count, locations) = (rd32(d, 0) as usize, rd64(d, 8));
+                if count > 4 || (count != 0 && locations == 0) {
+                    return None;
+                }
+                h.feed(&d[16..20]);
+                h.feed(unsafe { bytes(locations, count * 8) });
+            }
+            8..=11 | 13..=21 | 26..=28 => h.feed(d),
+            // Unrecognized or unsupported pointer-bearing records bypass the cache.
+            _ => return None,
+        }
+    }
+    Some(h.done())
 }
 
 struct RootInfo {
@@ -395,6 +436,7 @@ pub fn on_create_hr(hr: i32, had_blob: bool) -> OnCreate {
 }
 
 struct Lib {
+    device: usize,
     lib: usize,
     rw: RwLock<()>,
     path: std::path::PathBuf,
@@ -467,7 +509,7 @@ unsafe fn open(real: *mut c_void) -> Option<Lib> {
         path.display(), blob.len(), t0.elapsed().as_secs_f64() * 1000.0, unsafe { luid(real) }, ident, note.map(|n| format!("; {n}")).unwrap_or_default()));
     SAVED_AT.store(now_s(), Relaxed);
     register_exit_save();
-    Some(Lib { lib, rw: RwLock::new(()), path, ident, rejected: Mutex::new(HashSet::new()), stored: Mutex::new(HashSet::new()) })
+    Some(Lib { device: real as usize, lib, rw: RwLock::new(()), path, ident, rejected: Mutex::new(HashSet::new()), stored: Mutex::new(HashSet::new()) })
 }
 
 fn now_s() -> u64 {
@@ -475,7 +517,7 @@ fn now_s() -> u64 {
 }
 
 fn lib(real: *mut c_void) -> Option<&'static Lib> {
-    LIB.get_or_init(|| unsafe { open(real) }).as_ref()
+    LIB.get_or_init(|| unsafe { open(real) }).as_ref().filter(|l| l.device == real as usize)
 }
 
 pub fn warm(real: *mut c_void, wrapper: *mut c_void) {
@@ -651,7 +693,7 @@ pub(crate) unsafe fn prebuild(real: *mut c_void, kind: u8, k: u128, desc: &[u8])
     let gfx = kind == crate::pso_prewarm::GFX;
     let mut pso: *mut c_void = core::ptr::null_mut();
     let l = match LIB.get() {
-        Some(Some(l)) => Some(l),
+        Some(Some(l)) if l.device == real as usize => Some(l),
         _ => None,
     };
     let rejected = l.is_some_and(|l| l.rejected.lock().unwrap_or_else(|e| e.into_inner()).contains(&k));
@@ -707,11 +749,23 @@ pub unsafe fn stream(real: *mut c_void, desc: &[u8], extra: &str, sd: *const [us
         return create();
     }
     let key = root_hash(rd64(desc, 0)).and_then(|r| unsafe { gfx_key(desc, r, mode_tag()) }).map(|g| stream_key(g, extra));
+    unsafe { run_stream(key, real, sd, riid, ppv, create) }
+}
+
+pub(crate) unsafe fn native_stream(real: *mut c_void, stream: &[u8], sd: *const [usize; 2], riid: *const Guid, ppv: *mut *mut c_void, create: &dyn Fn() -> i32) -> i32 {
+    if !enabled() {
+        return create();
+    }
+    let key = unsafe { native_stream_key(stream) };
+    unsafe { run_stream(key, real, sd, riid, ppv, create) }
+}
+
+unsafe fn run_stream(key: Option<u128>, real: *mut c_void, sd: *const [usize; 2], riid: *const Guid, ppv: *mut *mut c_void, create: &dyn Fn() -> i32) -> i32 {
     let load = |lib: usize, name: *const u16| -> i32 {
         let f: unsafe extern "system" fn(*mut c_void, *const u16, *const [usize; 2], *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(lib as *mut c_void, LIB_LOAD_STREAM)) };
         unsafe { f(lib as *mut c_void, name, sd, riid, ppv) }
     };
-    unsafe { run(key, None, real, desc, None, riid, ppv, &load, &|_| create()) }
+    unsafe { run(key, None, real, &[], None, riid, ppv, &load, &|_| create()) }
 }
 
 fn save(exiting: bool) -> Result<String, String> {
@@ -845,6 +899,48 @@ mod tests {
 
     fn wr64(d: &mut [u8], o: usize, v: u64) {
         d[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    #[test]
+    fn native_stream_key_uses_shader_and_input_content_across_launches() {
+        let build = |shader: &[u8], element: &[u8]| {
+            let mut stream = [0u8; 56];
+            stream[0] = 1; // VS
+            wr64(&mut stream, 8, shader.as_ptr() as u64);
+            wr64(&mut stream, 16, shader.len() as u64);
+            stream[24] = 12; // Input layout
+            wr64(&mut stream, 32, element.as_ptr() as u64);
+            stream[40] = 1;
+            stream[48] = 14; // Primitive topology
+            stream[52] = 3;
+            stream
+        };
+        let shader = vec![1, 2, 3];
+        let same_shader = shader.clone();
+        let mut name = b"POSITION\0".to_vec();
+        let same_name = name.clone();
+        let mut element = [0u8; 32];
+        wr64(&mut element, 0, name.as_ptr() as u64);
+        let mut same_element = element;
+        wr64(&mut same_element, 0, same_name.as_ptr() as u64);
+        let key = unsafe { native_stream_key(&build(&shader, &element)) }.unwrap();
+        let mut stream = build(&same_shader, &same_element);
+        stream[4] = 0xff; // Alignment padding varies independently of the description.
+        assert_eq!(unsafe { native_stream_key(&stream) }, Some(key));
+        stream[52] = 2;
+        assert_ne!(unsafe { native_stream_key(&stream) }, Some(key));
+        assert_ne!(unsafe { native_stream_key(&build(&[4, 5, 6], &element)) }, Some(key));
+        name[0] = b'N';
+        assert_ne!(unsafe { native_stream_key(&build(&shader, &element)) }, Some(key));
+    }
+
+    #[test]
+    fn native_stream_cache_leaves_caller_driver_blobs_to_the_native_api() {
+        let mut stream = [0u8; 24];
+        stream[0] = 19; // Cached PSO
+        assert!(unsafe { native_stream_key(&stream) }.is_some());
+        stream[16] = 1;
+        assert_eq!(unsafe { native_stream_key(&stream) }, None);
     }
 
     #[test]

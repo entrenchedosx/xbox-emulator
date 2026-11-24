@@ -594,9 +594,9 @@ pub(crate) unsafe fn create_translated_stream(real: *mut c_void, out: &[u8], rii
         return hr;
     }
     let vt2 = *(dev2 as *const *const usize);
-    let f: unsafe extern "system" fn(*mut c_void, *const [u64; 2], *const c_void, *mut *mut c_void) -> i32 = core::mem::transmute(*vt2.add(PC_DEVICE2_CREATE_PIPELINE_STATE));
-    let d = [out.len() as u64, out.as_ptr() as u64];
-    let hr = {
+    let f: unsafe extern "system" fn(*mut c_void, *const [usize; 2], *const c_void, *mut *mut c_void) -> i32 = core::mem::transmute(*vt2.add(PC_DEVICE2_CREATE_PIPELINE_STATE));
+    let d = [out.len(), out.as_ptr() as usize];
+    let hr = crate::pso_lib::native_stream(real, out, &d, riid.cast(), ppv, &|| {
         // Startup jobs can reach the driver together even when their DXIL is cached.
         // Limit only the driver compilation. Translation and GPU execution can continue.
         static SCARLETT_COMPILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -606,7 +606,7 @@ pub(crate) unsafe fn create_translated_stream(real: *mut c_void, out: &[u8], rii
             SCARLETT_COMPILE.lock().unwrap_or_else(|e| e.into_inner())
         });
         f(dev2, &d, riid, ppv)
-    };
+    });
     if hr < 0 {
         record("d3d12_xs", "CreatePipelineState", &format!("PC driver rejected stream hr={hr:#010x} subs=[{}]", stream_summary(out)));
         if hr == E_INVALIDARG && std::env::var_os("TOMBOX_PSO_PROBE_DUMP").is_some() {
@@ -624,7 +624,7 @@ pub(crate) unsafe fn create_translated_stream(real: *mut c_void, out: &[u8], rii
 /// Enabled by TOMBOX_PSO_PROBE_DUMP. Any pipeline the probe creates is released at once.
 unsafe fn probe_rejected_stream(
     dev2: *mut c_void,
-    create: unsafe extern "system" fn(*mut c_void, *const [u64; 2], *const c_void, *mut *mut c_void) -> i32,
+    create: unsafe extern "system" fn(*mut c_void, *const [usize; 2], *const c_void, *mut *mut c_void) -> i32,
     out: &[u8],
     riid: *const c_void,
 ) {
@@ -664,7 +664,7 @@ unsafe fn probe_rejected_stream(
         let mut v = Vec::with_capacity(out.len());
         v.extend_from_slice(&out[..start]);
         v.extend_from_slice(&out[end..]);
-        let d = [v.len() as u64, v.as_ptr() as u64];
+        let d = [v.len(), v.as_ptr() as usize];
         let mut pso: *mut c_void = core::ptr::null_mut();
         let hr = create(dev2, &d, riid, &mut pso);
         if hr >= 0 && !pso.is_null() {
@@ -691,7 +691,7 @@ unsafe fn probe_rejected_stream(
                 v[o..o + 36].fill(0);
             }
         }
-        let d = [v.len() as u64, v.as_ptr() as u64];
+        let d = [v.len(), v.as_ptr() as usize];
         let mut pso: *mut c_void = core::ptr::null_mut();
         let hr = create(dev2, &d, riid, &mut pso);
         if hr >= 0 && !pso.is_null() {
