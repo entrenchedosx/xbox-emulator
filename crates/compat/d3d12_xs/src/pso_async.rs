@@ -143,13 +143,21 @@ fn budget() -> std::time::Duration {
 
 type Job = Box<dyn FnOnce() + Send>;
 
+fn worker_count(cores: usize, eager: bool, limit: Option<usize>) -> usize {
+    let available = cores.saturating_sub(2).clamp(1, 6);
+    limit.filter(|&n| n > 0).unwrap_or(if eager { available } else { 1 }).min(available)
+}
+
 fn pool() -> &'static Mutex<std::sync::mpsc::Sender<Job>> {
     static P: OnceLock<Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
     P.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        for _ in 0..cores.saturating_sub(2).clamp(1, 6) {
+        let limit = std::env::var("TOMBOX_PSO_ASYNC_WORKERS").ok().and_then(|s| s.trim().parse().ok());
+        let workers = worker_count(cores, crate::shader_xlat::eager_startup_compilation(), limit);
+        record("d3d12_xs", "pso_async", &format!("starting {workers} pipeline build worker(s) on {cores} logical CPU(s)"));
+        for _ in 0..workers {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name("tombox-pso-async".into()).stack_size(64 << 20).spawn(move || loop {
                 let job = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
@@ -783,6 +791,16 @@ pub fn install(vt: &[AtomicUsize]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_worker_count_leaves_capacity_for_the_title() {
+        assert_eq!(worker_count(12, false, None), 1);
+        assert_eq!(worker_count(12, false, Some(2)), 2);
+        assert_eq!(worker_count(12, false, Some(0)), 1);
+        assert_eq!(worker_count(12, true, None), 6);
+        assert_eq!(worker_count(4, false, Some(6)), 2);
+        assert_eq!(worker_count(2, true, None), 1);
+    }
 
     fn desc() -> Vec<u8> {
         let mut d = vec![0u8; DESC_SIZE];

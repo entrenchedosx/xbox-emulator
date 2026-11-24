@@ -549,6 +549,11 @@ pub(crate) fn title_name_pub() -> String {
     title_name()
 }
 
+pub(crate) fn eager_startup_compilation() -> bool {
+    static EAGER: OnceLock<bool> = OnceLock::new();
+    *EAGER.get_or_init(|| !title_name().eq_ignore_ascii_case("game_scarlett_master"))
+}
+
 fn title_name() -> String {
     std::env::current_exe().ok().and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned())).unwrap_or_else(|| "title".into())
 }
@@ -827,8 +832,12 @@ fn prewarm_workers(cores: usize, from_game: usize) -> usize {
 pub fn start_prewarm() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        if std::env::var("TOMBOX_SHADER_PREWARM").map(|v| v == "0").unwrap_or(false) {
-            record("d3d12_xs", "shader_xlat", "prewarm disabled (TOMBOX_SHADER_PREWARM=0)");
+        let game_on = std::env::var("TOMBOX_GAME_SCAN_PREWARM").is_ok_and(|v| v.trim() == "1");
+        let prewarm = std::env::var("TOMBOX_SHADER_PREWARM")
+            .map(|v| v.trim() != "0")
+            .unwrap_or_else(|_| eager_startup_compilation() || game_on);
+        if !prewarm {
+            record("d3d12_xs", "shader_xlat", "startup shader prewarm is off; the disk shader cache is used on demand (TOMBOX_SHADER_PREWARM=1 enables prewarm)");
             return;
         }
         let _ = fma_mode();
@@ -859,7 +868,6 @@ pub fn start_prewarm() {
             }
         }
         let known = todo.len();
-        let game_on = std::env::var("TOMBOX_GAME_SCAN_PREWARM").map(|v| v.trim() == "1").unwrap_or(false);
         if let Some(rd) = game_on.then(|| std::fs::read_dir(&game).ok()).flatten() {
             let mut names: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
             names.sort();
@@ -947,7 +955,8 @@ fn helper_pool() -> &'static Mutex<std::sync::mpsc::Sender<Job>> {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        for _ in 0..cores.saturating_sub(2).clamp(1, 8) {
+        let workers = if eager_startup_compilation() { cores.saturating_sub(2).clamp(1, 8) } else { 1 };
+        for _ in 0..workers {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name("tombox-shader-stage".into()).spawn(move || loop {
                 let job = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();

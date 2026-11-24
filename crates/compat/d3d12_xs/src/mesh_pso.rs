@@ -596,7 +596,17 @@ pub(crate) unsafe fn create_translated_stream(real: *mut c_void, out: &[u8], rii
     let vt2 = *(dev2 as *const *const usize);
     let f: unsafe extern "system" fn(*mut c_void, *const [u64; 2], *const c_void, *mut *mut c_void) -> i32 = core::mem::transmute(*vt2.add(PC_DEVICE2_CREATE_PIPELINE_STATE));
     let d = [out.len() as u64, out.as_ptr() as u64];
-    let hr = f(dev2, &d, riid, ppv);
+    let hr = {
+        // Startup jobs can reach the driver together even when their DXIL is cached.
+        // Limit only the driver compilation. Translation and GPU execution can continue.
+        static SCARLETT_COMPILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _compile = (!crate::shader_xlat::eager_startup_compilation()).then(|| {
+            static LOG: std::sync::Once = std::sync::Once::new();
+            LOG.call_once(|| record("d3d12_xs", "CreatePipelineState", "Scarlett stream PSO compilations run one at a time on the host"));
+            SCARLETT_COMPILE.lock().unwrap_or_else(|e| e.into_inner())
+        });
+        f(dev2, &d, riid, ppv)
+    };
     if hr < 0 {
         record("d3d12_xs", "CreatePipelineState", &format!("PC driver rejected stream hr={hr:#010x} subs=[{}]", stream_summary(out)));
         if hr == E_INVALIDARG && std::env::var_os("TOMBOX_PSO_PROBE_DUMP").is_some() {

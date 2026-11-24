@@ -53,9 +53,11 @@ pub fn enabled() -> bool {
     }
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
-        let on = std::env::var("TOMBOX_PSO_XREC").map(|v| v.trim() != "0").unwrap_or(true);
+        let on = std::env::var("TOMBOX_PSO_XREC")
+            .map(|v| v.trim() != "0")
+            .unwrap_or_else(|_| crate::shader_xlat::eager_startup_compilation());
         if !on {
-            record("d3d12_xs", "pso_xrec", "TOMBOX_PSO_XREC=0: title PSO creates are not recorded or replayed at boot");
+            record("d3d12_xs", "pso_xrec", "startup PSO journal replay and recording are off (TOMBOX_PSO_XREC=1 enables both)");
         }
         on && crate::pso_lib::enabled()
     })

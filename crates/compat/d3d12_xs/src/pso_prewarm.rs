@@ -45,9 +45,11 @@ extern "system" {
 pub fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
-        let on = std::env::var("TOMBOX_PSO_PREWARM_LIB").map(|v| v.trim() != "0").unwrap_or(true);
+        let on = std::env::var("TOMBOX_PSO_PREWARM_LIB")
+            .map(|v| v.trim() != "0")
+            .unwrap_or_else(|_| crate::shader_xlat::eager_startup_compilation());
         if !on {
-            record("d3d12_xs", "pso_prewarm", "TOMBOX_PSO_PREWARM_LIB=0: PSOs are not recorded or prewarmed from the pipeline library");
+            record("d3d12_xs", "pso_prewarm", "startup pipeline prewarm and recording are off; the pipeline library is queried on demand (TOMBOX_PSO_PREWARM_LIB=1 enables prewarm)");
         }
         on && crate::pso_lib::enabled()
     })
