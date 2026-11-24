@@ -242,6 +242,8 @@ pub fn sop1(op: u32) -> Option<&'static str> {
         0x27 => "s_andn2_saveexec_b64", 0x28 => "s_orn2_saveexec_b64", 0x29 => "s_nand_saveexec_b64",
         0x34 => "s_abs_i32", 0x37 => "s_andn1_saveexec_b64", 0x3c => "s_and_saveexec_b32",
         0x3d => "s_or_saveexec_b32", 0x3e => "s_xor_saveexec_b32", 0x3f => "s_andn2_saveexec_b32",
+        // closes each pass of a waterfall loop (non-uniform descriptor index): the lanes just served leave the pending set
+        0x47 => "s_andn2_wrexec_b32",
         _ => return None,
     })
 }

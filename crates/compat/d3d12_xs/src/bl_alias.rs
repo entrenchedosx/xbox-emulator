@@ -143,6 +143,32 @@ pub fn add_positional(body: &[u8], cbv_as_raw: bool) -> Result<Option<Vec<u8>>, 
     Ok((added > 0).then_some(out))
 }
 
+/// Give the root signature the bank of static samplers (`tombox_xshader::hlsl::litsamp`) the translator binds a sampler
+/// to when the console shader builds that sampler itself from constants. Static samplers the signature already has are
+/// kept. Returns `None` when the bank is already there.
+pub fn add_literal_samplers(body: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    use tombox_xshader::hlsl::litsamp;
+    let version = rd(body, 0)?;
+    if !(1..=3).contains(&version) {
+        return Err(format!("RTS0 version {version} is not supported"));
+    }
+    let stride = litsamp::rts0_stride(version);
+    let (n, off) = (rd(body, 12)? as usize, rd(body, 16)? as usize);
+    let existing: &[u8] = if n == 0 { &[] } else { body.get(off..off + n * stride).ok_or("RTS0 static samplers out of bounds")? };
+    for i in 0..n {
+        if rd(existing, i * stride + 44)? == litsamp::TB_LITSAMP_SPACE {
+            return Ok(None);
+        }
+    }
+    let mut out = body.to_vec();
+    let new_off = out.len();
+    out.extend_from_slice(existing);
+    out.extend_from_slice(&litsamp::rts0_bytes(version));
+    wr(&mut out, 12, (n + litsamp::bank().len()) as u32);
+    wr(&mut out, 16, new_off as u32);
+    Ok(Some(out))
+}
+
 pub fn replace_rts0(blob: &[u8], body: &[u8]) -> Result<Vec<u8>, String> {
     if blob.get(0..4) != Some(b"DXBC") {
         return Ok(body.to_vec());
@@ -314,5 +340,34 @@ mod positional_tests {
     fn sampler_tables_stay_sampler_only() {
         assert!(add_positional(&table_rts0(&[3]), true).unwrap().is_none());
         assert!(add_positional(&table_rts0(&[]), true).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_literal_sampler_bank_is_appended_once_and_the_titles_own_static_samplers_are_kept() {
+        use tombox_xshader::hlsl::litsamp;
+        let w = |b: &mut Vec<u8>, o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        // root signature 1.1 with no parameters and one static sampler of the title's at s7
+        let mut b = vec![0u8; 24 + 52];
+        w(&mut b, 0, 2);
+        w(&mut b, 8, 24);
+        w(&mut b, 12, 1);
+        w(&mut b, 16, 24);
+        w(&mut b, 24 + 40, 7);
+        let out = add_literal_samplers(&b).unwrap().expect("bank added");
+        let bank = litsamp::bank().len();
+        assert_eq!(rd(&out, 12).unwrap() as usize, 1 + bank);
+        let off = rd(&out, 16).unwrap() as usize;
+        assert_eq!(rd(&out, off + 40).unwrap(), 7, "the title's own sampler comes first, untouched");
+        let last = off + bank * 52;
+        assert_eq!((rd(&out, last + 40).unwrap() as usize, rd(&out, last + 44).unwrap()), (bank - 1, litsamp::TB_LITSAMP_SPACE));
+        assert_eq!(out.len(), b.len() + (1 + bank) * 52);
+        assert!(add_literal_samplers(&out).unwrap().is_none(), "already there");
+        let mut v3 = vec![0u8; 24];
+        w(&mut v3, 0, 3);
+        w(&mut v3, 8, 24);
+        w(&mut v3, 16, 24);
+        let out = add_literal_samplers(&v3).unwrap().expect("bank added to a 1.2 signature");
+        assert_eq!(out.len(), 24 + bank * 56);
+        assert!(add_literal_samplers(&[0u8; 8]).is_err());
     }
 }

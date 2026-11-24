@@ -32,6 +32,8 @@ mod global;
 mod sval;
 mod centroid;
 mod durango;
+pub mod litsamp;
+pub use litsamp::TB_LITSAMP_SPACE;
 mod mixed;
 mod mimg_d16;
 mod atomic;
@@ -660,6 +662,14 @@ struct Emitter<'a> {
 const OP_WAVE_REDUCE: u32 = 0x7ff0;
 
 const BINDLESS: u32 = 0x8000_0000;
+/// Bit position above which an `Indexed` binding carries the image dimension of a heap descriptor (see `implicit_heap_ptr`).
+const HEAP_VARIANT_SHIFT: u32 = 24;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeapKind {
+    Resource,
+    Sampler,
+}
 const RESOURCE_HEAP_DIRECTLY_INDEXED: u32 = 0x400;
 const SAMPLER_HEAP_DIRECTLY_INDEXED: u32 = 0x800;
 
@@ -1484,6 +1494,9 @@ impl<'a> Emitter<'a> {
         if let Some(k) = self.table_kind(sgpr) {
             return Some(k);
         }
+        if self.implicit_heap_ptr(sgpr) == Some(HeapKind::Resource) {
+            return Some(writes as u32);
+        }
         let (p, 0) = self.root_param_at(sgpr, self.user_base())? else { return None };
         match &self.ex.root_sig.as_ref()?.params.get(p)?.kind {
             crate::meta::RootParamKind::Table(r) if !r.is_empty() && r.iter().all(|x| x.range_type <= 1) => Some(writes as u32),
@@ -1603,6 +1616,15 @@ impl<'a> Emitter<'a> {
     }
 
     fn sgpr_const_in(insns: &[Insn], start: usize, idx: usize, reg: u8) -> Option<u32> {
+        Self::sgpr_const_at(insns, start, idx, reg, 0)
+    }
+
+    /// The constant `reg` holds before instruction `idx`, when the block builds it from literals with scalar ALU
+    /// instructions (`s_mov`, `s_movk`, `s_brev`, `s_not`, shifts, bitwise ops, adds) and copies of such registers.
+    fn sgpr_const_at(insns: &[Insn], start: usize, idx: usize, reg: u8, depth: u32) -> Option<u32> {
+        if depth > 6 {
+            return None;
+        }
         for j in (start..idx).rev() {
             let i = &insns[j];
             let wide = if i.enc == Enc::Smem && i.op <= 4 { 1u16 << i.op } else if i.mnemonic.ends_with("_b64") || i.mnemonic.ends_with("_u64") || i.mnemonic.ends_with("_i64") { 2 } else { 1 };
@@ -1610,10 +1632,29 @@ impl<'a> Emitter<'a> {
             if !hit {
                 continue;
             }
-            return match (i.mnemonic.as_str(), i.src.first()) {
-                ("s_movk_i32", _) => Some(i.aux.imm as i32 as u32),
-                ("s_mov_b32", Some(Opnd::ConstInt(v))) => Some(*v as u32),
-                ("s_mov_b32", Some(Opnd::Literal(v))) => Some(*v),
+            let src = |k: usize| -> Option<u32> {
+                match i.src.get(k)? {
+                    Opnd::ConstInt(v) => Some(*v as u32),
+                    Opnd::Literal(v) => Some(*v),
+                    Opnd::Sgpr(r) => Self::sgpr_const_at(insns, start, j, u8::try_from(*r).ok()?, depth + 1),
+                    _ => None,
+                }
+            };
+            if wide != 1 {
+                return None;
+            }
+            return match i.mnemonic.as_str() {
+                "s_movk_i32" => Some(i.aux.imm as i32 as u32),
+                "s_mov_b32" => src(0),
+                "s_brev_b32" => src(0).map(u32::reverse_bits),
+                "s_not_b32" => src(0).map(|v| !v),
+                "s_or_b32" => Some(src(0)? | src(1)?),
+                "s_and_b32" => Some(src(0)? & src(1)?),
+                "s_xor_b32" => Some(src(0)? ^ src(1)?),
+                "s_lshl_b32" => Some(src(0)? << (src(1)? & 31)),
+                "s_lshr_b32" => Some(src(0)? >> (src(1)? & 31)),
+                "s_add_u32" | "s_add_i32" => Some(src(0)?.wrapping_add(src(1)?)),
+                "s_sub_u32" | "s_sub_i32" => Some(src(0)?.wrapping_sub(src(1)?)),
                 _ => None,
             };
         }
@@ -1645,31 +1686,59 @@ impl<'a> Emitter<'a> {
     }
 
     fn direct_sampler_heap(&self, index: u32) -> bool {
-        let Some(root) = &self.ex.root_sig else { return false };
-        let Some(&(table, _)) = self.bl.get(index as usize) else { return false };
-        if self.ex.stage != Stage::Pixel || self.dg().is_some()
-            || root.flags & (RESOURCE_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED)
-                != SAMPLER_HEAP_DIRECTLY_INDEXED
-        {
-            return false;
+        let Some(&(table, _)) = self.bl.get((index & ((1 << HEAP_VARIANT_SHIFT) - 1)) as usize) else { return false };
+        self.implicit_heap_ptr(table) == Some(HeapKind::Sampler)
+    }
+
+    fn direct_resource_heap(&self, index: u32) -> bool {
+        let Some(&(table, _)) = self.bl.get((index & ((1 << HEAP_VARIANT_SHIFT) - 1)) as usize) else { return false };
+        self.implicit_heap_ptr(table) == Some(HeapKind::Resource)
+    }
+
+    /// With `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` and / or `SAMPLER_HEAP_DIRECTLY_INDEXED` in the root signature the
+    /// descriptor heaps themselves are handed to the shader as implicit 64-bit pointers in the user SGPRs that follow
+    /// the packed root arguments, the resource heap first. `table` is the SGPR a descriptor load reads from; the
+    /// load's SGPR offset is then a byte offset into that heap (32 bytes per resource, 16 per sampler).
+    fn implicit_heap_ptr(&self, table: u8) -> Option<HeapKind> {
+        let root = self.ex.root_sig.as_ref()?;
+        let res = root.flags & RESOURCE_HEAP_DIRECTLY_INDEXED != 0;
+        let samp = root.flags & SAMPLER_HEAP_DIRECTLY_INDEXED != 0;
+        if (!res && !samp) || self.dg().is_some() {
+            return None;
         }
-        // In this pixel ABI, the sole implicit heap pointer immediately follows the
-        // packed root arguments. S_LOAD takes a byte offset into 16-byte samplers.
         let base = self.user_base();
-        table as usize >= base && self.root_param_at(table, base).is_none()
-            && (table as usize == base || self.root_param_at(table - 1, base).is_some())
+        if (table as usize) < base || self.root_param_at(table, base).is_some() {
+            return None;
+        }
+        let mut first = base;
+        while first < 104 && self.root_param_at(first as u8, base).is_some() {
+            first += 1;
+        }
+        match (table as usize).checked_sub(first)? {
+            0 if res => Some(HeapKind::Resource),
+            0 => Some(HeapKind::Sampler),
+            1 if res && samp => Some(HeapKind::Sampler),
+            _ => None,
+        }
     }
 
     fn decl(&self, used: &mut Vec<(String, u8, usize)>, ty: &str, name: &str, slot: Binding, class: char, range_type: u32, stride: u32) -> Result<String, String> {
         let n = match slot {
             Binding::Static(register) => return Ok(format!("{ty} {name} : register({});\n", register.hlsl(class))),
-            Binding::Indexed(n) => n,
+            Binding::Indexed(n) => n & ((1 << HEAP_VARIANT_SHIFT) - 1),
         };
         if range_type == 3 && self.direct_sampler_heap(n) {
             // Heap samplers are typed where the sample instruction uses them.
             return Ok(String::new());
         }
         let (table, _) = *self.bl.get(n as usize).ok_or("bindless: unknown load")?;
+        if self.direct_resource_heap(n) {
+            // the shader indexes the resource heap by byte offset: SM 6.6 dynamic resources. DXC crashes on a method call on
+            // an inline cast of a heap element, so the typed resource comes out of a function.
+            return Ok(format!("{ty} tb_hv_{name}() {{ return ResourceDescriptorHeap[NonUniformResourceIndex(tb_bi{n} / {stride}u)]; }}
+#define {name} tb_hv_{name}()
+"));
+        }
         let (p, _) = self.root_param_at(table, self.user_base()).ok_or_else(|| format!("bindless: s{table} is not a root parameter"))?;
         let Some(crate::meta::RootParamKind::Table(ranges)) = self.ex.root_sig.as_ref().and_then(|r| r.params.get(p)).map(|x| &x.kind) else {
             return Err(format!("bindless: s{table} is not a descriptor table"));
@@ -2516,6 +2585,9 @@ impl<'a> Emitter<'a> {
                         let bn = self.bl_loads.entry(idx).or_insert((next, soff as u8)).0;
                         if bn == next {
                             self.bl.push((table, ins.aux.imm as u32));
+                            if self.implicit_heap_ptr(table).is_some() {
+                                self.sm6_minor = self.sm6_minor.max(6);
+                            }
                         }
                         if let Some(c) = Self::sgpr_const_in(&insns, block_start, idx, soff as u8) {
                             self.bl_const.insert(bn, c);
@@ -2636,10 +2708,18 @@ impl<'a> Emitter<'a> {
                     for (ttable, off) in &tex_c {
                         let tslot = self.bind_id(*ttable, *off, 32)?;
                         let writes = ins.mnemonic.contains("store") || ins.mnemonic.contains("atomic") || self.uav_force.contains(&tslot);
-                        let kind = self.kind_at(*ttable, *off, writes)?;
+                        // The console does not check a store against the declared range type: a slot declared as an SRV
+                        // that the shader writes holds a UAV, bound by position like a slot no range covers.
+                        let srv_written = writes && self.mixed_range_kind(*ttable, *off) == Some(0);
+                        let kind = if srv_written { Some(1) } else { self.kind_at(*ttable, *off, writes)? };
+                        // a slot no declared range covers is whatever the use needs (see `kind_for_slot`)
+                        let kind = self.kind_for_slot(tslot, kind, writes);
+                        // ... and so is a slot of a table classified as constant buffers that the shader stores to
+                        let cbv_written = writes && kind == Some(2);
+                        let kind = if cbv_written { Some(1) } else { kind };
                         let is_uav = kind == Some(1);
                         // A texture read from a slot the root signature declares as a CBV: bind it by position.
-                        let tslot = if kind == Some(2) && !is_uav { self.positional_id(*ttable, *off, 32)? } else { tslot };
+                        let tslot = if (kind == Some(2) && !is_uav) || srv_written || cbv_written { self.positional_id(*ttable, *off, 32)? } else { tslot };
                         let dim = self.gcn_image_dim(*ttable, *off, is_uav, da_dim);
                         if !is_uav && dim == 1 && msaa_dim_on() && ins.mnemonic == "image_load" && *off & BINDLESS == 0 && *off >= 32 && self.gcn_image_dim(*ttable, *off - 32, false, 1) == 6 {
                             let ms = self.bind_id(*ttable, *off - 32, 32)?;
@@ -2651,7 +2731,13 @@ impl<'a> Emitter<'a> {
                                 }
                             }
                         }
-                        if matches!(tslot, Binding::Indexed(_)) {
+                        // A heap descriptor has no declared type: each dimension it is used with gets its own typed accessor
+                        // (the high bits of the index name the variant, `HEAP_VARIANT_SHIFT`).
+                        let tslot = match tslot {
+                            Binding::Indexed(n) if self.direct_resource_heap(n) => Binding::Indexed(n | ((dim + 1) << HEAP_VARIANT_SHIFT)),
+                            t => t,
+                        };
+                        if matches!(tslot, Binding::Indexed(n) if n >> HEAP_VARIANT_SHIFT == 0) {
                             if is_uav { self.bl_uav.insert(tslot); } else { self.bl_srv.insert(tslot); }
                         }
                         if is_uav && ins.mnemonic.starts_with("image_atomic_") {
@@ -2666,7 +2752,7 @@ impl<'a> Emitter<'a> {
                         let map = if is_uav { &mut self.uav } else { &mut self.tex };
                         if let Some(prev) = map.insert(tslot, dim) {
                             if prev != dim {
-                                return Err(format!("image slot {tslot} used with two dimensions"));
+                                return Err(format!("image slot {tslot} used with two dimensions ({prev} and {dim}, at {:#x})", ins.offset));
                             }
                         }
                         tex_res.push((((*ttable as u32) << 24) | off, if is_uav { Res::Uav(tslot, dim) } else { Res::Tex(tslot, dim) }));
@@ -2681,6 +2767,14 @@ impl<'a> Emitter<'a> {
                             }
                         } else {
                             None
+                        };
+                        // A sampler the shader builds in SGPRs on paths that disagree (or from data it computes): decode
+                        // the S# at run time and pick from the bank of static samplers.
+                        let fixed = match fixed {
+                            None if !sym.contains_key(&ss) && written.contains(&ss) && self.ex.root_sig.is_some() && self.dg().is_none() => {
+                                Some(Binding::register(litsamp::DYNAMIC, TB_LITSAMP_SPACE))
+                            }
+                            f => f,
                         };
                         let samp_c = match fixed {
                             Some(_) => vec![(0xffu8, 0)],
@@ -3914,6 +4008,16 @@ impl<'a> Emitter<'a> {
                     "s_swappc_b64" => {
                         // Vertex-fetch shader call: inputs are materialised from the D3D input layout.
                         self.line("// (fetch-shader call: vertex attributes come from the input layout)");
+                        Ok(())
+                    }
+                    "s_andn2_wrexec_b32" => {
+                        // Waterfall loop epilogue: exec = pending & ~exec, and the destination takes the new exec. A lane
+                        // here serves its own descriptor index in one pass, so the loop leaves after the first.
+                        let t = self.tmp;
+                        self.tmp += 1;
+                        self.line(&format!("uint t{t} = ({a} & ~exec_lo) & 1u;"));
+                        self.ws(&d, &format!("t{t}"))?;
+                        self.line(&format!("exec_lo = t{t}; scc = t{t};"));
                         Ok(())
                     }
                     _ if m.contains("saveexec") => {
@@ -6766,6 +6870,17 @@ impl<'a> Emitter<'a> {
         };
         let tex = format!("tex{tslot}");
         let smp = match sslot {
+            Binding::Static(r) if r.space == TB_LITSAMP_SPACE && r.register == litsamp::DYNAMIC => {
+                let reg = match ins.src.last() {
+                    Some(Opnd::Sgpr(n)) => *n,
+                    _ => return Err("bad sampler register".into()),
+                };
+                for k in 0..3u8 {
+                    self.touch(&Opnd::Sgpr(reg + k));
+                }
+                let index = format!("tb_lit_sampler_index(s{reg}, s{}, s{}, {})", reg + 1, reg + 2, cmp);
+                if cmp { format!("tb_lsc[{index}]") } else { format!("tb_lsb[{index}]") }
+            }
             Binding::Indexed(index) if self.direct_sampler_heap(index) => {
                 let name = format!("tb_heap_sampler{}", self.tmp);
                 self.tmp += 1;
@@ -7274,10 +7389,34 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(h, "{ty}<{e}> tex{slot}_m[16] : register({});", register.mip_views()?.hlsl('t'));
             }
         }
-        for slot in &self.samp {
+        let dynamic = Binding::register(litsamp::DYNAMIC, TB_LITSAMP_SPACE);
+        let bank_reg = |slot: &Binding| match slot {
+            Binding::Static(r) if r.space == TB_LITSAMP_SPACE && r.register != litsamp::DYNAMIC => Some(r.register),
+            _ => None,
+        };
+        let any_dynamic = self.samp.contains(&dynamic) || self.samp_cmp.contains(&dynamic);
+        if any_dynamic {
+            // A run-time selection declares the whole bank as arrays; the bank samplers the shader names statically are
+            // elements of those arrays (the same registers cannot be declared twice).
+            let plain = self.samp.contains(&dynamic) || self.samp.iter().any(|s| bank_reg(s).is_some());
+            let compare = self.samp_cmp.contains(&dynamic) || self.samp_cmp.iter().any(|s| bank_reg(s).is_some());
+            h.push_str(&litsamp::hlsl_decls(plain, compare));
+            let cs = litsamp::compare_start() as u32;
+            for slot in &self.samp {
+                if let Some(reg) = bank_reg(slot) {
+                    let _ = writeln!(h, "#define samp{slot} tb_lsb[{reg}]");
+                }
+            }
+            for slot in &self.samp_cmp {
+                if let Some(reg) = bank_reg(slot) {
+                    let _ = writeln!(h, "#define scmp{slot} tb_lsc[{}]", reg - cs);
+                }
+            }
+        }
+        for slot in self.samp.iter().filter(|s| **s != dynamic && !(any_dynamic && bank_reg(s).is_some())) {
             h.push_str(&self.decl(&mut used, "SamplerState", &format!("samp{slot}"), *slot, 's', 3, 16)?);
         }
-        for slot in &self.samp_cmp {
+        for slot in self.samp_cmp.iter().filter(|s| **s != dynamic && !(any_dynamic && bank_reg(s).is_some())) {
             if self.samp.contains(slot) {
                 return Err(format!("sampler s{slot} used both as a regular and a comparison sampler"));
             }

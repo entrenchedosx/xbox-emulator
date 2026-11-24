@@ -179,7 +179,9 @@ pub fn alias_blob(blob: &[u8]) -> Result<Option<Vec<u8>>, String> {
     let aliased = crate::bl_alias::add_aliases(body)?;
     let current = aliased.as_deref().unwrap_or(body);
     let positional = crate::bl_alias::add_positional(current, false)?;
-    match positional.or(aliased) {
+    let so_far = positional.or(aliased);
+    let literal = crate::bl_alias::add_literal_samplers(so_far.as_deref().unwrap_or(body))?;
+    match literal.or(so_far) {
         Some(b) => Ok(Some(crate::bl_alias::replace_rts0(blob, &b)?)),
         None => Ok(None),
     }
@@ -211,6 +213,10 @@ fn patch_blob_with(blob: &[u8], roots: bool) -> Result<Option<(Vec<u8>, RsPatch)
     }
     // constant buffers in tables became raw SRVs above, so their positional range is one too
     if let Some(b) = crate::bl_alias::add_positional(&body, true)? {
+        body = b;
+        p.aliased = true;
+    }
+    if let Some(b) = crate::bl_alias::add_literal_samplers(&body)? {
         body = b;
         p.aliased = true;
     }
@@ -846,8 +852,17 @@ void main() {
         assert!(patch_blob(&b).unwrap().is_some());
         let mut b = rts0(2, &[[2, 1, 0, 100_000]], false);
         assert!(patch_rts0(&mut b).is_err());
+        // A signature with nothing to alias still gets the literal-sampler bank every translated shader
+        // may sample from, so it is patched (and says so) rather than passed through untouched.
         let b = rts0(2, &[[3, 1, 0, 0]], false);
-        assert_eq!(patch_blob(&b).unwrap(), None);
+        let (patched, p) = patch_blob(&b).unwrap().expect("the static sampler bank is added");
+        assert!(p.aliased && p.ranges == 0 && p.root_cbvs.is_empty());
+        let bank = tombox_xshader::hlsl::litsamp::bank().len() as u32;
+        assert_eq!(u32::from_le_bytes(patched[..4].try_into().unwrap()), 2, "the RTS0 body, version unchanged");
+        assert_eq!(u32::from_le_bytes(patched[12..16].try_into().unwrap()), bank);
+        let off = u32::from_le_bytes(patched[16..20].try_into().unwrap()) as usize;
+        let last = off + bank as usize * 52 - 52;
+        assert_eq!(u32::from_le_bytes(patched[last + 44..last + 48].try_into().unwrap()), tombox_xshader::hlsl::TB_LITSAMP_SPACE);
     }
 
     #[test]

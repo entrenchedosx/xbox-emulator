@@ -197,6 +197,17 @@ impl Emitter<'_> {
             Self::sgpr_const_in(&self.insns, start, idx, reg)
         };
         let (Some(w0), Some(w1), Some(w2), Some(_)) = (literal(0), literal(1), literal(2), literal(3)) else {
+            if let Some(path) = std::env::var_os("TOMBOX_LITSAMP_LOG") {
+                use std::io::Write;
+                let writer = |dword: u8| -> String {
+                    let reg = base.wrapping_add(dword);
+                    self.insns[start..idx].iter().rev().find(|i| i.dst.iter().any(|d| matches!(d, crate::rdna2::Opnd::Sgpr(r) if *r as u16 <= reg as u16 && (reg as u16) < *r as u16 + if i.mnemonic.ends_with("64") { 2 } else { 1 })))
+                        .map_or("none-in-block".to_string(), |i| format!("{}({:?})", i.mnemonic, i.src))
+                };
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(f, "UNRESOLVED s{ss}: {} | {} | {} | {}", writer(0), writer(1), writer(2), writer(3));
+                }
+            }
             return Ok(None);
         };
         let decoded = decode_ssharp(w0, Some(w1), Some(w2), is_compare_sample(&self.insns[idx].mnemonic));
@@ -212,6 +223,17 @@ impl Emitter<'_> {
                 })
         }).copied().collect();
         if candidates.is_empty() {
+            // The title's root signature declares no matching sampler: the shader builds its own, which the
+            // root signature of every title gets from the fixed bank (see `litsamp`).
+            if let Some(s) = super::litsamp::pick(&decoded) {
+                return Ok(Some(super::Binding::register(s.register, s.space)));
+            }
+            if let (Some(path), Some(w3)) = (std::env::var_os("TOMBOX_LITSAMP_LOG"), literal(3)) {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(f, "{w0:08x} {w1:08x} {w2:08x} {w3:08x} {decoded:?}");
+                }
+            }
             return Ok(None);
         }
         let pick = pick_static_sampler(&decoded, &candidates)
