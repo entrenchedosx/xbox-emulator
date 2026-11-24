@@ -613,6 +613,38 @@ pub(crate) unsafe fn create_translated_stream(real: *mut c_void, out: &[u8], rii
             probe_rejected_stream(dev2, f, out, riid);
         }
     }
+    if hr >= 0 && std::env::var_os("TOMBOX_PSO_PROBE_DUMP").is_some() {
+        // Minimal reproducer from the other side: keep a stream the driver accepted and add
+        // exactly one render target to it. If this fails, the state subobjects of working
+        // pipelines cannot carry an RTV at all; if it passes, the rejected stream has a
+        // field that only becomes invalid in the presence of a color target.
+        static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            if let Ok(dir) = std::env::var("TOMBOX_PSO_PROBE_DUMP") {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(format!("{dir}\\accepted_stream.bin"), out);
+            }
+            if let Ok(subs) = parse(out) {
+                if let Some(&(_, o)) = subs.iter().find(|(t, _)| *t == 15) {
+                    let mut v = out.to_vec();
+                    v[o..o + 4].copy_from_slice(&28u32.to_le_bytes());
+                    for k in 1..8 {
+                        v[o + 4 * k..o + 4 * k + 4].copy_from_slice(&0u32.to_le_bytes());
+                    }
+                    v[o + 32..o + 36].copy_from_slice(&1u32.to_le_bytes());
+                    let d = [v.len(), v.as_ptr() as usize];
+                    let mut pso: *mut c_void = core::ptr::null_mut();
+                    let hr2 = f(dev2, &d, riid, &mut pso);
+                    if hr2 >= 0 && !pso.is_null() {
+                        let vto = *(pso as *const *const usize);
+                        let rel2: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*vto.add(2));
+                        rel2(pso);
+                    }
+                    record("d3d12_xs", "CreatePipelineState", &format!("accepted stream + one RTV (formats-first 1x28): hr={hr2:#010x} subs=[{}]", stream_summary(out)));
+                }
+            }
+        }
+    }
     let rel: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*vt2.add(2));
     rel(dev2);
     hr
@@ -768,6 +800,23 @@ mod tests {
         assert_eq!(subs, vec![(21, 4), (17, 68)]);
         assert_eq!(s[4 + 52], 1);
         assert_eq!(inner_layout(11), Some((4, 52)));
+    }
+
+    #[test]
+    fn pc_stream_rtv_is_formats_first_not_console_order() {
+        // D3D12_RT_FORMAT_ARRAY (pipeline stream subobject 15) is
+        // `DXGI_FORMAT RTFormats[8]; UINT NumRenderTargets;`, with the count at offset 32.
+        // D3D12_GRAPHICS_PIPELINE_STATE_DESC is the structure that is count-first.
+        let mut payload = Vec::new();
+        for f in [87u32, 26, 0, 0, 0, 0, 0, 0] {
+            payload.extend_from_slice(&f.to_le_bytes());
+        }
+        payload.extend_from_slice(&2u32.to_le_bytes());
+        let mut s = Vec::new();
+        push(&mut s, 15, &payload);
+        let subs = parse(&s).unwrap();
+        assert_eq!(rt_formats(&s, &subs), (2, [87, 26, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(classify(&s).unwrap().0, Numbering::Pc, "a formats-first RTV is already PC order");
     }
 
     #[test]

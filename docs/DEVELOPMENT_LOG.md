@@ -169,3 +169,52 @@ Reverse chronological. Each entry: what was done, evidence, blockers, next actio
 2. `run_fortnite.ps1 -Run` — capture baseline log.
 3. Decide on first contribution: keyboard input is the smallest high-value PR
    (upstream README lists input as "partial (mouse)").
+
+## 2026-11-24 — PC pipeline-stream RTV layout: formats-first, not count-first
+
+**Correction.** `D3D12_RT_FORMAT_ARRAY`, the pipeline-stream subobject 15, is
+`DXGI_FORMAT RTFormats[8]; UINT NumRenderTargets;` with the count at offset 32.
+Only `D3D12_GRAPHICS_PIPELINE_STATE_DESC` is count-first. A speculative attempt
+to reorder console subobject 15 into count-first read the first format (28, 87,
+…) as a target count and raised PSO rejections from 31 to 50,987 in 130 s. That
+reorder and its classifier were reverted; no other changes were involved.
+
+**Evidence for formats-first on this machine**
+- `TOMBOX_EXEC_HW=1 cargo test -p d3d12_xs --lib hw_db_count -- --ignored`:
+  4 passed. `warp_rectlist`: 1 passed. Both hardware streams write the RTV
+  formats first and the count at offset 32, and the driver accepts them.
+- In-process minimal reproducer: take a stream the driver accepted and add one
+  formats-first RTV (`RTFormats[0]=28`, count=1). Result `hr=0x00000000`, so the
+  blend/rasterizer/depth/sample state of working pipelines can carry an RTV.
+- With the layout restored: 0 driver rejections in the first 35 s; 196 driver
+  rejections plus 20 semantic (`stream rejected with root`) in 150 s, versus
+  50,987 in 130 s with the reorder. Backbuffer still 0/8,294,400 non-black.
+
+**Cause of the remaining rejections (isolated, not yet fixed)**
+- Stream probe on the correct layout: leaving out the pixel shader succeeds;
+  leaving out the RTV does not. The PS dump
+  (`%TEMP%`/probe `rejected*_ps.dxil`) has `SV_Target0` float4 and its inputs
+  match the VS outputs exactly.
+- The PS declares `s0,space70000` (literal sampler bank) and textures at
+  `space60000`/`space4160000` (raw-CBV aliases); the stream's 112-byte console
+  root signature exposes only one range at space 1, register 27. The shader's
+  bindings are outside the root signature, which is E_INVALIDARG at PSO
+  creation. `via_real=false` on that root.
+- `TOMBOX_CBV_RAW=on` makes both rejection classes disappear: 0 driver and 0
+  semantic rejections in 95 s and again in 175 s. That key is cache-cold, so
+  the title was still compiling shaders (500 shaders, 1,800 PSOs) at 175 s and
+  had not reached presentation; it was progressing, not stalled. `copy` is the
+  default and the reason the title presents quickly from its warm cache.
+
+**Checks**
+- `cargo test -p d3d12_xs --lib mesh_pso`: 15 passed, including the new
+  regression `pc_stream_rtv_is_formats_first_not_console_order`, which fails on
+  the reordered classifier.
+- No D3D12 SDK debug layer is installed (`C:\Windows\System32\d3d12SDKLayers.dll`
+  absent), so the driver's own E_INVALIDARG text is unavailable.
+
+**Next**
+1. Prewarm the `cbraw=on` shader/PSO cache and verify whether the title presents
+   and draws with zero rejected PSOs.
+2. Otherwise make stream PSO root signatures go through the same `cbv_raw`
+   patch as descriptor-created roots, so the shader spaces exist in the root.
