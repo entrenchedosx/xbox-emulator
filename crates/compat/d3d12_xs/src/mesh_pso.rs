@@ -13,6 +13,8 @@ pub const SUB_HS: u32 = 4;
 pub const SUB_GS: u32 = 5;
 pub const SUB_CS: u32 = 6;
 pub const SUB_PRIMITIVE_TOPOLOGY: u32 = 14;
+const XBOX_TOPOLOGY_TYPE_RECTLIST: u32 = 0x13;
+const PC_TOPOLOGY_TYPE_TRIANGLE: u32 = 3;
 pub const SUB_AS: u32 = 24;
 pub const SUB_MS: u32 = 25;
 pub const XBOX_SUB_AS: u32 = 23;
@@ -485,6 +487,10 @@ pub fn translate_stream(stream: &[u8], xlat: &dyn Fn(u32, &[u8], (u32, [u32; 8])
         }
         let base = out.len();
         out.extend_from_slice(&stream[start..end]);
+        if !has_ms && ty == SUB_PRIMITIVE_TOPOLOGY && word(stream, inner) == XBOX_TOPOLOGY_TYPE_RECTLIST {
+            let dst = base + (inner - start);
+            out[dst..dst + 4].copy_from_slice(&PC_TOPOLOGY_TYPE_TRIANGLE.to_le_bytes());
+        }
         if !matches!(ty, 1..=6 | SUB_AS | SUB_MS) {
             continue;
         }
@@ -494,7 +500,8 @@ pub fn translate_stream(stream: &[u8], xlat: &dyn Fn(u32, &[u8], (u32, [u32; 8])
         }
         let blob = unsafe { core::slice::from_raw_parts(p as *const u8, n as usize) };
         let feeds = if Some(ty) == feeder { ps } else { None };
-        let code = xlat(ty, blob, rts, feeds).map_err(|e| format!("subobject {ty}: {e}"))?;
+        let code = xlat(ty, blob, rts, feeds)
+            .map_err(|e| format!("subobject {ty}, shader {:016x}: {e}", crate::shader_xlat::fnv1a(blob)))?;
         if ty == SUB_MS && ms_topo.is_none() {
             ms_topo = mesh_dxil_topology(&code);
         }
@@ -564,10 +571,21 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
     let (out, keep) = match translate_stream(stream, &xlat) {
         Ok(v) => v,
         Err(e) => {
-            record("d3d12_xs", "CreatePipelineState", &format!("stream rejected: {e} -> E_INVALIDARG"));
+            record("d3d12_xs", "CreatePipelineState", &format!("stream rejected with root {root:#x}: {e} -> E_INVALIDARG"));
             return E_INVALIDARG;
         }
     };
+    let hr = unsafe { create_translated_stream(real, &out, riid, ppv) };
+    if hr >= 0 && !(*ppv).is_null() {
+        if parse(stream).is_ok_and(|s| s.iter().any(|(t, o)| *t == SUB_AS && bytecode(stream, *o).0 != 0)) {
+            crate::console_slots_mesh::note_as_pso(*ppv as usize);
+        }
+        crate::dbcount::note_stream_pso(*ppv as usize, &out, &keep);
+    }
+    hr
+}
+
+pub(crate) unsafe fn create_translated_stream(real: *mut c_void, out: &[u8], riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
     let vt = *(real as *const *const usize);
     let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(*vt);
     let mut dev2: *mut c_void = core::ptr::null_mut();
@@ -580,25 +598,20 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
     let d = [out.len() as u64, out.as_ptr() as u64];
     let hr = f(dev2, &d, riid, ppv);
     if hr < 0 {
-        record("d3d12_xs", "CreatePipelineState", &format!("PC driver rejected stream hr={hr:#010x} subs=[{}]", stream_summary(&out)));
-        probe_rejected_stream(dev2, f, &out, riid);
-    }
-    if hr >= 0 && !(*ppv).is_null() && parse(stream).is_ok_and(|s| s.iter().any(|(t, o)| *t == SUB_AS && bytecode(stream, *o).0 != 0)) {
-        crate::console_slots_mesh::note_as_pso(*ppv as usize);
-    }
-    if hr >= 0 && !(*ppv).is_null() {
-        crate::dbcount::note_stream_pso(*ppv as usize, &out, &keep);
+        record("d3d12_xs", "CreatePipelineState", &format!("PC driver rejected stream hr={hr:#010x} subs=[{}]", stream_summary(out)));
+        if hr == E_INVALIDARG && std::env::var_os("TOMBOX_PSO_PROBE_DUMP").is_some() {
+            probe_rejected_stream(dev2, f, out, riid);
+        }
     }
     let rel: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*vt2.add(2));
     rel(dev2);
-    drop(keep);
     hr
 }
 
 /// The host driver names no reason for E_INVALIDARG without the SDK debug layer, which is not installed
 /// here. For the first few rejected streams, say which subobject the rejection depends on: create the
 /// pipeline again with each subobject left out in turn and log the ones whose removal changes the result.
-/// (A pipeline that is created by this probe is released at once; nothing the title sees changes.)
+/// Enabled by TOMBOX_PSO_PROBE_DUMP. Any pipeline the probe creates is released at once.
 unsafe fn probe_rejected_stream(
     dev2: *mut c_void,
     create: unsafe extern "system" fn(*mut c_void, *const [u64; 2], *const c_void, *mut *mut c_void) -> i32,
@@ -937,6 +950,10 @@ mod tests {
         assert_eq!(subs_vs, vec![(SUB_VS, 8), (SUB_PRIMITIVE_TOPOLOGY, 28), (SUB_PS, 40)]);
         assert_eq!(u32::from_le_bytes(out_vs[28..32].try_into().unwrap()), 3);
         assert_eq!(keep_vs.len(), 2);
+
+        vs_stream[28..32].copy_from_slice(&XBOX_TOPOLOGY_TYPE_RECTLIST.to_le_bytes());
+        let (out_rect, _) = translate_stream(&vs_stream, &xl_raw).unwrap();
+        assert_eq!(word(&out_rect, 28), PC_TOPOLOGY_TYPE_TRIANGLE);
     }
 
     fn rec(ty: u32, size: usize, payload_at: usize, payload: &[u8]) -> Vec<u8> {

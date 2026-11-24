@@ -1,4 +1,5 @@
 use compat_common::record;
+use core::ffi::c_void;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -329,6 +330,83 @@ pub fn expand(d: &mut [u8]) -> bool {
             false
         }
     }
+}
+
+unsafe fn expand_stream(source: &crate::dbcount::StreamRec) -> Result<Vec<u8>, String> {
+    use crate::mesh_pso::{SUB_AS, SUB_CS, SUB_DS, SUB_GS, SUB_HS, SUB_MS, SUB_PRIMITIVE_TOPOLOGY, SUB_PS, SUB_VS};
+
+    let inner = |ty| source.subs.iter().find(|&&(t, _)| t == ty).map(|&(_, offset)| offset);
+    let shader = |ty| inner(ty).map(|offset| unsafe { blob(&source.stream, offset) }).unwrap_or_default();
+    let vs = shader(SUB_VS);
+    if vs.is_empty() {
+        return Err("the pipeline stream has no vertex shader".into());
+    }
+    if [SUB_GS, SUB_HS, SUB_DS, SUB_CS, SUB_MS, SUB_AS].into_iter().any(|ty| !shader(ty).is_empty()) {
+        return Err("the pipeline stream already has an incompatible shader stage".into());
+    }
+    let word = |offset| u32::from_le_bytes(source.stream[offset..offset + 4].try_into().unwrap());
+    if inner(7).is_some_and(|offset| word(offset + 8) != 0) {
+        return Err("the pipeline stream writes vertices to stream output".into());
+    }
+    let topology = inner(SUB_PRIMITIVE_TOPOLOGY);
+    if topology.is_some_and(|offset| !matches!(word(offset), 0 | TOPOLOGY_TYPE_TRIANGLE)) {
+        return Err("the pipeline stream does not use triangle primitives".into());
+    }
+
+    let gs = gs_for(vs, shader(SUB_PS))?;
+    let mut stream = source.stream.clone();
+    let mut subs = source.subs.clone();
+    let mut write = |ty, data: &[u8]| {
+        if let Some(offset) = inner(ty) {
+            stream[offset..offset + data.len()].copy_from_slice(data);
+        } else {
+            crate::dbcount::append_sub(&mut stream, &mut subs, ty, data);
+        }
+    };
+    let mut shader_bytecode = [0u8; 16];
+    shader_bytecode[..8].copy_from_slice(&(gs.as_ptr() as u64).to_le_bytes());
+    shader_bytecode[8..].copy_from_slice(&(gs.len() as u64).to_le_bytes());
+    write(SUB_GS, &shader_bytecode);
+    write(SUB_PRIMITIVE_TOPOLOGY, &TOPOLOGY_TYPE_TRIANGLE.to_le_bytes());
+    if inner(19).is_some() {
+        // CachedPSO belongs to the original stream.
+        write(19, &[0; 16]);
+    }
+    Ok(stream)
+}
+
+struct StreamVariant {
+    source: Arc<crate::dbcount::StreamRec>,
+    pso: usize,
+}
+
+pub(crate) unsafe fn stream_variant(list: *mut c_void, pso: usize, iid: *const c_void) -> Option<usize> {
+    static VARIANTS: Mutex<Option<HashMap<usize, StreamVariant>>> = Mutex::new(None);
+    let source = crate::dbcount::stream_rec(pso)?;
+    let mut cache = VARIANTS.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if let Some(v) = cache.get(&pso).filter(|v| Arc::ptr_eq(&v.source, &source)) {
+        return Some(v.pso);
+    }
+    let build = || {
+        let device = unsafe { crate::cl2_state::device_of(list) };
+        if device.is_null() {
+            return Err("the command list has no host device".into());
+        }
+        let stream = unsafe { expand_stream(&source) }?;
+        let mut dst = core::ptr::null_mut();
+        let hr = unsafe { crate::mesh_pso::create_translated_stream(device, &stream, iid, &mut dst) };
+        if hr < 0 || dst.is_null() {
+            return Err(format!("the host rejected the expanded pipeline stream ({hr:#010x})"));
+        }
+        Ok(dst as usize)
+    };
+    let variant = build().unwrap_or_else(|why| {
+        refuse(0, pso as u64, &why);
+        0
+    });
+    cache.insert(pso, StreamVariant { source, pso: variant });
+    Some(variant)
 }
 
 #[cfg(test)]

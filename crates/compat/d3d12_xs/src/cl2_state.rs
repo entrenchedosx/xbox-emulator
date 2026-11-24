@@ -905,8 +905,8 @@ unsafe extern "system" fn w_pso(this: *mut c_void, pso: *mut c_void) {
     let graphics = pso_bias(pso as usize).is_some();
     rec(this, |s| {
         s.pso = Some(pso as usize);
+        s.variant_bound = false;
         if graphics {
-            s.variant_bound = false;
             s.depth_bias_x = None;
         }
     });
@@ -941,11 +941,15 @@ unsafe fn apply_rect(list: *mut c_void) {
     if pso == 0 {
         return;
     }
-    let Some(k) = (unsafe { wanted_key(list, pso) }) else {
-        crate::rectlist::refuse(0, pso as u64, &format!("PSO {pso:#x} has no recorded PC description (stream-built or unknown pipeline)"));
-        return;
+    let v = if let Some(k) = unsafe { wanted_key(list, pso) } {
+        unsafe { pso_variant(pso, k) }
+    } else {
+        let Some(v) = (unsafe { crate::rectlist::stream_variant(list, pso, (&IID_PSO as *const Guid).cast()) }) else {
+            crate::rectlist::refuse(0, pso as u64, &format!("PSO {pso:#x} has no recorded PC description"));
+            return;
+        };
+        v
     };
-    let v = unsafe { pso_variant(pso, k) };
     if v != 0 {
         unsafe { pc_set_pso(list, v) };
         with(list, |s| s.variant_bound = true);
@@ -1699,7 +1703,7 @@ struct PoolAlloc {
 static POOL: Mutex<Vec<PoolAlloc>> = Mutex::new(Vec::new());
 static QFENCES: Mutex<Option<HashMap<usize, (usize, u64)>>> = Mutex::new(None);
 
-unsafe fn device_of(obj: *mut c_void) -> *mut c_void {
+pub(crate) unsafe fn device_of(obj: *mut c_void) -> *mut c_void {
     let get: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(obj, CHILD_GET_DEVICE)) };
     let mut d: *mut c_void = core::ptr::null_mut();
     if unsafe { get(obj, &IID_DEVICE, &mut d) } < 0 || d.is_null() {

@@ -212,6 +212,48 @@ unsafe fn pso(k: &Kit) -> usize {
     p as usize
 }
 
+unsafe fn stream_pso(k: &Kit) -> usize {
+    use crate::dbcount::{append_sub, default_blend, note_stream_pso};
+    use crate::mesh_pso::{create_translated_stream, translate_stream, SUB_PRIMITIVE_TOPOLOGY, SUB_PS, SUB_VS};
+    use std::sync::Arc;
+
+    let bytecode = |shader: &[u8]| {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&(shader.as_ptr() as u64).to_le_bytes());
+        bytes[8..].copy_from_slice(&(shader.len() as u64).to_le_bytes());
+        bytes
+    };
+    let mut stream = Vec::new();
+    let mut subs = Vec::new();
+    let mut raster = [0u8; 44];
+    put(&mut raster, 0, 3);
+    put(&mut raster, 4, 1);
+    put(&mut raster, 24, 1);
+    let mut formats = [0u8; 36];
+    put(&mut formats, 0, FMT_RGBA32F);
+    put(&mut formats, 32, 1);
+    for (kind, body) in [
+        (0, &(k.rs as u64).to_le_bytes()[..]),
+        (SUB_VS, &bytecode(&k.vs)),
+        (SUB_PS, &bytecode(&k.ps)),
+        (8, &default_blend()[..]),
+        (9, &u32::MAX.to_le_bytes()),
+        (10, &raster),
+        (11, &[0u8; 52]),
+        (SUB_PRIMITIVE_TOPOLOGY, &0x13u32.to_le_bytes()),
+        (15, &formats),
+        (17, &[1, 0, 0, 0, 0, 0, 0, 0]),
+    ] {
+        append_sub(&mut stream, &mut subs, kind, body);
+    }
+    let (pc_stream, shaders) = translate_stream(&stream, &|_, bytes, _, _| Ok(Arc::new(bytes.to_vec()))).unwrap();
+    let mut pso = core::ptr::null_mut();
+    let hr = unsafe { create_translated_stream(k.dev as *mut c_void, &pc_stream, (&IID_PSO as *const Guid).cast(), &mut pso) };
+    assert!(hr >= 0 && !pso.is_null(), "CreatePipelineState for console RECTLIST hr={hr:#010x}");
+    note_stream_pso(pso as usize, &pc_stream, &shaders);
+    pso as usize
+}
+
 unsafe fn barrier(k: &Kit, a: u32, b: u32) {
     let mut d = [0u8; 32];
     d[8..16].copy_from_slice(&(k.rt as u64).to_le_bytes());
@@ -410,6 +452,9 @@ fn warp_rectlist_topology_17_covers_all_four_corners() {
         if at(46, 46) != [0.0; 4] {
             bad.push(format!("topology-4 draw after a rect still drew a fourth corner: {:?}", at(46, 46)));
         }
+        let p = stream_pso(&k);
+        let img = run(&mut k, p, &[Draw { topology: 17, c: flat, ..Draw::default() }]);
+        check_rect(&img, &flat, "stream PSO RECTLIST", &mut bad);
         crate::cl2_state::test_restore(saved);
         assert!(bad.is_empty(), "{}", bad.join("\n"));
     }

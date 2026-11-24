@@ -669,7 +669,7 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
                     let mut p: *mut u8 = core::ptr::null_mut();
                     if vcall!(rb, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut p) >= 0 && !p.is_null() {
                         let data = core::slice::from_raw_parts(p, len);
-                        let extra = format!(" | src={src:p} trackedState={state:#x} titleFmt={}", st.format);
+                        let extra = format!(" | gpu fence={} queue={queue:p} list={:p} title src={src:p} -> swapchain buffer[{idx}]={dst:p} trackedState={state:#x} titleFmt={}", st.fence_value, st.list, st.format);
                         crate::present_snap::finish(tag, snap_frame, data, st.width as u32, st.height, st.format, &extra);
                         vcall!(rb, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
                     }

@@ -8,7 +8,16 @@ pub fn dir() -> Option<String> {
 }
 
 pub fn wanted(frame: u64) -> bool {
-    dir().is_some() && SNAP_FRAMES.contains(&frame)
+    if dir().is_none() {
+        return false;
+    }
+    static FRAMES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    FRAMES.get_or_init(|| {
+        std::env::var("TOMBOX_PRESENT_SNAP_FRAMES")
+            .ok()
+            .map(|frames| frames.split(',').filter_map(|frame| frame.trim().parse().ok()).collect())
+            .unwrap_or_else(|| SNAP_FRAMES.to_vec())
+    }).contains(&frame)
 }
 
 pub fn row_pitch(width: u32) -> u32 {

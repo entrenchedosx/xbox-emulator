@@ -623,7 +623,7 @@ pub fn note_stream_pso(pso: usize, stream: &[u8], shaders: &[Arc<Vec<u8>>]) {
     }
 }
 
-fn stream_rec(pso: usize) -> Option<Arc<StreamRec>> {
+pub(crate) fn stream_rec(pso: usize) -> Option<Arc<StreamRec>> {
     STREAMS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&pso).cloned()
 }
 
