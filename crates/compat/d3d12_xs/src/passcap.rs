@@ -679,6 +679,10 @@ struct Shot {
     probes: Vec<ProbeBuf>,
     cpu_pending: Vec<(usize, u64, String)>,
     cpu_submit: Vec<String>,
+    /// Every colour draw recorded while the shot was armed, with the state bound at draw time. A
+    /// pass whose render targets were set before the shot armed never reaches a pass boundary, so
+    /// this is the only place such a draw's state can be read.
+    draws: Vec<String>,
 }
 
 #[derive(Default)]
@@ -1297,7 +1301,61 @@ unsafe extern "system" fn om_set_targets(this: *mut c_void, n: u32, handles: *co
     f(this, n, handles, single, dsv)
 }
 
-fn note_draw(this: *mut c_void, kind: u8) {
+fn draw_record(g: &G, k: usize, this: usize, kind: u8, args: &str) -> String {
+    let Some(st) = g.lists.get(&k) else { return String::new() };
+    let pso = st.pso;
+    let mut s = format!("kind={kind} args={args} pso={pso:#x} topo={:?}", crate::cl2_state::topology_of(this));
+    s.push_str(&format!(" rt=[{}] dsv={:#x} sref={:?}", st.rts.iter().map(|r| format!("{r:#x}")).collect::<Vec<_>>().join(","), st.dsv, st.sref));
+    let snap = crate::cl2_state::raster_snapshot(this);
+    let rpso = snap.as_ref().and_then(|x| x.3);
+    s.push_str(&format!(" stages={:?}", rpso.and_then(crate::mesh_pso::stages_of)));
+    if let Some((vp, sc, _, _)) = &snap {
+        let v: Vec<String> = vp.chunks_exact(24).map(|b| {
+            let f = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+            format!("{}x{} at {},{}", f(8), f(12), f(0), f(4))
+        }).collect();
+        let c: Vec<String> = sc.chunks_exact(16).map(|b| {
+            let i = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+            format!("x{}..{} y{}..{}", i(0), i(8), i(4), i(12))
+        }).collect();
+        s.push_str(&format!(" viewport[{}] scissor[{}]", v.join(";"), c.join(";")));
+    }
+    let vb = crate::rtcap::bound_vbs(this);
+    s.push_str(&format!(" vb[{}]", vb.iter().map(|(slot, va, size, stride)| format!("{slot}={va:#x}/{size}B/{stride}")).collect::<Vec<_>>().join(" ")));
+    let mut rc: Vec<(u32, Vec<Option<u32>>)> = st.rc.iter().map(|(a, b)| (*a, b.clone())).collect();
+    rc.sort_by_key(|x| x.0);
+    for (i, w) in rc.iter().take(8) {
+        let words: Vec<String> = w.iter().enumerate().map(|(n, v)| match v { Some(u) => format!("[{n}]{u:08x}={:.4}", f32::from_bits(*u)), None => format!("[{n}]unset") }).collect();
+        s.push_str(&format!(" rc[{i}]={}", words.join(" ")));
+    }
+    let mut cbv: Vec<(u32, u64)> = st.cbv.iter().map(|(a, b)| (*a, *b)).collect();
+    cbv.sort();
+    for (i, va) in cbv.iter().take(8) {
+        let dw = unsafe { crate::bindtrace::read_va(*va, 32) }.map(|b| b.chunks_exact(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect::<Vec<_>>().join(" ")).unwrap_or_else(|| "unreadable".into());
+        s.push_str(&format!(" cbv[{i}] va={va:#x} [{dw}]"));
+    }
+    for param in 0..4u32 {
+        for slot in 0..4u32 {
+            if let Some((res, fmt, dim, map)) = crate::bindtrace::table_srv_fmt(this, false, param, slot) {
+                s.push_str(&format!(" t{param}[{slot}]=res{res:#x}/fmt{fmt}/dim{dim}/map{map:#x}"));
+            }
+        }
+    }
+    match crate::device_wrap::pso_desc_text(pso) {
+        Some(t) => s.push_str(&format!("\n      pso: {t}")),
+        None => {
+            let real = crate::pso_async::real_of(pso);
+            let d = crate::dbcount::stream_pso_dump(if real != 0 { real } else { pso }).or_else(|| crate::dbcount::stream_pso_dump(pso));
+            s.push_str(&format!("\n      pso: not in the registry (stream pipeline){}; real={real:#x}", d.unwrap_or_default()));
+        }
+    }
+    if let Some(v) = crate::cl2_state::pc_pso_of(this) {
+        s.push_str(&format!("\n      bound PC variant {v:#x}:{}", crate::dbcount::stream_pso_dump(v).unwrap_or_else(|| " (no stream snapshot)".into())));
+    }
+    s
+}
+
+fn note_draw(this: *mut c_void, kind: u8, args: &str) {
     with(|g| {
         let k = key(this);
         let active = ACTIVE.load(Ordering::Relaxed);
@@ -1342,7 +1400,11 @@ fn note_draw(this: *mut c_void, kind: u8) {
             }
         }
         if active && kind != 2 {
+            let detail = draw_record(g, k, this as usize, kind, args);
             if let Some(shot) = g.shot.as_mut() {
+                if shot.draws.len() < 48 && !detail.is_empty() {
+                    shot.draws.push(detail);
+                }
                 let h = ps_hash(shot, pso);
                 let st = g.lists.get_mut(&k).unwrap();
                 if !st.ps.contains(&h) && st.ps.len() < 160 {
@@ -1395,19 +1457,19 @@ fn note_draw(this: *mut c_void, kind: u8) {
 }
 
 unsafe extern "system" fn draw(this: *mut c_void, a: u32, b: u32, c: u32, d: u32) {
-    note_draw(this, 0);
+    note_draw(this, 0, &format!("DrawInstanced v={a} inst={b} sv={c} si={d}"));
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) = core::mem::transmute(prev(12));
     f(this, a, b, c, d);
     probe_after(this)
 }
 unsafe extern "system" fn draw_indexed(this: *mut c_void, a: u32, b: u32, c: u32, d: i32, e: u32) {
-    note_draw(this, 1);
+    note_draw(this, 1, &format!("DrawIndexedInstanced n={a} inst={b} start={c} base={d} at={e}"));
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32) = core::mem::transmute(prev(13));
     f(this, a, b, c, d, e);
     probe_after(this)
 }
 unsafe extern "system" fn dispatch(this: *mut c_void, a: u32, b: u32, c: u32) {
-    note_draw(this, 2);
+    note_draw(this, 2, "");
     if ACTIVE.load(Ordering::Relaxed) {
         note_dispatch(this, a, b, c);
     }
@@ -1415,22 +1477,22 @@ unsafe extern "system" fn dispatch(this: *mut c_void, a: u32, b: u32, c: u32) {
     f(this, a, b, c)
 }
 unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, fmt: u32, n: u32, inst: u32) {
-    note_draw(this, 1);
+    note_draw(this, 1, &format!("DrawIndexedX va={va:#x} fmt={fmt} n={n} inst={inst}"));
     let f: unsafe extern "system" fn(*mut c_void, u64, u32, u32, u32) = core::mem::transmute(prev(81));
     f(this, va, fmt, n, inst)
 }
 unsafe extern "system" fn dispatch_mesh_x(this: *mut c_void, n: u32, a: u64, b: u64, c: u64) {
-    note_draw(this, 0);
+    note_draw(this, 0, &format!("DispatchMeshX n={n}"));
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u64) = core::mem::transmute(prev(98));
     f(this, n, a, b, c)
 }
 unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
-    note_draw(this, 0);
+    note_draw(this, 0, &format!("DispatchMesh {x}x{y}x{z}"));
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(prev(127));
     f(this, x, y, z)
 }
 unsafe extern "system" fn indirect(this: *mut c_void, sig: *mut c_void, n: u32, buf: *mut c_void, off: u64, cbuf: *mut c_void, coff: u64) {
-    note_draw(this, 3);
+    note_draw(this, 3, "");
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64) = core::mem::transmute(prev(59));
     f(this, sig, n, buf, off, cbuf, coff)
 }
@@ -1865,7 +1927,7 @@ pub unsafe fn on_present(queue: *mut c_void, src: *mut c_void, plane_count: u32,
             if let Some(w) = why {
                 g.next_id += 1;
                 g.shot = Some(Shot { id: g.next_id, why: w.clone(), start_present: g.presents, end_present: 0, t, frames_left: s.frames, passes: Vec::new(), caps: Vec::new(), submit: HashMap::new(), cpu_pending: Vec::new(), cpu_submit: Vec::new(),
-                    bytes: 0, waits: 0, order: 0, src: 0, src_label: String::new(), chain: String::new(), budget_note: None, ps_cache: HashMap::new(), probes: Vec::new() });
+                    bytes: 0, waits: 0, order: 0, src: 0, src_label: String::new(), chain: String::new(), budget_note: None, ps_cache: HashMap::new(), probes: Vec::new(), draws: Vec::new() });
                 ACTIVE.store(true, Ordering::Relaxed);
                 record("d3d12_xs", "passcap", &format!("shot {} armed ({w}) at present #{} t={t:.2}s: recording the next {} frame(s)", g.next_id, g.presents, s.frames));
             }
@@ -2025,6 +2087,13 @@ fn write_shot(sh: Shot, gpu_done: bool, waited: Vec<(usize, bool)>, raw: bool) {
         }
     }
     let _ = std::fs::write(dir.join("passes.txt"), &out);
+    if !sh.draws.is_empty() {
+        let mut d = format!("passcap shot {}: every colour draw recorded while the shot was armed, in recording order; the state is what was bound at the draw call\n", sh.id);
+        for (i, r) in sh.draws.iter().enumerate() {
+            d.push_str(&format!("draw {i:02}: {r}\n"));
+        }
+        let _ = std::fs::write(dir.join("draws.txt"), d);
+    }
     if crate::va_census::on() {
         let views: Vec<(usize, u8)> = crate::bindtrace::all_views().into_iter().map(|(r, u)| (r, if u { crate::va_census::P_UAV } else { crate::va_census::P_SRV })).collect();
         let c = crate::va_census::census(&views);

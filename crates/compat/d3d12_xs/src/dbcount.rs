@@ -623,6 +623,23 @@ pub fn note_stream_pso(pso: usize, stream: &[u8], shaders: &[Arc<Vec<u8>>]) {
     }
 }
 
+/// Raw subobject dump of a stream PSO's PC pipeline stream: type, payload offset, length and the
+/// first words. Used when a draw has to be attributed to a pipeline that is not in the PSO
+/// registry (every stream PSO), so its rasterizer/sample/RT state can be read instead of guessed.
+pub fn stream_pso_dump(pso: usize) -> Option<String> {
+    let r = stream_rec(pso)?;
+    let mut order = r.subs.clone();
+    order.sort_by_key(|x| x.1);
+    let mut s = String::new();
+    for (i, &(ty, o)) in order.iter().enumerate() {
+        let end = order.get(i + 1).map_or(r.stream.len(), |x| x.1);
+        let n = end.saturating_sub(o).min(64);
+        let hex: Vec<String> = r.stream.get(o..o + n).map(|b| b.chunks(4).filter(|c| c.len() == 4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect()).unwrap_or_default();
+        s.push_str(&format!("\n      sub {ty:2} @{o:#06x} {n:2}B: {}", hex.join(" ")));
+    }
+    Some(s)
+}
+
 pub(crate) fn stream_rec(pso: usize) -> Option<Arc<StreamRec>> {
     STREAMS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&pso).cloned()
 }

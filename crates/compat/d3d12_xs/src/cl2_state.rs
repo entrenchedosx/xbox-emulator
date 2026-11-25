@@ -211,6 +211,9 @@ pub struct ListState {
     pub stencil: Option<u32>,
     pub pso: Option<usize>,
     pub variant_bound: bool,
+    /// The PC pipeline actually bound for the current console PSO when a variant was substituted
+    /// (rect expansion, depth-bias/clip variant). This is what the draw really runs with.
+    pub pc_pso: Option<usize>,
     pub predication: Option<(usize, u64, u32)>,
     pub plain_predicate: bool,
     pub heaps: Option<Vec<usize>>,
@@ -410,6 +413,14 @@ pub(crate) fn clone_state(from: *mut c_void, to: *mut c_void) {
     if from != to {
         crate::query_x::carry_nest(from as usize, to as usize);
     }
+}
+
+/// The topology the title set on the list (17 = RECTLIST, before the emulator forwards
+/// TRIANGLELIST), so a draw can be attributed to rect expansion or to a normal topology.
+pub fn topology_of(list: usize) -> Option<u32> {
+    let g = STATES[shard_of(list)].lock().unwrap_or_else(|e| e.into_inner());
+    let s = g.as_ref()?.get(&list)?;
+    s.topology
 }
 
 pub fn raster_snapshot(list: usize) -> Option<(Vec<u8>, Vec<u8>, Option<u32>, Option<usize>)> {
@@ -897,7 +908,10 @@ unsafe fn apply_pso_bias(list: *mut c_void, pso: usize) {
     let v = unsafe { pso_variant(pso, VariantKey { clip: b.clip, dynamic: false, bias: None, rect: false }) };
     if v != 0 {
         unsafe { pc_set_pso(list, v) };
-        with(list, |s| s.variant_bound = true);
+        with(list, |s| {
+            s.variant_bound = true;
+            s.pc_pso = Some(v);
+        });
     }
 }
 
@@ -913,6 +927,12 @@ unsafe extern "system" fn w_pso(this: *mut c_void, pso: *mut c_void) {
     fwd!(X_PSO, fn(*mut c_void), this, pso);
     unsafe { apply_pso_bias(this, pso as usize) };
     unsafe { apply_rect(this) };
+}
+
+/// The PC pipeline the current draw really runs with, when a variant replaced the console PSO.
+pub fn pc_pso_of(list: usize) -> Option<usize> {
+    let g = STATES[shard_of(list)].lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref()?.get(&list)?.pc_pso
 }
 
 fn is_rect(list: *mut c_void) -> bool {
@@ -934,6 +954,13 @@ unsafe fn wanted_key(list: *mut c_void, pso: usize) -> Option<VariantKey> {
 }
 
 unsafe fn apply_rect(list: *mut c_void) {
+    // Diagnostic A/B: keep the console PSO (one TRIANGLELIST triangle) instead of the expanded rect
+    // pipeline, so a rect draw that rasterizes nothing can be attributed to the expansion itself.
+    if std::env::var_os("TOMBOX_NO_RECTLIST").is_some() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| compat_common::record("d3d12_xs", "rectlist", "TOMBOX_NO_RECTLIST: RECTLIST draws run as one TRIANGLELIST triangle, no expanded pipeline"));
+        return;
+    }
     if !is_rect(list) {
         return;
     }
@@ -952,7 +979,10 @@ unsafe fn apply_rect(list: *mut c_void) {
     };
     if v != 0 {
         unsafe { pc_set_pso(list, v) };
-        with(list, |s| s.variant_bound = true);
+        with(list, |s| {
+            s.variant_bound = true;
+            s.pc_pso = Some(v);
+        });
     }
 }
 

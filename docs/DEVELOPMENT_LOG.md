@@ -542,3 +542,70 @@ would not change the image.
 - The warm pipeline library still misses ~165 stream PSOs per run, and every miss
   is a driver compile. That is the dominant cold-start cost, not a correctness
   defect.
+
+## Session: the composite draw's state, measured at draw time
+
+`passcap` used to record only whole passes, so a draw whose render targets were
+set before the shot armed (the presented-buffer composite) had no record at all.
+Each shot now also writes `draws.txt`: every colour draw recorded while the shot
+was armed, with the draw arguments, the console PSO, the topology the title set,
+RTs/DSV, viewport/scissor, bound vertex buffers, root constants, root CBVs with
+their first bytes, descriptor-table handles, and the PC pipeline variant the list
+actually bound (with its raw stream subobjects). That is what finally attributed
+the failing draw.
+
+### What the failing draw is
+
+```
+kind=0 args=DrawInstanced v=3 inst=1 sv=0 si=0 topo=Some(17) rt=[presented buffer]
+       dsv=0x0 stages=(true, true) viewport[3840x2160 at 0,0] scissor[x0..3840 y0..2160]
+       vb[]  bound PC variant <rect-expanded stream>
+```
+
+- Topology 17 is RECTLIST, so the emulator expands it to two TRIANGLELIST
+  triangles with a synthesized geometry shader; the variant really is bound and
+  the GS really runs (`GSInvocations=1, GSPrimitives=2`).
+- The console pipeline carries a real VS and PS (`stages=(true,true)`), a sample
+  mask of `0xffffffff`, FillMode solid, CullMode back, FrontCounterClockwise 1.
+  No vertex buffer is bound, so the three vertices come from `SV_VertexID` plus
+  whatever the shader reads.
+- Pipeline statistics for it: `IAVertices=3 GSPrimitives=2 CInvocations=2
+  CPrimitives=2 PSInvocations=0` — both primitives reach the rasterizer and not
+  one sample is shaded.
+
+### The rect expansion is not the defect (measured A/B)
+
+- With `TOMBOX_NO_RECTLIST=1` (console PSO kept, no GS, one triangle) the same
+  draw reports `IAVertices=3 GSPrimitives=0 CInvocations=1 CPrimitives=1
+  PSInvocations=0`. Removing the expansion does not change the result.
+- The other RECTLIST draw in the same frame, expanded by the same synthesized GS,
+  shades exactly half the screen: `GSPrimitives=2 CInvocations=2 CPrimitives=2
+  PSInvocations=4,147,200`. The expansion path is therefore producing correct,
+  visible geometry elsewhere in the same frame.
+- Forcing CULL_NONE on the expanded rect variant changed nothing either
+  (`PSInvocations` stayed 0), so the two triangles are not being culled; they are
+  degenerate or entirely outside the viewport. That change was reverted rather
+  than shipped on an unproven theory.
+
+Conclusion: the composite draw is faithfully translated. Its three vertices
+rasterize to zero area because of the data the title gives the vertex shader at
+this stage, not because of a bound-state translation defect. The black frame is
+the title's own black frame (the two offscreen UI draws shade the full screen and
+half the screen and write RGB 0 with alpha 0.5), and this draw then fails to copy
+it anywhere.
+
+### Measured on the shipped build
+
+| frame | title backbuffer | presented swapchain |
+|------:|-----------------:|--------------------:|
+| 10    | 0 / 8,294,400    | 27,117 / 8,294,400 (0.33%), 187 rows |
+| 200   | 0 / 8,294,400    | 28,582 / 8,294,400 (0.34%), 218 rows |
+
+Zero PSO rejections (`0 rejected loads, 0 unkeyed`); `d3d12_xs` 717 passed with
+the one known environmental `xs_exports` failure, `tombox-xshader` 126 passed.
+
+### Still open
+
+Reachability is now the whole blocker: the title raises `0xC0000005` writing to
+`0x0` at `game_scarlett_master.exe+0x2215c35` after 135-150 s (its own heap
+allocator) and never reaches the frames where it has content to composite.
