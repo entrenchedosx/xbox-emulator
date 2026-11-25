@@ -1193,12 +1193,78 @@ fn root_of(list: usize, side: usize) -> Option<usize> {
     lists(|m| chain.iter().rev().find_map(|l| m.get(&(*l as usize)).and_then(|s| s.root[side])))
 }
 
+/// Env-gated (`TOMBOX_TITLE_HEAP_TBL=1`) diagnostic on the path the title's tables really take: the
+/// kind-1 console-descriptor decode at the table bind. Per root signature it prints the first slots
+/// of parameter 0 - the console words, their CBV-shaped reading, the resource and offset the address
+/// resolves to, and the floats at element 0 (the transform the VS reads) and element 2 (the colour a
+/// full-target fill reads). Bytes are read through the PC address (`pc_va(entry.res) + off`), never
+/// through the console address, so a placed alias is read where the GPU reads it. Bounded per root
+/// signature rather than by a raw line budget so a long run cannot crowd out the signature of
+/// interest. Off unless the variable is set; harmless when gated off.
+pub fn tables_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TOMBOX_TITLE_HEAP_TBL").map_or(false, |v| v != "0"))
+}
+
+fn diag_table(rs: usize, param: u32, heap: usize, index: u32, ranges: Option<&[TableRange]>) {
+    if !tables_on() || param != 0 {
+        return;
+    }
+    static PER: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+    {
+        let mut g = PER.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.len() > 12 {
+            return;
+        }
+        let n = m.get(&rs).copied().unwrap_or(0);
+        if n >= 3 {
+            return;
+        }
+        m.insert(rs, n + 1);
+    }
+    let (slot0, w) = heaps(|m| m.get(&heap).map(|h| (h.slot0, h.words()))).unwrap_or((0, 0));
+    let list: Vec<TableRange> = ranges.map(|r| r.to_vec()).unwrap_or_default();
+    let mut s = format!(
+        "tblrs={rs:#x} p{param} heap={heap:#x} slot0={slot0:#x} idx={index} words={w} ranges[{}]",
+        list.iter().map(|x| format!("{}+{}/{}", x.offset, x.count, x.kind)).collect::<Vec<_>>().join(" ")
+    );
+    for x in list.iter().take(2) {
+        let at = index as usize + x.offset as usize;
+        let mut q = [0u32; 8];
+        let read = heaps(|m| m.get(&heap).map(|h| for (k, o) in q.iter_mut().enumerate() { *o = *h.raw.get(at * h.words() + k).unwrap_or(&0); }));
+        if read.is_none() {
+            continue;
+        }
+        let va = q[0] as u64 | (q[1] as u64) << 32;
+        let mut t = format!(" [off{} n{} k{} slot{at} {q:08x?} va={va:#x} size={} fl={}]", x.offset, x.count, x.kind, q[2], q[3]);
+        if let Some((e, off)) = crate::gpu_va::lookup(va) {
+            let pc = unsafe { pc_va(e.res) } + off;
+            let f = |p: u64| -> String {
+                if p < 0x10000 {
+                    return "n/a".into();
+                }
+                let b = unsafe { core::slice::from_raw_parts(p as *const u8, 16) };
+                b.chunks_exact(4).map(|c| format!("{:.6}", f32::from_bits(u32::from_le_bytes(c.try_into().unwrap())))).collect::<Vec<_>>().join(" ")
+            };
+            t.push_str(&format!(" res={:#x} off={off:#x} len={:#x} buf={} pc={pc:#x} e0=[{}] e2=[{}]", e.res, e.len, e.buffer, f(pc), f(pc + 32)));
+        } else {
+            t.push_str(" va not in any buffer");
+        }
+        s.push_str(&t);
+    }
+    record(M, TAG, &s);
+}
+
 pub fn on_table(list: usize, side: usize, param: u32, handle: u64) -> u64 {
     let Some((heap, index, pc, ty)) = locate(handle) else {
         return handle;
     };
     let rs = root_of(list, side);
     let ranges = rs.and_then(|rs| roots(|m| m.get(&rs).and_then(|l| l.tables.get(param as usize).cloned().flatten())));
+    if let Some(rr) = rs {
+        diag_table(rr, param, heap, index, ranges.as_deref());
+    }
     if ranges.is_none() {
         // Bounded diagnostic: a table with no range list is either a parameter the root signature
         // declares as something other than a table (a root CBV/SRV, in which case the title should
