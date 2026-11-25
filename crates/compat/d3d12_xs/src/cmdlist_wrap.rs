@@ -229,6 +229,7 @@ macro_rules! make_probes {
                 XBOX_VT[35].store(set_compute_table_traced as usize, Ordering::Relaxed);
                 XBOX_VT[36].store(set_gfx_table_traced as usize, Ordering::Relaxed);
             }
+            XBOX_VT[32].store(set_descriptor_heaps_logged as usize, Ordering::Relaxed);
             crate::blendclamp::install();
             crate::gpuprof::install();
         }
@@ -269,6 +270,28 @@ unsafe extern "system" fn om_set_targets_traced(this: *mut c_void, n: u32, handl
     let f: unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize) = core::mem::transmute(*REAL_VT_PTR.add(46));
     f(this, n, handles, single, dsv)
 }
+/// SetDescriptorHeaps (PC 28 = Xbox 32): record which heap types the title binds, then forward.
+unsafe extern "system" fn set_descriptor_heaps_logged(this: *mut c_void, n: u32, heaps: *const *mut c_void) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 12 {
+        let mut v = Vec::new();
+        for i in 0..n as usize {
+            let h = unsafe { *heaps.add(i) };
+            if h.is_null() { v.push("null".to_string()); continue; }
+            let vt = unsafe { *(h as *const *const usize) };
+            let g: unsafe extern "system" fn(*mut c_void, *mut u32) =
+                unsafe { core::mem::transmute(*vt.add(8)) };
+            let mut d = [0u32; 4];
+            unsafe { g(h, d.as_mut_ptr()) }
+            v.push(format!("type={} num={} flags={:#x}", d[0], d[1], d[2]));
+        }
+        record("d3d12_xs", "SetDescriptorHeaps", &format!("n={n} [{}]", v.join(", ")));
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
+        unsafe { core::mem::transmute(*REAL_VT_PTR.add(28)) };
+    unsafe { f(this, n, heaps) }
+}
+
 /// SetCompute/GraphicsRootDescriptorTable (PC 31/32 = Xbox 35/36): (RootParameterIndex,
 /// D3D12_GPU_DESCRIPTOR_HANDLE by value). Recorded for the binding trace.
 unsafe extern "system" fn set_compute_table_traced(this: *mut c_void, index: u32, handle: u64) {

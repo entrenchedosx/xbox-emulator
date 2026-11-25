@@ -369,5 +369,27 @@ reorder and its classifier were reverted; no other changes were involved.
   **50,883 PSOs** (117 hits) and the title kept presenting the same 3-draw
   content through present 780. The title is not yet rendering a menu/game frame;
   this is a loading/precompile stall, not a missing copy of a rendered frame.
-- Open: a longer run with snapshots at later frames is in progress; the
-  precompilation volume (50k driver PSO builds) is itself a performance defect.
+- Open: the precompilation volume (50k driver PSO builds) is itself a
+  performance defect.
+
+### Heap binding and input are not the black-screen cause
+
+- With the heap-binding probe re-enabled (safe after fixing a descriptor
+  lifetime bug), the title calls `SetDescriptorHeaps n=2` with
+  `type=0 num=1000000 flags=0x1` **and** `type=1 num=2048 flags=0x1`: the
+  extended sampler heap really is bound, so the direct-heap reads are valid.
+- A long run (MDBG_LIMIT=900) reached **present 1500** with snapshots at frames
+  300/600/900/1200: `title_backbuffer` stayed **0 of 8,294,400** every time, and
+  the draw count stayed exactly **3** (all into `rt#022` and `rt#000`), with
+  `draws_into_presented=0` and no copy calls. `pso_lib` reached 25,711 hits /
+  25,289 misses.
+- `PresentX` planes are single-resource (`plane_count=1, res_count=1`), so the
+  presented surface choice is not a multi-plane read either.
+- A virtual-pad test (`press start`, `press a`) did run, but the title logged
+  "has read the virtual pad 0 time(s)": it is not polling input at this stage.
+- Conclusion: with zero pipeline rejections and a bound sampler heap, the title
+  is still in a startup state that submits three draws into an offscreen target
+  and presents a cleared buffer. The black title backbuffer is therefore a
+  title-side startup/loading stall, not an OSD measurement error and not (per
+  the measurements above) a missing present copy. No genuine title frame has
+  been captured yet; this remains the open blocker.
