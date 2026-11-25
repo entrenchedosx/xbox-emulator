@@ -812,3 +812,75 @@ Composite `PSInvocations=8,294,400` (was 0); title backbuffer 0 of 8,294,400
 non-black pixels; presented source 0 of 8,294,400 non-black, so the swapchain
 still shows only the OSD the emulator draws after the copy. The visible frame is
 still black.
+
+## Is the black real, and what does the composite's PS actually compute?
+
+### The capture path is honest: the window itself was read
+
+Two independent readbacks (`passcap`, `rtcap`) use the same copy-into-a-readback
+buffer mechanics, so neither can settle a "maybe the capture lies" question. An
+outside measurement can: a Windows `PrintWindow` capture of the title's own
+window (`wincap.ps1`, PW_RENDERFULLCONTENT, 2x2 sampled) at present ~60 reports
+`sampled=379760 nonblack=14479 frac=0.0381 max=255 mean=8.94`, and the image is
+the emulator's OSD text and frametime graph on pure black. The OSD is drawn by
+`present.rs` **after** `CopyResource(swapchain, src)`, so this separates the two:
+OSD = 3.81% of the window's pixels, the title's own contribution = **0**. The
+capture path is not lying; the title's target really is black, and the DSV
+reading all-zero is consistent (both full-target draws write z=0 everywhere).
+
+### What the composite's PS computes (translated DXIL, draw 01)
+
+```
+Resource Bindings:
+ sbuf268697665563   texture  struct  r/o  T0t27,space4100001  1
+%1  = createHandle(0, 0, 27)                       ; SRV t27, space 4100001
+%2..%5 = loadInput(1, 0..3)                        ; COLOR0 (interpolated)
+%6..%13 = rawBufferLoad(handle, i32 2, 0|4|8|12)   ; element 2 of the struct
+%14 = bitcast i32 %7 to float
+%16 = fcmp oeq float %14, 0
+%18 = fmul fast float %14, %2
+...
+```
+
+The PS is a **full-target fill whose colour is element 2 of the very same
+constant block** (`t27, space4100001`, a struct of `[4 x i32]` per element) whose
+transform the VS reads, multiplied by the interpolated vertex colour, with an
+explicit `== 0` guard per channel. So one 16-byte element decides both geometry
+and colour: if the block holds black, the frame is black **by construction**, and
+the `==0` guards turn "read nothing" into exactly the same picture.
+
+### Correction to the previous entry's causal claim
+
+`title_heap::write_slot`'s CBV-to-raw-SRV path did **not** run in the latest
+title run: with `cbv_raw=copy` active it logged no conversion and no conversion
+failure, while 868 `no PC resource/format match; null view written` events came
+from other slots. The composite's own table slots therefore go through the
+generic console-descriptor decode (kind 1), not `KIND_CBV`. The earlier
+`PSInvocations=0` -> `8,294,400` step cannot be attributed to that commit: the two
+runs' vertex buffers differ (pixel-space corners then, NDC corners now), and an
+NDC vertex term covers the target even when the cbuffer term is zero. The
+`write_slot` change is still right on its own terms - a CBV mirror written into a
+range the patched signature declares as an SRV can never be read - but it is not
+what made this draw cover its target, and the claim that it was is withdrawn.
+
+### New measured leads
+
+* A **third draw** exists in the same captured frame: `topo=17 rt=0x170c7dc24a0`
+  with `PSInvocations=0` while the two draws into the other target report
+  8,294,400 - same signature, same list.
+* `title_heap heap 0x170be140270: 4 slot ranges are bound as different view kinds
+  by lists in one submission; the most recently recorded binding is mirrored`:
+  one mirror per range cannot serve two kinds in one submission, so at least one
+  list in that submission reads a descriptor written for the other.
+* One signature parses as `0 table parameter(s); param 0 = None` even though the
+  title binds a table at parameter 0 on it.
+
+### State on this build
+
+Visible frame black: window = OSD only (3.81% of sampled pixels), title 0 of
+8,294,400 non-black; drawn target 0 of 8,294,400; presented source 0 of
+8,294,400. The next thing to measure is the 16 bytes of element 2 in the
+constant block behind `t27, space4100001` at draw time (and the same block's
+transform element), which requires a read that is valid at that moment - the
+sample added for it never fired, because the `KIND_CBV` path it hung off is not
+the path this title's tables take.
