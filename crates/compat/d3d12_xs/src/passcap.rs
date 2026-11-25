@@ -1790,6 +1790,22 @@ unsafe fn after_write(this: *mut c_void, what: &str, dst: usize, src: usize, def
 unsafe extern "system" fn resolve(this: *mut c_void, dst: *mut c_void, dsub: u32, src: *mut c_void, ssub: u32, fmt: u32) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u32, u32) = core::mem::transmute(prev(19));
     f(this, dst, dsub, src, ssub, fmt);
+    {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 24 {
+            record(
+                "d3d12_xs",
+                "resolve.handles",
+                &format!(
+                    "ResolveSubresource dst=0x{:x} dsub={dsub} dst_desc={}B src=0x{:x} ssub={ssub} src_desc={}B fmt={fmt}",
+                    dst as usize,
+                    desc_of(dst as usize).len(),
+                    src as usize,
+                    desc_of(src as usize).len()
+                ),
+            );
+        }
+    }
     after_write(this, &format!("ResolveSubresource(sub {dsub}<-{ssub} fmt={fmt})"), if dsub == 0 { dst as usize } else { 0 }, src as usize, ST_RESOLVE_DEST, true);
 }
 
@@ -1817,6 +1833,22 @@ unsafe extern "system" fn copy_region_x(this: *mut c_void, dst: *const u8, x: u3
 unsafe extern "system" fn copy_resource(this: *mut c_void, dst: *mut c_void, src: *mut c_void) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = core::mem::transmute(prev(17));
     f(this, dst, src);
+    {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 24 {
+            record(
+                "d3d12_xs",
+                "copy.handles",
+                &format!(
+                    "CopyResource dst=0x{:x} dst_desc={}B src=0x{:x} src_desc={}B",
+                    dst as usize,
+                    desc_of(dst as usize).len(),
+                    src as usize,
+                    desc_of(src as usize).len()
+                ),
+            );
+        }
+    }
     after_write(this, "CopyResource", dst as usize, src as usize, ST_COPY_DEST, false);
 }
 unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: *mut c_void, src: *mut c_void, flags: u32) {
