@@ -604,6 +604,12 @@ struct LState {
     pso_dirty: bool,
     seq: u32,
     cbv: HashMap<u32, u64>,
+    /// Root SRVs/UAVs (Xbox slots 44/46) and every root-state call on this list in order, so a draw
+    /// can show whether a transform was ever bound, was bound and then replaced, or was cleared by a
+    /// root-signature change.
+    rsrv: HashMap<u32, u64>,
+    ruav: HashMap<u32, u64>,
+    journal: Vec<String>,
     groot: usize,
     rc: HashMap<u32, Vec<Option<u32>>>,
     sref: Option<u32>,
@@ -1147,6 +1153,52 @@ unsafe fn probe_text(p: &ProbeBuf) -> String {
     t
 }
 
+/// One ordered line per root-state call on a list. A draw that reads a register nothing here ever
+/// mentions was never given that register on this list; a register that is set and then replaced or
+/// cleared is a different defect (dropped state) and the two must never be confused.
+fn journal(this: *mut c_void, line: String) {
+    with(|g| {
+        let st = g.lists.entry(key(this)).or_default();
+        st.journal.push(line);
+        if st.journal.len() > 256 {
+            st.journal.drain(0..128);
+        }
+    });
+}
+
+/// Disassembles a stream pipeline's stage bytecode into the draw record, so the record states which
+/// constant/memory registers the shader it really runs reads instead of leaving that to inference.
+fn shader_text(pso: usize) -> String {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let cap_n = std::env::var("TOMBOX_PASSCAP_DISASM").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    if cap_n == 0 || N.fetch_add(1, Ordering::Relaxed) >= cap_n {
+        return String::new();
+    }
+    let mut s = String::new();
+    for (ty, name, cap) in [(1u32, "vs", 800usize), (2, "ps", 400)] {
+        let Some((p, n)) = crate::dbcount::sub_payload(pso, ty) else { continue };
+        let Some(b) = crate::title_shadow::raw(p, n) else {
+            s.push_str(&format!("\n      {name} ({n}B) unreadable"));
+            continue;
+        };
+        let magic = String::from_utf8_lossy(&b[..4.min(b.len())]).into_owned();
+        match tombox_xshader::dxc::disassemble(&b) {
+            Ok(t) => {
+                let lines: Vec<&str> = t.lines().filter(|l| !l.trim().is_empty()).collect();
+                s.push_str(&format!("\n      {name} ({n}B magic {magic:?}, {} lines):", lines.len()));
+                for l in lines.iter().take(cap) {
+                    s.push_str(&format!("\n        {l}"));
+                }
+                if lines.len() > cap {
+                    s.push_str(&format!("\n        … {} more lines", lines.len() - cap));
+                }
+            }
+            Err(e) => s.push_str(&format!("\n      {name} ({n}B magic {magic:?}): disasm failed: {e}")),
+        }
+    }
+    s
+}
+
 fn note_rc(this: *mut c_void, i: u32, off: u32, vals: &[u32]) {
     with(|g| {
         let st = g.lists.entry(key(this)).or_default();
@@ -1171,12 +1223,15 @@ unsafe extern "system" fn set_stencil_ref(this: *mut c_void, r: u32) {
 }
 
 unsafe extern "system" fn set_graphics_root_c1(this: *mut c_void, i: u32, v: u32, off: u32) {
+    journal(this, format!("Root32BitConstant({i}, {v:#x}, off {off})"));
     note_rc(this, i, off, &[v]);
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(prev(38));
     f(this, i, v, off)
 }
 
 unsafe extern "system" fn set_graphics_root_cn(this: *mut c_void, i: u32, n: u32, p: *const c_void, off: u32) {
+    let head: Vec<String> = if p.is_null() { Vec::new() } else { std::slice::from_raw_parts(p as *const u32, (n as usize).min(8)).iter().map(|v| format!("{v:08x}={:.4}", f32::from_bits(*v))).collect() };
+    journal(this, format!("Root32BitConstants({i}, {n}, off {off}) [{}]", head.join(" ")));
     if !p.is_null() && n > 0 {
         let vals = std::slice::from_raw_parts(p as *const u32, (n as usize).min(64));
         note_rc(this, i, off, vals);
@@ -1188,11 +1243,15 @@ unsafe extern "system" fn set_graphics_root_cn(this: *mut c_void, i: u32, n: u32
 unsafe extern "system" fn set_graphics_root_sig(this: *mut c_void, rs: *mut c_void) {
     with(|g| {
         let st = g.lists.entry(key(this)).or_default();
-        if st.groot != rs as usize {
+        let was = st.groot;
+        if was != rs as usize {
             st.groot = rs as usize;
             st.cbv.clear();
             st.rc.clear();
+            st.rsrv.clear();
+            st.ruav.clear();
         }
+        st.journal.push(format!("SetGraphicsRootSignature({:#x}) was {was:#x}{}", rs as usize, if was != rs as usize { ", root args cleared with it" } else { "" }));
     });
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(prev(34));
     f(this, rs)
@@ -1249,6 +1308,7 @@ fn note_dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
 }
 
 unsafe extern "system" fn set_graphics_table(this: *mut c_void, i: u32, h: u64) {
+    journal(this, format!("SetGraphicsRootDescriptorTable({i}, {h:#x})"));
     if !crate::rtcap::enabled() && tables_on() {
         crate::bindtrace::set_table(this as usize, false, i, h);
     }
@@ -1257,10 +1317,29 @@ unsafe extern "system" fn set_graphics_table(this: *mut c_void, i: u32, h: u64) 
 }
 
 unsafe extern "system" fn set_graphics_root_cbv(this: *mut c_void, i: u32, va: u64) {
+    journal(this, format!("SetGraphicsRootConstantBufferView({i}, {va:#x})"));
     with(|g| {
         g.lists.entry(key(this)).or_default().cbv.insert(i, va);
     });
     let f: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(prev(42));
+    f(this, i, va)
+}
+
+unsafe extern "system" fn set_graphics_root_srv(this: *mut c_void, i: u32, va: u64) {
+    journal(this, format!("SetGraphicsRootShaderResourceView({i}, {va:#x})"));
+    with(|g| {
+        g.lists.entry(key(this)).or_default().rsrv.insert(i, va);
+    });
+    let f: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(prev(44));
+    f(this, i, va)
+}
+
+unsafe extern "system" fn set_graphics_root_uav(this: *mut c_void, i: u32, va: u64) {
+    journal(this, format!("SetGraphicsRootUnorderedAccessView({i}, {va:#x})"));
+    with(|g| {
+        g.lists.entry(key(this)).or_default().ruav.insert(i, va);
+    });
+    let f: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(prev(46));
     f(this, i, va)
 }
 
@@ -1318,6 +1397,19 @@ fn root_state(g: &G, k: usize) -> String {
         let dw = unsafe { crate::bindtrace::read_va(*va, 32) }.map(|b| b.chunks_exact(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect::<Vec<_>>().join(" ")).unwrap_or_else(|| "unreadable".into());
         s.push_str(&format!(" cbv[{i}] va={va:#x} [{dw}]"));
     }
+    let mut rv: Vec<(u32, u64)> = st.rsrv.iter().map(|(a, b)| (*a, *b)).collect();
+    rv.sort();
+    for (i, va) in rv.iter().take(8) {
+        s.push_str(&format!(" rootSRV[{i}]={va:#x}"));
+    }
+    let mut uv: Vec<(u32, u64)> = st.ruav.iter().map(|(a, b)| (*a, *b)).collect();
+    uv.sort();
+    for (i, va) in uv.iter().take(8) {
+        s.push_str(&format!(" rootUAV[{i}]={va:#x}"));
+    }
+    let n = st.journal.len();
+    let from = n.saturating_sub(24);
+    s.push_str(&format!(" journal[{n}]{:?}", &st.journal[from..]));
     s
 }
 
@@ -1360,11 +1452,10 @@ fn draw_record(g: &G, k: usize, this: usize, kind: u8, args: &str) -> String {
     }).collect();
     let ib = crate::cl2_state::ib_of(this).map(|v| format!(" va={:#x} fmt={} off={:#x}", u64::from_le_bytes(v[0..8].try_into().unwrap()), u32::from_le_bytes(v[8..12].try_into().unwrap()), u32::from_le_bytes(v[12..16].try_into().unwrap()))).unwrap_or_else(|| "none".into());
     s.push_str(&format!(" vb[{}] ib[{ib}]", if vb.is_empty() { "none bound".to_string() } else { vb.join("; ") }));
-    let st = g.lists.get(&k).unwrap();
-    let _ = st;
     s.push_str(&format!(" list-root-state [{}]", root_state(g, k)));
-    for param in 0..4u32 {
-        for slot in 0..4u32 {
+    s.push_str(&shader_text(pso));
+    for param in 0..16u32 {
+        for slot in 0..8u32 {
             if let Some((res, fmt, dim, map)) = crate::bindtrace::table_srv_fmt(this, false, param, slot) {
                 s.push_str(&format!(" t{param}[{slot}]=res{res:#x}/fmt{fmt}/dim{dim}/map{map:#x}"));
             }
@@ -1551,6 +1642,7 @@ unsafe extern "system" fn execute_bundle(this: *mut c_void, bundle: *mut c_void)
 }
 
 unsafe extern "system" fn set_pso(this: *mut c_void, pso: *mut c_void) {
+    journal(this, format!("SetPipelineState({:#x})", pso as usize));
     with(|g| {
         let st = g.lists.entry(key(this)).or_default();
         st.pso = pso as usize;
@@ -1743,8 +1835,8 @@ pub fn install(vt: &[AtomicUsize]) {
     if !on() {
         return;
     }
-    let hooks: [(usize, usize); 27] = [
-        (27, execute_bundle as *const () as usize),
+    let hooks: [(usize, usize); 29] = [
+        (27, execute_bundle as *const () as usize), (44, set_graphics_root_srv as *const () as usize), (46, set_graphics_root_uav as *const () as usize),
         (36, set_graphics_table as *const () as usize), (35, set_compute_table as *const () as usize), (24, set_stencil_ref as *const () as usize), (42, set_graphics_root_cbv as *const () as usize), (34, set_graphics_root_sig as *const () as usize), (38, set_graphics_root_c1 as *const () as usize), (40, set_graphics_root_cn as *const () as usize),
         (9, close as *const () as usize), (10, reset as *const () as usize), (12, draw as *const () as usize), (13, draw_indexed as *const () as usize), (14, dispatch as *const () as usize),
         (16, copy_region as *const () as usize), (17, copy_resource as *const () as usize), (19, resolve as *const () as usize), (25, set_pso as *const () as usize), (26, barrier as *const () as usize),

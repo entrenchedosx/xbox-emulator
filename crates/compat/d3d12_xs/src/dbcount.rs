@@ -640,6 +640,16 @@ pub fn stream_pso_dump(pso: usize) -> Option<String> {
     Some(s)
 }
 
+/// The (pointer, length) a stream PSO carries for one subobject, read out of the stream itself. Used
+/// to hand a draw's real pipeline bytecode to the disassembler instead of guessing at it.
+pub fn sub_payload(pso: usize, ty: u32) -> Option<(u64, usize)> {
+    let r = stream_rec(pso)?;
+    let &(_, o) = r.subs.iter().find(|x| x.0 == ty)?;
+    let g = |at: usize| -> Option<u64> { Some(u64::from_le_bytes(r.stream.get(at..at + 8)?.try_into().ok()?)) };
+    let (p, n) = (g(o)?, g(o + 8)?);
+    (p != 0 && n > 64 && n <= 0x200000).then_some((p, n as usize))
+}
+
 pub(crate) fn stream_rec(pso: usize) -> Option<Arc<StreamRec>> {
     STREAMS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&pso).cloned()
 }

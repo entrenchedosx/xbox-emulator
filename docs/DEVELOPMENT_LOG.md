@@ -676,3 +676,69 @@ Composite: `IAVertices=3 GSPrimitives=2 CInvocations=2 CPrimitives=2 PSInvocatio
 Title backbuffer 0 of 8,294,400 non-black pixels; presented swapchain OSD only.
 Zero PSO rejections. `d3d12_xs` 717 passed (1 known environmental), `tombox-xshader`
 126 passed.
+
+## Rect-list corner convention: the three vertices are *consecutive* corners
+
+The synthesised RECTLIST geometry shader treated `v0` as the corner diagonally
+opposite the one it generated, so it completed the rectangle as `v1 + v2 - v0`.
+The title's own rect lists say otherwise, on both of its RECTLIST draws:
+
+```
+draw 01 (clip space)  v0=(-1,1) uv(0,0)   v1=(-1,-1) uv(0,1)   v2=(1,-1) uv(1,1)
+draw 02 (pixels)      v0=(0,0)  uv(0,0)   v1=(0,2160) uv(0,1)  v2=(3840,2160) uv(1,1)
+```
+
+Both are top-left, bottom-left, bottom-right, so `v1` is the corner *between* the
+other two, the omitted corner is top-right, and its texture coordinate must be
+`(1,0)`. Only `v0 + v2 - v1` yields that: `v1 + v2 - v0` gives uv `(1,2)`, outside
+the source rect, and its quad `(v0,v1,v3,v2)` only covers half the target. The
+arithmetic matches the measurement exactly: the old rule covered 2 of the 4 clip
+units, i.e. 4,147,200 of 8,294,400 pixels.
+
+`rectlist.rs` now completes the parallelogram as `v0 + v2 - v1` (with the same
+projective `1/w` handling, roles permuted) and emits the fan in quad order
+`(v0,v1,v2)(v0,v2,v3)` so both triangles keep one winding instead of the previous
+`(v0,v1,v3)(v0,v3,v2)`, which alternates it. Measured on the title:
+
+```
+draw 01  PSInvocations 4,147,200 -> 8,294,400   (full 3840x2160 target)
+         occlusion samples 4,147,200 -> 8,294,400
+```
+
+### The composite is the draw into the presented buffer, and its VS is not a passthrough
+
+`draw 02` is pass#2 on the same list, `rt` = the presented source, no DSV, full
+viewport/scissor. Its translated VS is 7,972 bytes / 722 lines and computes
+`SV_Position = vertex term + cbuffer term` (`fadd` of a per-vertex value and an
+`FMad` chain), reading two raw buffers:
+
+```
+sbuf3932160002  texture struct r/o  t2, space60000      (positional SRV range)
+sbuf268697665563 texture struct r/o t27, space4100001   (descriptor-table CBV range)
+```
+
+So the pixel-to-clip transform does exist and comes from the descriptor table the
+title binds at root parameter 0 (`SetGraphicsRootDescriptorTable(0, ...)`), whose
+ranges cover both an SRV (t2) and a CBV (b27). The journal for that list records
+
+```
+SetPipelineState(0x23525ea5bd0)
+SetGraphicsRootSignature(0x235067f5300) was 0x235067f5300     <- same signature
+SetGraphicsRootDescriptorTable(0, 0x2334c8add80)
+```
+
+The re-set is the *same* root signature and root arguments are only cleared when
+it differs, so "bound then lost" is disproved for this draw: nothing was dropped
+between the table bind and the draw. With the corrected corner rule the composite
+still reports `GSInvocations=1 GSPrimitives=2 CInvocations=2 CPrimitives=2
+PSInvocations=0`, i.e. its quad is still degenerate, which now points at the
+constants its VS reads rather than at the rect.
+
+### State on this build
+
+Composite `PSInvocations=0`; title backbuffer 0 of 8,294,400 non-black pixels;
+presented swapchain OSD only. Open lead: `title_heap` reports 1,032
+`console descriptor [...] has no PC resource/format match; null view written`
+events, and the one-shot block dump shows the first one in a UAV range over an
+all-zero heap region, so which of the composite's table descriptors (if any) are
+null is not yet established.

@@ -206,7 +206,10 @@ pub fn gs_hlsl(vs_out: &[El], ps_in: &[El]) -> Result<String, String> {
     let p = format!("f{pos}");
     h.push_str(&format!("    float q0 = 1.0 / v[0].{p}.w;\n    float q1 = 1.0 / v[1].{p}.w;\n    float q2 = 1.0 / v[2].{p}.w;\n"));
     h.push_str(&format!("    bool same = v[0].{p}.w == v[1].{p}.w && v[0].{p}.w == v[2].{p}.w;\n"));
-    h.push_str("    float q3 = q1 + q2 - q0;\n    float w3 = 1.0 / q3;\n    GO c[4];\n");
+    // A rect list gives three corners that are consecutive around the rectangle, with the middle one
+    // (v1) adjacent to both others: the title's own rects are top-left, bottom-left, bottom-right. The
+    // corner the list omits is therefore v0 + v2 - v1, and the quad runs v0, v1, v2, v3.
+    h.push_str("    float q3 = q0 + q2 - q1;\n    float w3 = 1.0 / q3;\n    GO c[4];\n");
     for k in 0..3 {
         for i in 0..vs_out.len() {
             h.push_str(&format!("    c[{k}].f{i} = v[{k}].f{i};\n"));
@@ -215,9 +218,9 @@ pub fn gs_hlsl(vs_out: &[El], ps_in: &[El]) -> Result<String, String> {
     for (i, e) in vs_out.iter().enumerate() {
         let f = format!("f{i}");
         let line = match mode(e, ps_in) {
-            Mode::Position => format!("    c[3].{f} = same ? v[1].{f} + v[2].{f} - v[0].{f} : float4((v[1].{f}.xyz * q1 + v[2].{f}.xyz * q2 - v[0].{f}.xyz * q0) * w3, w3);\n"),
-            Mode::Perspective => format!("    c[3].{f} = same ? v[1].{f} + v[2].{f} - v[0].{f} : (v[1].{f} * q1 + v[2].{f} * q2 - v[0].{f} * q0) * w3;\n"),
-            Mode::Affine => format!("    c[3].{f} = v[1].{f} + v[2].{f} - v[0].{f};\n"),
+            Mode::Position => format!("    c[3].{f} = same ? v[0].{f} + v[2].{f} - v[1].{f} : float4((v[0].{f}.xyz * q0 + v[2].{f}.xyz * q2 - v[1].{f}.xyz * q1) * w3, w3);\n"),
+            Mode::Perspective => format!("    c[3].{f} = same ? v[0].{f} + v[2].{f} - v[1].{f} : (v[0].{f} * q0 + v[2].{f} * q2 - v[1].{f} * q1) * w3;\n"),
+            Mode::Affine => format!("    c[3].{f} = v[0].{f} + v[2].{f} - v[1].{f};\n"),
             Mode::Flat => format!("    c[3].{f} = v[0].{f};\n"),
         };
         h.push_str(&line);
@@ -225,7 +228,8 @@ pub fn gs_hlsl(vs_out: &[El], ps_in: &[El]) -> Result<String, String> {
     if pid {
         h.push_str("    c[0].pid = pid;\n    c[1].pid = pid;\n    c[2].pid = pid;\n    c[3].pid = pid;\n");
     }
-    h.push_str("    s.Append(c[0]);\n    s.Append(c[1]);\n    s.Append(c[3]);\n    s.RestartStrip();\n    s.Append(c[0]);\n    s.Append(c[3]);\n    s.Append(c[2]);\n    s.RestartStrip();\n}\n");
+    // Fan from v0 over the quad order v0, v1, v2, v3 so both triangles keep the same winding.
+    h.push_str("    s.Append(c[0]);\n    s.Append(c[1]);\n    s.Append(c[2]);\n    s.RestartStrip();\n    s.Append(c[0]);\n    s.Append(c[2]);\n    s.Append(c[3]);\n    s.RestartStrip();\n}\n");
     Ok(h)
 }
 
@@ -261,7 +265,7 @@ static REFUSED: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
 
 fn compile_cached(h: &str) -> Result<Vec<u8>, String> {
     let mode = crate::shader_xlat::runtime_mode();
-    let more = ["rect-gs"];
+    let more = ["rect-gs2"];
     tombox_xshader::shader_cache::compile_cached_with(h, "gs_6_0", mode.fma, &tombox_xshader::pack_key::extra(mode, &more), || tombox_xshader::dxc::compile(h, "gs_6_0")).map(|c| c.code)
 }
 
@@ -415,16 +419,16 @@ mod tests {
 
     fn fourth(p: [[f64; 4]; 3], a: [f64; 3], m: Mode) -> ([f64; 4], f64) {
         let q = [1.0 / p[0][3], 1.0 / p[1][3], 1.0 / p[2][3]];
-        let q3 = q[1] + q[2] - q[0];
+        let q3 = q[0] + q[2] - q[1];
         let w3 = 1.0 / q3;
         let mut pos = [0.0; 4];
         for c in 0..3 {
-            pos[c] = (p[1][c] * q[1] + p[2][c] * q[2] - p[0][c] * q[0]) * w3;
+            pos[c] = (p[0][c] * q[0] + p[2][c] * q[2] - p[1][c] * q[1]) * w3;
         }
         pos[3] = w3;
         let attr = match m {
-            Mode::Perspective | Mode::Position => (a[1] * q[1] + a[2] * q[2] - a[0] * q[0]) * w3,
-            Mode::Affine => a[1] + a[2] - a[0],
+            Mode::Perspective | Mode::Position => (a[0] * q[0] + a[2] * q[2] - a[1] * q[1]) * w3,
+            Mode::Affine => a[0] + a[2] - a[1],
             Mode::Flat => a[0],
         };
         (pos, attr)
@@ -445,7 +449,7 @@ mod tests {
     fn fourth_corner_completes_the_parallelogram_in_screen_space_and_stays_on_the_attribute_plane() {
         let close = |a: f64, b: f64| (a - b).abs() < 1e-9 * (1.0 + a.abs().max(b.abs()));
         let rects: [[[f64; 4]; 3]; 3] = [
-            [[-1.0, 1.0, 0.5, 1.0], [-1.0, -1.0, 0.5, 1.0], [1.0, 1.0, 0.5, 1.0]],
+            [[-1.0, 1.0, 0.5, 1.0], [-1.0, -1.0, 0.5, 1.0], [1.0, -1.0, 0.5, 1.0]],
             [[-0.5 * 2.0, 0.5 * 2.0, 0.2 * 2.0, 2.0], [-0.5 * 4.0, -0.25 * 4.0, 0.3 * 4.0, 4.0], [0.75 * 3.0, 0.5 * 3.0, 0.1 * 3.0, 3.0]],
             [[0.1, 0.2, 0.0, 0.5], [0.3 * 1.5, 0.2 * 1.5, 0.4 * 1.5, 1.5], [0.1 * 0.8, 0.9 * 0.8, 0.9 * 0.8, 0.8]],
         ];
@@ -455,7 +459,7 @@ mod tests {
             let s: Vec<[f64; 3]> = p.iter().map(|&v| screen(v)).collect();
             let s3 = screen(v3);
             for c in 0..3 {
-                assert!(close(s3[c], s[1][c] + s[2][c] - s[0][c]), "screen corner {c}: {} vs {}", s3[c], s[1][c] + s[2][c] - s[0][c]);
+                assert!(close(s3[c], s[0][c] + s[2][c] - s[1][c]), "screen corner {c}: {} vs {}", s3[c], s[0][c] + s[2][c] - s[1][c]);
             }
             let xy = [[s[0][0], s[0][1]], [s[1][0], s[1][1]], [s[2][0], s[2][1]]];
             let at = [s3[0], s3[1]];
@@ -468,10 +472,11 @@ mod tests {
             assert!(close(n3, plane_at(xy, attr, at)), "noperspective attribute: {n3}");
             assert_eq!(fourth(p, attr, Mode::Flat).1, attr[0]);
         }
+        // top-left, bottom-left, bottom-right in, top-right out: the full-target rect this title draws
         let blit = rects[0];
         let (v3, a3) = fourth(blit, attr, Mode::Perspective);
-        assert_eq!(v3, [1.0, -1.0, 0.5, 1.0]);
-        assert_eq!(a3, attr[1] + attr[2] - attr[0]);
+        assert_eq!(v3, [1.0, 1.0, 0.5, 1.0]);
+        assert_eq!(a3, attr[0] + attr[2] - attr[1]);
     }
 
     fn el(name: &str, index: u32, row: u8, col: u8, cols: u8, kind: u8, comp: u8, interp: u8) -> El {
@@ -484,12 +489,12 @@ mod tests {
         let ps = [el("COLOR", 0, 2, 0, 4, 0, COMP_FLOAT, 4), el("", 0, 0xff, 0, 1, KIND_PRIMITIVE_ID, COMP_UINT, 1)];
         let h = gs_hlsl(&vs, &ps).unwrap();
         assert!(h.contains("    noperspective float4 f0 : SV_Position;\n    float2 f1 : TEXCOORD0;\n    nointerpolation uint f2 : TEXCOORD1;\n    float4 f3 : COLOR0;\n"), "{h}");
-        assert!(h.contains("c[3].f0 = same ? v[1].f0 + v[2].f0 - v[0].f0 : float4((v[1].f0.xyz * q1"), "{h}");
-        assert!(h.contains("c[3].f1 = same ? v[1].f1 + v[2].f1 - v[0].f1 : (v[1].f1 * q1"), "{h}");
+        assert!(h.contains("c[3].f0 = same ? v[0].f0 + v[2].f0 - v[1].f0 : float4((v[0].f0.xyz * q0"), "{h}");
+        assert!(h.contains("c[3].f1 = same ? v[0].f1 + v[2].f1 - v[1].f1 : (v[0].f1 * q0"), "{h}");
         assert!(h.contains("c[3].f2 = v[0].f2;"), "{h}");
-        assert!(h.contains("c[3].f3 = v[1].f3 + v[2].f3 - v[0].f3;"), "{h}");
+        assert!(h.contains("c[3].f3 = v[0].f3 + v[2].f3 - v[1].f3;"), "{h}");
         assert!(h.contains("uint pid : SV_PrimitiveID;\n};"), "{h}");
-        assert!(h.contains("s.Append(c[0]);\n    s.Append(c[1]);\n    s.Append(c[3]);\n    s.RestartStrip();\n    s.Append(c[0]);\n    s.Append(c[3]);\n    s.Append(c[2]);"), "{h}");
+        assert!(h.contains("s.Append(c[0]);\n    s.Append(c[1]);\n    s.Append(c[2]);\n    s.RestartStrip();\n    s.Append(c[0]);\n    s.Append(c[2]);\n    s.Append(c[3]);"), "{h}");
         assert!(gs_hlsl(&vs[1..], &[]).is_err());
         assert!(gs_hlsl(&[el("", 0, 0, 0, 4, KIND_POSITION, COMP_FLOAT, 0), el("X", 0, 1, 0, 4, 0, 6, 0)], &[]).is_err());
         assert_eq!(forwarded(RECTLIST), TRIANGLELIST);
