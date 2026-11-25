@@ -15,7 +15,7 @@ NAME="${1:-probe}"
 LOG="$OVERLAY/$NAME.log"
 CONSOLE="$OVERLAY/$NAME.console"
 DLL="$REPO/target/release/d3d12_xs.dll"
-MDBG="$REPO/target/release/mdbg.exe"
+MDBG="$REPO/target/release/mdbg_hr.exe"
 
 fail() { echo "RUNNER: FAIL: $*" >&2; exit 1; }
 

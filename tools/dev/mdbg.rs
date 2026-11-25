@@ -571,9 +571,13 @@ fn exc_hr_suffix(read: impl Fn(u64, usize) -> Vec<u8>, obj: u64) -> String {
     }
     let c = [rd_u32(&buf, 0), rd_u32(&buf, 4), rd_u32(&buf, 8), rd_u32(&buf, 0x10)];
     let dump = format!(" cands=[{:#010X},{:#010X},{:#010X},{:#010X}]", c[0], c[1], c[2], c[3]);
-    // Severity bit set and a non-zero code: E_FAIL (0x80004005) has facility 0, so the facility
-    // field alone cannot be required.
-    match c.iter().copied().find(|h| (*h & 0x8000_0000) != 0 && (*h & 0xFFFF) != 0) {
+    // Severity bit set, non-zero code, and a facility field that is actually a facility. The
+    // low half of the object's vtable pointer sits at 0x0 in an MSVC _com_error and reads as a
+    // "valid" HRESULT by the first two tests alone (a live capture picked 0x9EBB8938, whose
+    // facility 0x1EBB is not a facility), so bound the facility field.
+    match c.iter().copied().find(|h| {
+        (*h & 0x8000_0000) != 0 && (*h & 0xFFFF) != 0 && ((*h >> 16) & 0x1FFF) <= 0x1FF
+    }) {
         Some(h) => format!(" hr=0x{h:08X}{dump}"),
         None => format!(" hr=unavailable(no-valid-word){dump}"),
     }
@@ -596,6 +600,21 @@ mod exc_hr_tests {
         let s = exc_hr_suffix(|_, n| obj[..n.min(obj.len())].to_vec(), 0x1000);
         assert!(s.contains("hr=0x80004005"), "{s}");
         assert!(s.contains("cands=["), "{s}");
+    }
+
+    /// The object seen in a live capture: the low half of its vtable (0x9EBB8938) also has the
+    /// severity bit set, and the real code is E_INVALIDARG at 0x8.
+    #[test]
+    fn a_vtable_half_is_not_mistaken_for_an_hresult() {
+        let obj: [u8; 0x14] = [
+            0x38, 0x89, 0xBB, 0x9E, // 0x0 vtable low half
+            0xFD, 0x7F, 0x00, 0x00, // 0x4 vtable high half
+            0x57, 0x00, 0x07, 0x80, // 0x8 E_INVALIDARG = 0x80070057
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let s = exc_hr_suffix(|_, n| obj[..n.min(obj.len())].to_vec(), 0x3000);
+        assert!(s.contains("hr=0x80070057"), "{s}");
     }
 
     #[test]
