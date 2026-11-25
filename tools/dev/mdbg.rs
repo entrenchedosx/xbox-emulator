@@ -447,6 +447,13 @@ fn main() {
                         if let Some(c) = &caller { extra.push_str(&format!(" caller={c}")); }
                         if let Some(t) = &thrower { extra.push_str(&format!(" thrower_image={t}")); }
                         if let Some(t) = &ty { extra.push_str(&format!(" type={t}")); }
+                        // A C++ throw of _com_error carries the HRESULT inside the thrown object,
+                        // not in the later access violation. Decode it here, from the exception
+                        // record's own parameter array (ExceptionInformation[1]). Gated and capped
+                        // like the other traces; never guessed when the object is absent.
+                        if ecode == 0xE06D7363 && exc_hr_gate() {
+                            extra.push_str(&exc_hr_suffix(|a, n| read_until_fault(hproc, a, n), info(1)));
+                        }
                         eprintln!("[EXC] code=0x{:08X} addr=0x{:x} ({}) firstChance={} {}{} n={} t_ms={}",
                             ecode, addr, m, first, exc_name(ecode), extra, v.nth, start.elapsed().as_millis());
                     } else if v.nth == SITE_LOG_N + 1 {
@@ -536,6 +543,67 @@ impl ExcGate {
             out.push(format!("[EXC]   n={:<5} code=0x{:08X} {} site={} type={}{}", n, code, exc_name(*code), site, if ty.is_empty() { "-" } else { ty }, if *sec > 0 { format!(" unhandled={sec}") } else { String::new() }));
         }
         out
+    }
+}
+
+/// Gate for the thrown-`_com_error` HRESULT decode: `TOMBOX_EXC_HR`, capped at 8 events.
+fn exc_hr_gate() -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if std::env::var_os("TOMBOX_EXC_HR").is_none() { return false; }
+    N.fetch_add(1, Ordering::Relaxed) < 8
+}
+
+/// Candidate HRESULT words of a thrown C++ exception object, and the one that is structural.
+///
+/// `ExceptionInformation[1]` points at the thrown object; in an MSVC throw of `_com_error` the
+/// HRESULT sits among its first words, so it is selected by shape (severity bit set, facility
+/// non-zero) rather than by a guessed offset. `read(addr, len)` supplies the bytes: the real
+/// process in the debugger, a plain buffer in tests. Nothing is synthesized when the object is
+/// absent — a rethrow has no object and says so.
+fn exc_hr_suffix(read: impl Fn(u64, usize) -> Vec<u8>, obj: u64) -> String {
+    if obj == 0 {
+        return " hr=unavailable(rethrow)".to_string();
+    }
+    let buf = read(obj, 0x14);
+    if buf.len() < 0x14 {
+        return " hr=unavailable(rethrow)".to_string();
+    }
+    let c = [rd_u32(&buf, 0), rd_u32(&buf, 4), rd_u32(&buf, 8), rd_u32(&buf, 0x10)];
+    let dump = format!(" cands=[{:#010X},{:#010X},{:#010X},{:#010X}]", c[0], c[1], c[2], c[3]);
+    // Severity bit set and a non-zero code: E_FAIL (0x80004005) has facility 0, so the facility
+    // field alone cannot be required.
+    match c.iter().copied().find(|h| (*h & 0x8000_0000) != 0 && (*h & 0xFFFF) != 0) {
+        Some(h) => format!(" hr=0x{h:08X}{dump}"),
+        None => format!(" hr=unavailable(no-valid-word){dump}"),
+    }
+}
+
+#[cfg(test)]
+mod exc_hr_tests {
+    use super::exc_hr_suffix;
+
+    /// A thrown `_com_error` object: vtable, then E_FAIL at 0x4.
+    #[test]
+    fn selects_the_structural_hresult_from_a_synthetic_object() {
+        let obj: [u8; 0x14] = [
+            0x78, 0x56, 0x34, 0x12, // 0x0 vtable
+            0x05, 0x40, 0x00, 0x80, // 0x4 E_FAIL = 0x80004005
+            0x00, 0x00, 0x00, 0x00, // 0x8
+            0x00, 0x00, 0x00, 0x00, // 0xC
+            0x00, 0x00, 0x00, 0x00, // 0x10
+        ];
+        let s = exc_hr_suffix(|_, n| obj[..n.min(obj.len())].to_vec(), 0x1000);
+        assert!(s.contains("hr=0x80004005"), "{s}");
+        assert!(s.contains("cands=["), "{s}");
+    }
+
+    #[test]
+    fn a_missing_object_is_reported_not_guessed() {
+        let s = exc_hr_suffix(|_, _| Vec::new(), 0);
+        assert!(s.contains("hr=unavailable(rethrow)"), "{s}");
+        let unreadable = exc_hr_suffix(|_, _| Vec::new(), 0x2000);
+        assert!(unreadable.contains("hr=unavailable(rethrow)"), "{unreadable}");
     }
 }
 
