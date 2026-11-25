@@ -765,6 +765,15 @@ unsafe fn present_x_body(queue: *mut c_void, plane_count: u32, planes: *const u8
         return 0;
     }
     let src = *pp;
+    if n < 6 {
+        let mut res = Vec::new();
+        for i in 0..(res_count as usize).min(8) {
+            res.push(format!("{:p}", unsafe { *pp.add(i) }));
+        }
+        record("d3d12_xs", "PresentX.planes", &format!(
+            "#{n} plane_count={plane_count} res_count={res_count} token={:#x} pp={pp:p} resources=[{}] chosen=0 ({src:p})",
+            unsafe { core::ptr::read_unaligned(planes as *const u64) }, res.join(", ")));
+    }
     crate::perf::on_present();
     crate::qwait::poll();
     crate::gpuprof::on_present();

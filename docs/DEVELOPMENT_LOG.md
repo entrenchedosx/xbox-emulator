@@ -335,3 +335,39 @@ reorder and its classifier were reverted; no other changes were involved.
   Next: compile a synthetic PS that uses `SamplerDescriptorHeap` on the real
   root to prove the PSO path, then determine why the real PS still fails
   (candidate: the PSO may still carry pre-rebuild bytecode for that shader).
+
+### Root-signature flags were the residual rejection (fixed)
+
+- A synthetic PS using `SamplerDescriptorHeap[1932 + x]` on the rejected
+  stream's own root failed with `0x80070057` for both 2D and 3D sampling, so the
+  root, not the title bytecode, was the defect.
+- The flag mask was wrong: `0x10`/`0x20` are
+  `DENY_GEOMETRY_SHADER_ROOT_ACCESS` / `DENY_PIXEL_SHADER_ROOT_ACCESS`, not the
+  direct-heap flags. The correct bits are
+  `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED = 0x400` and
+  `SAMPLER_HEAP_DIRECTLY_INDEXED = 0x800`. The previous patch denied the pixel
+  shader root access on every title root.
+- After correcting the mask, a run with the probe enabled recorded **zero**
+  `0x80070057` rejections (previously ~203 per 140 s, then 6 per 120 s).
+- Tests: `d3d12_xs` 716 passed + 1 known environmental failure; `tombox-xshader`
+  126 passed.
+
+### Why the title backbuffer is still black
+
+- The present path is: `PresentX` plane 0 resource -> `CopyResource` into a
+  swap-chain buffer -> overlay OSD drawn into the swap-chain buffer -> `Present`.
+  The `title_backbuffer` snapshot is a copy of plane 0, so OSD pixels never
+  enter that measurement.
+- Measured at frames 60/120/240: `title_backbuffer` **0 of 8,294,400** pixels;
+  `presented_swapchain` ~27,500-29,300 pixels, all OSD.
+- `PresentX.draws` shows the title issues only **3 draws per present**, all into
+  `rt#022` and `rt#000`, while plane 0 alternates between `rt#000` and `rt#001`:
+  `draws_into_presented=0`, `dispatches=0`, no copy calls in the log. The plane
+  parameters are `plane_count=1, res_count=1` (logged), so this is not a
+  multi-plane read.
+- The run is still in a startup precompilation phase: `pso_lib` compiled
+  **50,883 PSOs** (117 hits) and the title kept presenting the same 3-draw
+  content through present 780. The title is not yet rendering a menu/game frame;
+  this is a loading/precompile stall, not a missing copy of a rendered frame.
+- Open: a longer run with snapshots at later frames is in progress; the
+  precompilation volume (50k driver PSO builds) is itself a performance defect.

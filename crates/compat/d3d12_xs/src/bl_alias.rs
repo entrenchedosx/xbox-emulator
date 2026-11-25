@@ -157,7 +157,10 @@ pub fn add_literal_samplers(body: &[u8]) -> Result<Option<Vec<u8>>, String> {
     // Shaders translated with `SamplerDescriptorHeap` (the run-time S# path) and with
     // `ResourceDescriptorHeap` (bindless) require the root to allow direct heap indexing;
     // otherwise the host rejects the pipeline state with E_INVALIDARG.
-    const DIRECT_HEAPS: u32 = 0x20 | 0x10;
+    // D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED = 0x400,
+    // D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED = 0x800.
+    // (0x10/0x20 are DENY_GEOMETRY/PIXEL_SHADER_ROOT_ACCESS and must not be set here.)
+    const DIRECT_HEAPS: u32 = 0x400 | 0x800;
     let flags = rd(body, 20)?;
     let set_flags = |out: &mut Vec<u8>| { let _ = wr(out, 20, flags | DIRECT_HEAPS); };
     let existing: &[u8] = if n == 0 { &[] } else { body.get(off..off + n * stride).ok_or("RTS0 static samplers out of bounds")? };
@@ -373,7 +376,8 @@ mod positional_tests {
         let last = off + bank * 52;
         assert_eq!((rd(&out, last + 40).unwrap() as usize, rd(&out, last + 44).unwrap()), (bank - 1, litsamp::TB_LITSAMP_SPACE));
         assert_eq!(out.len(), b.len() + (1 + bank) * 52);
-        assert_eq!(rd(&out, 20).unwrap() & 0x30, 0x30, "direct sampler and resource heap indexing are enabled");
+        assert_eq!(rd(&out, 20).unwrap() & 0xC00, 0xC00, "direct sampler and resource heap indexing are enabled");
+        assert_eq!(rd(&out, 20).unwrap() & 0x30, 0, "pixel/geometry root access is not denied");
         assert!(add_literal_samplers(&out).unwrap().is_none(), "already there");
         assert!(add_literal_samplers(&out).unwrap().is_none(), "already there");
         let mut v3 = vec![0u8; 24];

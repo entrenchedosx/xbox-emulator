@@ -852,8 +852,8 @@ unsafe fn probe_rejected_stream(
         }
         hr
     };
-    let swap_ps_src = |src: &str| -> i32 {
-        let Ok(blob) = tombox_xshader::dxc::compile(src, "ps_6_0") else { return 0x7fff_fff0 };
+    let swap_ps_src_p = |src: &str, profile: &str| -> i32 {
+        let Ok(blob) = tombox_xshader::dxc::compile(src, profile) else { return 0x7fff_fff0 };
         let leaked: &'static [u8] = Box::leak(blob.into_boxed_slice());
         let (ptr, len) = (leaked.as_ptr() as usize, leaked.len());
         let mut v = Vec::with_capacity(out.len());
@@ -879,7 +879,18 @@ unsafe fn probe_rejected_stream(
         }
         hr
     };
+    let swap_ps_src = |src: &str| -> i32 { swap_ps_src_p(src, "ps_6_0") };
     const PS_HEAD: &str = "struct I { float4 pos : SV_Position; float4 col : COLOR0; float4 uv : TEXCOORD0; };\n";
+    // The real UI shaders read a run-time S# from the sampler heap. These two use exactly that
+    // path on the rejected stream's own root signature: if either fails, the root/heap state is
+    // the defect rather than the title bytecode.
+    for (name, profile, tail) in [
+        ("heap sampler 2D", "ps_6_6", "Texture2D<float4> t : register(t1, space60000);\nfloat4 main(I i) : SV_Target0 { SamplerState s = SamplerDescriptorHeap[1932u + (uint)abs(i.uv.x)]; return t.SampleLevel(s, i.uv.xy, 0) + i.col * 0.0; }\n"),
+        ("heap sampler 3D", "ps_6_6", "Texture3D<float4> t : register(t1, space60000);\nfloat4 main(I i) : SV_Target0 { SamplerState s = SamplerDescriptorHeap[1932u + (uint)abs(i.uv.x)]; return t.SampleLevel(s, float3(i.uv.xy, 0), 0) + i.col * 0.0; }\n"),
+    ] {
+        let src = format!("{PS_HEAD}{tail}");
+        verdicts.push(format!("{name}: {:#010x}", swap_ps_src_p(&src, profile)));
+    }
     for (name, tail) in [
         ("t1@60000 SRV", "Texture2D<float4> t : register(t1, space60000);\nfloat4 main(I i) : SV_Target0 { return t.Load(int3(0,0,0)) + i.col * 0.0; }\n"),
         ("t6@60000 structured", "StructuredBuffer<float2> b : register(t6, space60000);\nfloat4 main(I i) : SV_Target0 { float2 v = b[0]; return float4(v, 0, 1) + i.col * 0.0; }\n"),
