@@ -2025,6 +2025,22 @@ pub unsafe fn on_present(queue: *mut c_void, src: *mut c_void, plane_count: u32,
         } else {
             g.fc = FrameCount::default();
         }
+        // Every present is observable: this line is emitted for each one, never gated by the caps
+        // budget, the shot predicate or the chain quota, so the capture can no longer decline
+        // silently. It names the resolved absolute output directory so a run proves where a shot
+        // would be written even when none is.
+        record(
+            "d3d12_xs",
+            "passcap.present",
+            &format!(
+                "present #{} t={t:.2}s src=0x{src_u:x} src_desc={} into_src_zero={} out={} recording={}",
+                g.presents,
+                ptext,
+                into_zero,
+                out_root().display(),
+                ACTIVE.load(Ordering::Relaxed),
+            ),
+        );
         g.last_into_src_zero = Some(into_zero);
         g.last_src = src_u;
         g.last_src_desc = d.to_vec();
