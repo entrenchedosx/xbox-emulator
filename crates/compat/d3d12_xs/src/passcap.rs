@@ -1355,6 +1355,16 @@ unsafe fn views(n: u32, handles: *const usize, single: bool) -> Vec<usize> {
 }
 
 unsafe extern "system" fn om_set_targets(this: *mut c_void, n: u32, handles: *const usize, single: i32, dsv: *const usize) {
+    {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            record(
+                "d3d12_xs",
+                "passcap",
+                &format!("VTID: om_set_targets this=0x{:x} vt=0x{:x} n={n}", this as usize, unsafe { *(this as *const usize) } as usize),
+            );
+        }
+    }
     let rts = views(n, handles, single != 0);
     let d = if dsv.is_null() { 0 } else { crate::rtcap::view_of(*dsv).unwrap_or(usize::MAX) };
     // Which render targets this frame binds, deduped by resource handle and capped, so the set of
@@ -1788,6 +1798,16 @@ unsafe fn after_write(this: *mut c_void, what: &str, dst: usize, src: usize, def
 }
 
 unsafe extern "system" fn resolve(this: *mut c_void, dst: *mut c_void, dsub: u32, src: *mut c_void, ssub: u32, fmt: u32) {
+    {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            record(
+                "d3d12_xs",
+                "passcap",
+                &format!("VTID: resolve this=0x{:x} vt=0x{:x}", this as usize, unsafe { *(this as *const usize) } as usize),
+            );
+        }
+    }
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u32, u32) = core::mem::transmute(prev(19));
     f(this, dst, dsub, src, ssub, fmt);
     {
@@ -1831,6 +1851,16 @@ unsafe extern "system" fn copy_region_x(this: *mut c_void, dst: *const u8, x: u3
     after_write(this, "CopyTextureRegionX", if dt == 0 && ds == 0 { d } else { 0 }, s, ST_COPY_DEST, false);
 }
 unsafe extern "system" fn copy_resource(this: *mut c_void, dst: *mut c_void, src: *mut c_void) {
+    {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            record(
+                "d3d12_xs",
+                "passcap",
+                &format!("VTID: copy_resource this=0x{:x} vt=0x{:x}", this as usize, unsafe { *(this as *const usize) } as usize),
+            );
+        }
+    }
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = core::mem::transmute(prev(17));
     f(this, dst, src);
     {
@@ -1921,6 +1951,13 @@ pub fn install(vt: &[AtomicUsize]) {
     if !on() {
         return;
     }
+    // Read-only observation: the address of the vtable the crate patches, so a run can compare it
+    // with the instance each capture point actually reaches. Nothing here changes behaviour.
+    record(
+        "d3d12_xs",
+        "passcap",
+        &format!("VTID: patched vtable=0x{:x} slots={}", vt.as_ptr() as usize, vt.len()),
+    );
     let hooks: [(usize, usize); 29] = [
         (27, execute_bundle as *const () as usize), (44, set_graphics_root_srv as *const () as usize), (46, set_graphics_root_uav as *const () as usize),
         (36, set_graphics_table as *const () as usize), (35, set_compute_table as *const () as usize), (24, set_stencil_ref as *const () as usize), (42, set_graphics_root_cbv as *const () as usize), (34, set_graphics_root_sig as *const () as usize), (38, set_graphics_root_c1 as *const () as usize), (40, set_graphics_root_cn as *const () as usize),
