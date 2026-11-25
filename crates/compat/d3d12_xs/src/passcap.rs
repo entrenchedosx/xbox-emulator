@@ -1832,6 +1832,26 @@ unsafe extern "system" fn reset(this: *mut c_void, alloc: *mut c_void, pso: *mut
 }
 
 pub fn install(vt: &[AtomicUsize]) {
+    // Arming must always be observable. This line is emitted before the `on()` gate, before any
+    // hook chaining and on every spec shape, so a spec that parses to no capture leaves evidence of
+    // what was asked for instead of vanishing silently.
+    let raw_spec = std::env::var("TOMBOX_PASSCAP").unwrap_or_default();
+    record(
+        "d3d12_xs",
+        "passcap",
+        &format!(
+            "TOMBOX_PASSCAP arm evaluated: raw={raw_spec:?} enabled={} out={} selection={}",
+            on(),
+            out_root().display(),
+            match sel() {
+                None => "none (spec parsed to no capture)".to_string(),
+                Some(s) => format!(
+                    "secs={:?} presents={:?} file trigger={} frames/shot={} budget {} MB / {} captures, chain every {} presents",
+                    s.secs, s.presents, s.file, s.frames, s.budget_mb, s.max_caps, s.chain_every
+                ),
+            }
+        ),
+    );
     if !on() {
         return;
     }
@@ -1854,7 +1874,13 @@ pub fn install(vt: &[AtomicUsize]) {
         PREV[slot].store(p, Ordering::Relaxed);
         vt[slot].store(f, Ordering::Relaxed);
     }
-    let s = sel().unwrap();
+    let s = match sel() {
+        Some(s) => s,
+        None => {
+            record("d3d12_xs", "passcap", "TOMBOX_PASSCAP: no selection at hook install; capture stays off");
+            return;
+        }
+    };
     record("d3d12_xs", "passcap", &format!(
         "TOMBOX_PASSCAP armed: shots at t={:?} s after first present, presents={:?}, file trigger={} ({}\\now or %TEMP%\\tombox_passcap_now), frames/shot={}, budget {} MB / {} captures, chain log every {} presents, output {}; hooks chained on Xbox slots 9,10,12,13,14,16,17,19,24,25,26,27,34,35,36,38,40,42,50,51,52,59,81,83,84,98,127; probe PS {:x?}{}{} (draws are never skipped or changed; captures add barrier+copy commands only on capture frames)",
         s.secs, s.presents, s.file, out_root().display(), s.frames, s.budget_mb, s.max_caps, s.chain_every, out_root().display(), probe_hashes(),
