@@ -1357,6 +1357,30 @@ unsafe fn views(n: u32, handles: *const usize, single: bool) -> Vec<usize> {
 unsafe extern "system" fn om_set_targets(this: *mut c_void, n: u32, handles: *const usize, single: i32, dsv: *const usize) {
     let rts = views(n, handles, single != 0);
     let d = if dsv.is_null() { 0 } else { crate::rtcap::view_of(*dsv).unwrap_or(usize::MAX) };
+    // Which render targets this frame binds, deduped by resource handle and capped, so the set of
+    // resources that draws actually write into can be compared with the handle that is presented.
+    {
+        static SEEN: std::sync::Mutex<Option<Vec<usize>>> = std::sync::Mutex::new(None);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let v = seen.get_or_insert_with(Vec::new);
+        for r in rts.iter().copied().filter(|r| *r != 0 && *r != usize::MAX) {
+            if v.contains(&r) {
+                continue;
+            }
+            v.push(r);
+            if v.len() <= 40 {
+                record(
+                    "d3d12_xs",
+                    "rtv.bind",
+                    &format!(
+                        "rtv res=0x{r:x} desc={}B dsv=0x{d:x} depth={}",
+                        desc_of(r).len(),
+                        d != 0 && d != usize::MAX,
+                    ),
+                );
+            }
+        }
+    }
     with(|g| {
         g.fc.binds += 1;
         g.fc.unresolved += rts.iter().filter(|r| **r == usize::MAX).count() as u64 + (d == usize::MAX) as u64;
