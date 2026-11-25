@@ -2085,6 +2085,19 @@ unsafe fn wait_fence(f: usize, v: u64, ms: u32) -> bool {
 
 pub unsafe fn on_present(queue: *mut c_void, src: *mut c_void, plane_count: u32, planes: *const u8) {
     let Some(s) = sel() else { return };
+    // Read-only: which queue instance presents, and its vtable, so a run can compare it with the
+    // table the crate patches and with the instance each capture point reaches.
+    {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            let vt: usize = if queue.is_null() { 0 } else { unsafe { *(queue as *const usize) } };
+            record(
+                "d3d12_xs",
+                "passcap",
+                &format!("VTID: on_present queue=0x{:x} vt=0x{vt:x} src=0x{:x}", queue as usize, src as usize),
+            );
+        }
+    }
     let ptext = plane_text(plane_count, planes);
     let mut run_list: Option<usize> = None;
     let mut finalize: Option<Shot> = None;
