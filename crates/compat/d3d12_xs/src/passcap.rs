@@ -1301,10 +1301,30 @@ unsafe extern "system" fn om_set_targets(this: *mut c_void, n: u32, handles: *co
     f(this, n, handles, single, dsv)
 }
 
+/// Root signature, root constants and root CBVs bound on one list, with the first bytes of every
+/// root CBV, so the data a shader actually reads can be read back instead of inferred.
+fn root_state(g: &G, k: usize) -> String {
+    let Some(st) = g.lists.get(&k) else { return "no recorded state".into() };
+    let mut s = format!("groot={:#x} pso={:#x}", st.groot, st.pso);
+    let mut rc: Vec<(u32, Vec<Option<u32>>)> = st.rc.iter().map(|(a, b)| (*a, b.clone())).collect();
+    rc.sort_by_key(|x| x.0);
+    for (i, w) in rc.iter().take(8) {
+        let words: Vec<String> = w.iter().enumerate().map(|(n, v)| match v { Some(u) => format!("[{n}]{u:08x}={:.4}", f32::from_bits(*u)), None => format!("[{n}]unset") }).collect();
+        s.push_str(&format!(" rc[{i}]={}", words.join(" ")));
+    }
+    let mut cbv: Vec<(u32, u64)> = st.cbv.iter().map(|(a, b)| (*a, *b)).collect();
+    cbv.sort();
+    for (i, va) in cbv.iter().take(8) {
+        let dw = unsafe { crate::bindtrace::read_va(*va, 32) }.map(|b| b.chunks_exact(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect::<Vec<_>>().join(" ")).unwrap_or_else(|| "unreadable".into());
+        s.push_str(&format!(" cbv[{i}] va={va:#x} [{dw}]"));
+    }
+    s
+}
+
 fn draw_record(g: &G, k: usize, this: usize, kind: u8, args: &str) -> String {
     let Some(st) = g.lists.get(&k) else { return String::new() };
     let pso = st.pso;
-    let mut s = format!("kind={kind} args={args} pso={pso:#x} topo={:?}", crate::cl2_state::topology_of(this));
+    let mut s = format!("kind={kind} list={this:#x} key={k:#x} args={args} pso={pso:#x} topo={:?}", crate::cl2_state::topology_of(this));
     s.push_str(&format!(" rt=[{}] dsv={:#x} sref={:?}", st.rts.iter().map(|r| format!("{r:#x}")).collect::<Vec<_>>().join(","), st.dsv, st.sref));
     let snap = crate::cl2_state::raster_snapshot(this);
     let rpso = snap.as_ref().and_then(|x| x.3);
@@ -1320,20 +1340,29 @@ fn draw_record(g: &G, k: usize, this: usize, kind: u8, args: &str) -> String {
         }).collect();
         s.push_str(&format!(" viewport[{}] scissor[{}]", v.join(";"), c.join(";")));
     }
-    let vb = crate::rtcap::bound_vbs(this);
-    s.push_str(&format!(" vb[{}]", vb.iter().map(|(slot, va, size, stride)| format!("{slot}={va:#x}/{size}B/{stride}")).collect::<Vec<_>>().join(" ")));
-    let mut rc: Vec<(u32, Vec<Option<u32>>)> = st.rc.iter().map(|(a, b)| (*a, b.clone())).collect();
-    rc.sort_by_key(|x| x.0);
-    for (i, w) in rc.iter().take(8) {
-        let words: Vec<String> = w.iter().enumerate().map(|(n, v)| match v { Some(u) => format!("[{n}]{u:08x}={:.4}", f32::from_bits(*u)), None => format!("[{n}]unset") }).collect();
-        s.push_str(&format!(" rc[{i}]={}", words.join(" ")));
-    }
-    let mut cbv: Vec<(u32, u64)> = st.cbv.iter().map(|(a, b)| (*a, *b)).collect();
-    cbv.sort();
-    for (i, va) in cbv.iter().take(8) {
-        let dw = unsafe { crate::bindtrace::read_va(*va, 32) }.map(|b| b.chunks_exact(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect::<Vec<_>>().join(" ")).unwrap_or_else(|| "unreadable".into());
-        s.push_str(&format!(" cbv[{i}] va={va:#x} [{dw}]"));
-    }
+    let vb: Vec<String> = crate::cl2_state::vbs_of(this).iter().map(|(slot, v)| {
+        let (va, size, stride) = (u64::from_le_bytes(v[0..8].try_into().unwrap()), u32::from_le_bytes(v[8..12].try_into().unwrap()), u32::from_le_bytes(v[12..16].try_into().unwrap()));
+        let at = crate::gpu_va::lookup_gpu(va).map_or("not in the VA registry".to_string(), |(e, off)| format!("resource {:#x}+{off:#x} of {:#x}", e.res, e.len));
+        // A placed/aliased buffer is the title's own memory: read the vertices it binds straight out of
+        // the title's CPU mapping, which is byte-for-byte what the GPU fetches.
+        let head = crate::gpu_va::lookup_gpu(va)
+            .and_then(|(e, off)| crate::placed::lookup(e.res as *mut c_void).map(|p| (p.va.saturating_add(off), (e.len - off).min(72) as usize)))
+            .filter(|(a, n)| *a != 0 && *n != 0)
+            .map(|(a, n)| unsafe { core::slice::from_raw_parts(a as *const u8, n) }.chunks_exact(4).map(|c| format!("{:08x}={:.3}", u32::from_le_bytes(c.try_into().unwrap()), f32::from_bits(u32::from_le_bytes(c.try_into().unwrap())))).collect::<Vec<_>>().join(" "))
+            .or_else(|| unsafe { crate::bindtrace::read_va(va, 32) }.map(|b| b.chunks_exact(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect::<Vec<_>>().join(" ")))
+            .unwrap_or_else(|| "unreadable".into());
+        // The vertices the GPU really fetches: the write-back shadow's merged view, next to the title's
+        // own bytes, so "the title wrote nothing" and "the merge dropped it" cannot be confused.
+        let sh = crate::title_shadow::read(va, 96).map(|b| b.chunks_exact(4).map(|c| format!("{:.3}", f32::from_bits(u32::from_le_bytes(c.try_into().unwrap())))).collect::<Vec<_>>().join(" ")).unwrap_or_else(|| "n/a".into());
+        let raw = crate::title_shadow::raw(va, 96).map(|b| b.chunks_exact(4).map(|c| format!("{:.3}", f32::from_bits(u32::from_le_bytes(c.try_into().unwrap())))).collect::<Vec<_>>().join(" ")).unwrap_or_else(|| "n/a".into());
+        let head = format!("{head} gpu=[{sh}] title=[{raw}]");
+        format!("{slot}={va:#x}/{size}B/{stride} ({at}) [{head}]")
+    }).collect();
+    let ib = crate::cl2_state::ib_of(this).map(|v| format!(" va={:#x} fmt={} off={:#x}", u64::from_le_bytes(v[0..8].try_into().unwrap()), u32::from_le_bytes(v[8..12].try_into().unwrap()), u32::from_le_bytes(v[12..16].try_into().unwrap()))).unwrap_or_else(|| "none".into());
+    s.push_str(&format!(" vb[{}] ib[{ib}]", if vb.is_empty() { "none bound".to_string() } else { vb.join("; ") }));
+    let st = g.lists.get(&k).unwrap();
+    let _ = st;
+    s.push_str(&format!(" list-root-state [{}]", root_state(g, k)));
     for param in 0..4u32 {
         for slot in 0..4u32 {
             if let Some((res, fmt, dim, map)) = crate::bindtrace::table_srv_fmt(this, false, param, slot) {
@@ -1495,6 +1524,30 @@ unsafe extern "system" fn indirect(this: *mut c_void, sig: *mut c_void, n: u32, 
     note_draw(this, 3, "");
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64) = core::mem::transmute(prev(59));
     f(this, sig, n, buf, off, cbuf, coff)
+}
+
+/// ExecuteBundle: the bundle inherits the calling list's root signature and root arguments at
+/// execution time, and its draws were recorded before that. Recording the caller's root state here
+/// is the only way to see what a bundle's draws actually read.
+unsafe extern "system" fn execute_bundle(this: *mut c_void, bundle: *mut c_void) {
+    if ACTIVE.load(Ordering::Relaxed) {
+        with(|g| {
+            let k = key(this);
+            let b = key(bundle);
+            let (bd, bpso) = g.lists.get(&b).map_or((0, 0), |s| (s.draws, s.pso));
+            let line = format!(
+                "ExecuteBundle caller={:#x} bundle={:#x}: bundle recorded {bd} draw(s), pso={bpso:#x}; inherited at execution [{}]; own state [{}]",
+                this as usize, bundle as usize, root_state(g, k), root_state(g, b)
+            );
+            if let Some(shot) = g.shot.as_mut() {
+                if shot.draws.len() < 80 {
+                    shot.draws.push(line);
+                }
+            }
+        });
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(prev(27));
+    f(this, bundle)
 }
 
 unsafe extern "system" fn set_pso(this: *mut c_void, pso: *mut c_void) {
@@ -1690,7 +1743,8 @@ pub fn install(vt: &[AtomicUsize]) {
     if !on() {
         return;
     }
-    let hooks: [(usize, usize); 26] = [
+    let hooks: [(usize, usize); 27] = [
+        (27, execute_bundle as *const () as usize),
         (36, set_graphics_table as *const () as usize), (35, set_compute_table as *const () as usize), (24, set_stencil_ref as *const () as usize), (42, set_graphics_root_cbv as *const () as usize), (34, set_graphics_root_sig as *const () as usize), (38, set_graphics_root_c1 as *const () as usize), (40, set_graphics_root_cn as *const () as usize),
         (9, close as *const () as usize), (10, reset as *const () as usize), (12, draw as *const () as usize), (13, draw_indexed as *const () as usize), (14, dispatch as *const () as usize),
         (16, copy_region as *const () as usize), (17, copy_resource as *const () as usize), (19, resolve as *const () as usize), (25, set_pso as *const () as usize), (26, barrier as *const () as usize),
@@ -1710,7 +1764,7 @@ pub fn install(vt: &[AtomicUsize]) {
     }
     let s = sel().unwrap();
     record("d3d12_xs", "passcap", &format!(
-        "TOMBOX_PASSCAP armed: shots at t={:?} s after first present, presents={:?}, file trigger={} ({}\\now or %TEMP%\\tombox_passcap_now), frames/shot={}, budget {} MB / {} captures, chain log every {} presents, output {}; hooks chained on Xbox slots 9,10,12,13,14,16,17,19,24,25,26,34,35,36,38,40,42,50,51,52,59,81,83,84,98,127; probe PS {:x?}{}{} (draws are never skipped or changed; captures add barrier+copy commands only on capture frames)",
+        "TOMBOX_PASSCAP armed: shots at t={:?} s after first present, presents={:?}, file trigger={} ({}\\now or %TEMP%\\tombox_passcap_now), frames/shot={}, budget {} MB / {} captures, chain log every {} presents, output {}; hooks chained on Xbox slots 9,10,12,13,14,16,17,19,24,25,26,27,34,35,36,38,40,42,50,51,52,59,81,83,84,98,127; probe PS {:x?}{}{} (draws are never skipped or changed; captures add barrier+copy commands only on capture frames)",
         s.secs, s.presents, s.file, out_root().display(), s.frames, s.budget_mb, s.max_caps, s.chain_every, out_root().display(), probe_hashes(),
         if missing.is_empty() { String::new() } else { format!("; empty slots left alone: {missing:?}") },
         if s.unknown.is_empty() { String::new() } else { format!("; ignored tokens {:?}", s.unknown) }));

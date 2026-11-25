@@ -929,6 +929,20 @@ unsafe extern "system" fn w_pso(this: *mut c_void, pso: *mut c_void) {
     unsafe { apply_rect(this) };
 }
 
+/// Vertex buffer views bound on a list (console views, as the title set them), and the index buffer.
+pub fn vbs_of(list: usize) -> Vec<(u32, [u8; 16])> {
+    let g = STATES[shard_of(list)].lock().unwrap_or_else(|e| e.into_inner());
+    let Some(s) = g.as_ref().and_then(|m| m.get(&list)) else { return Vec::new() };
+    let mut v: Vec<(u32, [u8; 16])> = s.vbs.iter().filter_map(|(slot, b)| b.map(|b| (*slot, b))).collect();
+    v.sort_by_key(|x| x.0);
+    v
+}
+
+pub fn ib_of(list: usize) -> Option<[u8; 16]> {
+    let g = STATES[shard_of(list)].lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref()?.get(&list)?.ib.flatten()
+}
+
 /// The PC pipeline the current draw really runs with, when a variant replaced the console PSO.
 pub fn pc_pso_of(list: usize) -> Option<usize> {
     let g = STATES[shard_of(list)].lock().unwrap_or_else(|e| e.into_inner());

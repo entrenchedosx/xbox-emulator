@@ -609,3 +609,70 @@ the one known environmental `xs_exports` failure, `tombox-xshader` 126 passed.
 Reachability is now the whole blocker: the title raises `0xC0000005` writing to
 `0x0` at `game_scarlett_master.exe+0x2215c35` after 135-150 s (its own heap
 allocator) and never reaches the frames where it has content to composite.
+
+## Session: bundle inheritance measured; the composite's vertex source identified
+
+The previous session's next step assumed the presented-buffer composite was issued
+from a command bundle, so its root arguments would live on the parent list. The
+capture was extended to settle that with measurements rather than assumptions:
+
+- `passcap` now hooks `ExecuteBundle` (slot 27) and records, at execution time, the
+  calling list's root signature, every root constant with its float value, every
+  root CBV address with its first 32 bytes, and the bundle's own state.
+- Every draw record now carries `list=`/`key=`, the vertex buffer views bound in
+  the emulator's own list state (not only in the optional rtcap trace) with the VA
+  resolved through `gpu_va` and the first bytes of the data, plus the index buffer.
+
+### Measured: there is no bundle inheritance to fix here
+
+In the captured frame around present 300 there are **no `ExecuteBundle` records at
+all**, and all three draws report `list == key` (the same command list, not a
+bundle and not a split segment). The composite is therefore not inheriting root
+state from a parent list: its list only ever sets a graphics root signature
+(`groot=…`), with no root constants, no root CBVs and no descriptor tables
+recorded. The bundle-inheritance hypothesis is disproven for this draw.
+
+### Measured: the composite does have a vertex buffer
+
+```
+draw 02: DrawInstanced v=3 inst=1 sv=0 si=0  topo=17 (RECTLIST)
+         vb[0=0x…ddf0/4080B/24 → resource 0x…fea0+0xabddf0 of 0xae00000]
+         ib[none]  viewport 3840x2160  scissor full
+```
+
+The resource is the 182,452,224-byte buffer created by `CreateResourceFromAddressX`
+and placed on an *aliased shadow heap*, so the GPU reads the title's own pages. The
+other rect draw in the same frame (which does shade 4,147,200 samples) binds the
+same resource at `0xabee10`, 4128 bytes later, with the same size and stride.
+
+`title_shadow::read` (the write-back shadow's merged view, i.e. what the GPU sees)
+and a new `title_shadow::raw` (the title's live bytes) now print the first 96 bytes
+of every bound vertex buffer, so the two can never be confused again:
+
+```
+draw 01  gpu=[-1 1 0 NaN 0 0  -1 -1 0 NaN 0 1  1 -1 0 NaN 1 1]
+         title=[-1 1 0 NaN 0 0  -1 -1 0 NaN 0 1  1 -1 0 NaN 1 1]   → 4,147,200 px
+draw 02  gpu=[0 0 0 NaN 0 0  0 2160 0 NaN 0 1]
+         title=[0 0 0 NaN 0 0  0 2160 0 NaN 0 1]                  → 0 px
+```
+
+Three facts follow. First, the shadow path delivers the title's bytes exactly
+(`gpu == title` byte for byte), so global/aliased vertex data is not being lost.
+Second, the vertices are `(top-left, bottom-left, third)` with a don't-care `z/w`
+(the working draw uses clip-space NDC corners, the composite uses **pixel-space**
+corners `0,0` and `0,2160` for a 3840x2160 target). Third, the composite's list has
+no root constants, no root CBVs and no descriptor tables recorded at all, so its
+vertex shader has nothing that could turn pixel coordinates into clip space — the
+leading measured explanation for a full-target rect rasterizing zero pixels while
+`CInvocations=2 CPrimitives=2` (clipped away, not culled).
+
+Capture caveat: `draw_record` only scans descriptor tables at params 0..4 / slots
+0..4 and does not hook root SRV/UAV (Xbox slots 44/46), so "no transform bound" is
+currently proven only for root constants, root CBVs and those tables.
+
+### State on the shipped build
+
+Composite: `IAVertices=3 GSPrimitives=2 CInvocations=2 CPrimitives=2 PSInvocations=0`.
+Title backbuffer 0 of 8,294,400 non-black pixels; presented swapchain OSD only.
+Zero PSO rejections. `d3d12_xs` 717 passed (1 known environmental), `tombox-xshader`
+126 passed.

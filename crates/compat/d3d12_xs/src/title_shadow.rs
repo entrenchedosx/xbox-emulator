@@ -645,6 +645,13 @@ pub fn merged_view(title: &[u8], snap: &[u8], shadow: &[u8]) -> Vec<u8> {
     (0..title.len()).map(|i| if title[i] != snap[i] { title[i] } else { shadow[i] }).collect()
 }
 
+/// The title's own bytes at `addr`, with no shadow merge: lets a diagnostic tell a title that never
+/// wrote a range from a shadow merge that dropped the write.
+pub fn raw(addr: u64, len: usize) -> Option<Vec<u8>> {
+    let mut t = vec![0u8; len];
+    if read_title(addr, &mut t) { Some(t) } else { None }
+}
+
 pub fn read(addr: u64, len: usize) -> Option<Vec<u8>> {
     shadows(|m| {
         let s = m.values().find(|s| addr >= s.lo && addr + len as u64 <= s.hi && s.ranges().iter().any(|(a, b)| addr - s.lo >= *a && addr - s.lo + len as u64 <= *b))?;
