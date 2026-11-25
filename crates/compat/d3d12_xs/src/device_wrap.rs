@@ -183,11 +183,27 @@ pub(crate) fn host_heap_retry(desc: &[u32; 4]) -> Option<u32> {
 unsafe extern "system" fn create_descriptor_heap(
     this: *mut DeviceWrapper, pdesc: *const c_void, riid: *const Guid, ppv: *mut *mut c_void,
 ) -> i32 {
-    let xone_desc = crate::xone_heap::translate(pdesc); let pdesc = xone_desc.as_ref().map_or(pdesc, |d| d.as_ptr() as *const c_void);
+    let xone_desc = crate::xone_heap::translate(pdesc); let mut pdesc = xone_desc.as_ref().map_or(pdesc, |d| d.as_ptr() as *const c_void);
     let real = unsafe { (*this).real };
     let f: unsafe extern "system" fn(*mut c_void, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(14)) };
     let requested = if pdesc.is_null() { None } else { Some(unsafe { *(pdesc as *const [u32; 4]) }) };
+    // A shader-visible sampler heap also carries the literal-sampler bank at a fixed high
+    // range, so a run-time S# index can be read through `SamplerDescriptorHeap`. Grow the
+    // heap to the D3D12 maximum; the title's own descriptors keep their indexes.
+    // The replacement desc must outlive the creation call below.
+    let mut grown = [0u32; 4];
+    let mut grown_ok = false;
+    if let Some(req) = requested {
+        let need = tombox_xshader::hlsl::litsamp::TB_LITSAMP_HEAP_BASE
+            + tombox_xshader::hlsl::litsamp::bank().len() as u32;
+        if req[0] == 1 && req[2] & 1 != 0 && req[1] < need {
+            grown = req;
+            grown[1] = need;
+            grown_ok = true;
+            pdesc = grown.as_ptr() as *const c_void;
+        }
+    }
     let mut hr = unsafe { f(real, pdesc, riid, ppv) };
     // The host's shader-visible CBV/SRV/UAV ceiling is below the console's heap size.
     // Create the largest heap the host allows rather than none: the title would
@@ -215,6 +231,9 @@ unsafe extern "system" fn create_descriptor_heap(
         // Keep the heap REAL (so it works when passed to SetDescriptorHeaps etc.);
         // patch the shared heap vtable once to fix the handle-getter ABI.
         crate::heap_wrap::ensure_patched(unsafe { *ppv });
+        if grown_ok {
+            unsafe { install_literal_samplers(real, *ppv, grown[1]) };
+        }
         // A heap the title supplied memory for (it armed its XMem allocation hook) lives
         // over that memory; a title that armed nothing keeps an ordinary PC heap.
         if let Some(req) = requested {
@@ -259,6 +278,39 @@ unsafe extern "system" fn create_descriptor_heap(
         }
     }
     hr
+}
+
+/// Write `litsamp::bank()` into the shader-visible sampler heap at `TB_LITSAMP_HEAP_BASE`.
+/// The descriptors are exactly the state the root signature's static samplers carry, so a
+/// run-time S# index selects the same filtering/address mode as the constant path.
+unsafe fn install_literal_samplers(real: *mut c_void, heap: *mut c_void, count: u32) {
+    use tombox_xshader::hlsl::litsamp;
+    let base = litsamp::TB_LITSAMP_HEAP_BASE;
+    if count < base + litsamp::bank().len() as u32 {
+        return;
+    }
+    let inc: unsafe extern "system" fn(*mut c_void, u32) -> u32 =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(15)) };
+    let inc = unsafe { inc(real, 1) } as u64;
+    if inc == 0 {
+        return;
+    }
+    let hv = unsafe { *(heap as *const *const usize) };
+    let cpu: unsafe extern "system" fn(*mut c_void) -> u64 = unsafe { core::mem::transmute(*hv.add(9)) };
+    let start = unsafe { cpu(heap) };
+    let create: unsafe extern "system" fn(*mut c_void, *const c_void, u64) =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(22)) };
+    for (i, s) in litsamp::bank().iter().enumerate() {
+        let d = litsamp::sampler_desc(s);
+        let dest = start + (base as u64 + i as u64) * inc;
+        unsafe { create(real, d.as_ptr() as *const c_void, dest) };
+    }
+    static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+        record("d3d12_xs", "CreateDescriptorHeap", &format!(
+            "literal sampler bank written in heap {heap:p}: indexes {base}..{} increment={inc}",
+            base as usize + litsamp::bank().len()));
+    }
 }
 
 /// Intercept the Xbox extension `CreateCommandQueueX` (slot 48) and translate to

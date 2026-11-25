@@ -154,10 +154,21 @@ pub fn add_literal_samplers(body: &[u8]) -> Result<Option<Vec<u8>>, String> {
     }
     let stride = litsamp::rts0_stride(version);
     let (n, off) = (rd(body, 12)? as usize, rd(body, 16)? as usize);
+    // Shaders translated with `SamplerDescriptorHeap` (the run-time S# path) and with
+    // `ResourceDescriptorHeap` (bindless) require the root to allow direct heap indexing;
+    // otherwise the host rejects the pipeline state with E_INVALIDARG.
+    const DIRECT_HEAPS: u32 = 0x20 | 0x10;
+    let flags = rd(body, 20)?;
+    let set_flags = |out: &mut Vec<u8>| { let _ = wr(out, 20, flags | DIRECT_HEAPS); };
     let existing: &[u8] = if n == 0 { &[] } else { body.get(off..off + n * stride).ok_or("RTS0 static samplers out of bounds")? };
     for i in 0..n {
         if rd(existing, i * stride + 44)? == litsamp::TB_LITSAMP_SPACE {
-            return Ok(None);
+            if flags & DIRECT_HEAPS == DIRECT_HEAPS {
+                return Ok(None);
+            }
+            let mut out = body.to_vec();
+            set_flags(&mut out);
+            return Ok(Some(out));
         }
     }
     let mut out = body.to_vec();
@@ -166,6 +177,7 @@ pub fn add_literal_samplers(body: &[u8]) -> Result<Option<Vec<u8>>, String> {
     out.extend_from_slice(&litsamp::rts0_bytes(version));
     wr(&mut out, 12, (n + litsamp::bank().len()) as u32);
     wr(&mut out, 16, new_off as u32);
+    set_flags(&mut out);
     Ok(Some(out))
 }
 
@@ -361,6 +373,8 @@ mod positional_tests {
         let last = off + bank * 52;
         assert_eq!((rd(&out, last + 40).unwrap() as usize, rd(&out, last + 44).unwrap()), (bank - 1, litsamp::TB_LITSAMP_SPACE));
         assert_eq!(out.len(), b.len() + (1 + bank) * 52);
+        assert_eq!(rd(&out, 20).unwrap() & 0x30, 0x30, "direct sampler and resource heap indexing are enabled");
+        assert!(add_literal_samplers(&out).unwrap().is_none(), "already there");
         assert!(add_literal_samplers(&out).unwrap().is_none(), "already there");
         let mut v3 = vec![0u8; 24];
         w(&mut v3, 0, 3);

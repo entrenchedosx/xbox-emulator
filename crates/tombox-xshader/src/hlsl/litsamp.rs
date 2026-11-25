@@ -23,6 +23,11 @@ use std::sync::OnceLock;
 /// Register space of the bank in the root signature.
 pub const TB_LITSAMP_SPACE: u32 = 70_000;
 
+/// First descriptor of the bank in the title's shader-visible sampler heap. The emulator
+/// extends every such heap to `D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE` (2048) and writes
+/// the bank at this fixed index, so a run-time S# index can read a sampler descriptor.
+pub const TB_LITSAMP_HEAP_BASE: u32 = 1932;
+
 const WRAP: u32 = 1;
 const MIRROR: u32 = 2;
 const CLAMP: u32 = 3;
@@ -171,13 +176,20 @@ pub fn hlsl_decls(plain: bool, compare: bool) -> String {
     let b = bank();
     let cs = compare_start();
     let mut out = String::new();
+    // D3D12 validates a shader sampler *array* against a sampler descriptor range; the title
+    // roots carry the bank as static samplers, which can only satisfy individual registers.
+    // Declare each entry as its own static sampler; run-time indexes use the heap instead.
     if plain {
-        out.push_str(&format!("SamplerState tb_lsb[{cs}] : register(s0, space{TB_LITSAMP_SPACE});
+        for i in 0..cs {
+            out.push_str(&format!("SamplerState tb_lsb_{i} : register(s{i}, space{TB_LITSAMP_SPACE});
 "));
+        }
     }
     if compare {
-        out.push_str(&format!("SamplerComparisonState tb_lsc[{}] : register(s{cs}, space{TB_LITSAMP_SPACE});
-", b.len() - cs));
+        for i in cs..b.len() {
+            out.push_str(&format!("SamplerComparisonState tb_lsc_{} : register(s{i}, space{TB_LITSAMP_SPACE});
+", i - cs));
+        }
     }
     out.push_str(&format!("static const uint4 tb_lskey[{}] = {{
 ", b.len()));
@@ -212,6 +224,31 @@ uint tb_lit_sampler_index(uint w0, uint w1, uint w2, bool compare) {{
     out
 }
 
+/// `D3D12_SAMPLER_DESC` (52 bytes) for a bank entry, so the same state can be written as a
+/// descriptor in the shader-visible sampler heap.
+pub fn sampler_desc(s: &StaticSampler) -> [u32; 13] {
+    let border = match s.border_color {
+        1 => [0.0f32, 0.0, 0.0, 1.0],
+        2 => [1.0f32, 1.0, 1.0, 1.0],
+        _ => [0.0f32; 4],
+    };
+    [
+        s.filter,
+        s.address_u,
+        s.address_v,
+        s.address_w,
+        0.0f32.to_bits(),
+        s.max_anisotropy,
+        s.comparison_func,
+        border[0].to_bits(),
+        border[1].to_bits(),
+        border[2].to_bits(),
+        border[3].to_bits(),
+        s.min_lod_bits,
+        s.max_lod_bits,
+    ]
+}
+
 /// Size of one serialized static sampler in a root signature of `version`.
 pub fn rts0_stride(version: u32) -> usize {
     if version >= 3 { 56 } else { 52 }
@@ -225,6 +262,23 @@ mod tests {
     /// S# words a shipped title builds with `s_movk_i32` / `s_mov_b32` literals.
     fn decode(w0: u32, w1: u32, w2: u32, compare: bool) -> SSharp {
         decode_ssharp(w0, Some(w1), Some(w2), compare)
+    }
+
+    #[test]
+    fn the_heap_range_fits_the_shader_visible_sampler_heap() {
+        assert!(TB_LITSAMP_HEAP_BASE + bank().len() as u32 <= 2048);
+    }
+
+    #[test]
+    fn a_bank_sampler_serializes_as_a_52_byte_sampler_desc() {
+        let s = &bank()[30];
+        let d = sampler_desc(s);
+        assert_eq!(d.len() * 4, 52);
+        assert_eq!((d[0], d[1], d[2], d[3]), (s.filter, s.address_u, s.address_v, s.address_w));
+        assert_eq!(d[5], s.max_anisotropy);
+        assert_eq!(d[6], s.comparison_func);
+        assert_eq!(d[11], s.min_lod_bits);
+        assert_eq!(d[12], s.max_lod_bits);
     }
 
     #[test]

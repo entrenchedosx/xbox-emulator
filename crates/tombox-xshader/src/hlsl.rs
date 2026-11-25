@@ -6889,7 +6889,17 @@ impl<'a> Emitter<'a> {
                     self.touch(&Opnd::Sgpr(reg + k));
                 }
                 let index = format!("tb_lit_sampler_index(s{reg}, s{}, s{}, {})", reg + 1, reg + 2, cmp);
-                if cmp { format!("tb_lsc[{index}]") } else { format!("tb_lsb[{index}]") }
+                // The bank is also written into the shader-visible sampler heap (the emulator
+                // extends every such heap and places it at TB_LITSAMP_HEAP_BASE). A descriptor
+                // heap can be indexed at run time, unlike static samplers.
+                let base = litsamp::TB_LITSAMP_HEAP_BASE
+                    + if cmp { litsamp::compare_start() as u32 } else { 0 };
+                let name = format!("tb_heap_sampler{}", self.tmp);
+                self.tmp += 1;
+                self.sm6_minor = self.sm6_minor.max(6);
+                let ty = if cmp { "SamplerComparisonState" } else { "SamplerState" };
+                self.line(&format!("{ty} {name} = SamplerDescriptorHeap[{base}u + {index}];"));
+                name
             }
             Binding::Indexed(index) if self.direct_sampler_heap(index) => {
                 let name = format!("tb_heap_sampler{}", self.tmp);
@@ -7414,12 +7424,12 @@ impl<'a> Emitter<'a> {
             let cs = litsamp::compare_start() as u32;
             for slot in &self.samp {
                 if let Some(reg) = bank_reg(slot) {
-                    let _ = writeln!(h, "#define samp{slot} tb_lsb[{reg}]");
+                    let _ = writeln!(h, "#define samp{slot} tb_lsb_{reg}");
                 }
             }
             for slot in &self.samp_cmp {
                 if let Some(reg) = bank_reg(slot) {
-                    let _ = writeln!(h, "#define scmp{slot} tb_lsc[{}]", reg - cs);
+                    let _ = writeln!(h, "#define scmp{slot} tb_lsc_{}", reg - cs);
                 }
             }
         }
