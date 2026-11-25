@@ -990,14 +990,40 @@ pub fn range_kind(range_type: u32) -> u8 {
     }
 }
 
-pub fn table_ranges(r: &[tombox_xshader::meta::RootRange]) -> Vec<TableRange> {
+/// Place a parameter's ranges in the table: distinct offsets, and at most one open-ended range.
+///
+/// The console's `OffsetInTable` is not filled in for every range (it reads 0 for all of them),
+/// so honouring it literally made four ranges of one parameter all claim table offset 0 - and the
+/// range a translated shader resolves through (index 1, e.g. `space 4100001` / register 27) then
+/// addressed whichever of them happened to win. An offset is only honoured when it moves strictly
+/// forward; otherwise the range continues after the previous one. An open-ended range before the
+/// last one ends where the next range starts, so only the final range may run to the end.
+fn place_ranges(raw: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let n = raw.len();
+    let mut offsets = Vec::with_capacity(n);
     let mut next = 0u32;
-    r.iter()
-        .map(|x| {
-            let offset = if x.offset_in_table == u32::MAX { next } else { x.offset_in_table };
-            next = if x.num == u32::MAX { u32::MAX } else { offset.saturating_add(x.num) };
-            TableRange { offset, count: x.num, kind: range_kind(x.range_type) }
+    for &(specified, num) in raw {
+        let off = if specified != 0 && specified != u32::MAX && specified > next { specified } else { next };
+        offsets.push(off);
+        next = off.saturating_add(if num == u32::MAX { 1 } else { num.max(1) });
+    }
+    (0..n)
+        .map(|i| {
+            let mut count = raw[i].1;
+            if count == u32::MAX && i + 1 < n {
+                count = offsets[i + 1].saturating_sub(offsets[i]);
+            }
+            (offsets[i], count)
         })
+        .collect()
+}
+
+pub fn table_ranges(r: &[tombox_xshader::meta::RootRange]) -> Vec<TableRange> {
+    let raw: Vec<(u32, u32)> = r.iter().map(|x| (x.offset_in_table, x.num)).collect();
+    place_ranges(&raw)
+        .into_iter()
+        .zip(r.iter())
+        .map(|((offset, count), x)| TableRange { offset, count, kind: range_kind(x.range_type) })
         .collect()
 }
 
@@ -1604,6 +1630,33 @@ pub static DXGI_TO_HW: [[u16; 2]; 193] = [[0, 0], [75, 0], [77, 77], [75, 75], [
 
 #[cfg(test)]
 mod tests {
+    /// Measured on the title: one table parameter with four ranges whose `OffsetInTable` all read 0,
+    /// three of them open-ended. Honouring that literally made every range claim table offset 0, so
+    /// range index 1 (the one a translated shader resolves register 27 through, `space 4100001`)
+    /// addressed a slot shared with three other ranges. The placement must give each range its own
+    /// offset and leave exactly one open-ended.
+    #[test]
+    fn table_ranges_place_distinct_offsets_and_one_open_end() {
+        let got = place_ranges(&[(0, 1), (0, u32::MAX), (0, u32::MAX), (0, u32::MAX)]);
+        assert_eq!(got, vec![(0, 1), (1, 1), (2, 1), (3, u32::MAX)]);
+        let offsets: Vec<u32> = got.iter().map(|x| x.0).collect();
+        let mut uniq = offsets.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), offsets.len(), "no two ranges may share a table offset");
+        assert_eq!(got.iter().filter(|x| x.1 == u32::MAX).count(), 1, "at most one open-ended range");
+    }
+
+    /// An explicitly filled-in forward offset is still honoured, and a trailing short range keeps
+    /// its own count.
+    #[test]
+    fn table_ranges_honour_explicit_offsets() {
+        assert_eq!(place_ranges(&[(0, 4), (8, 2)]), vec![(0, 4), (8, 2)]);
+        // A lone explicitly placed range keeps its place; only an unset offset falls back to 0.
+        assert_eq!(place_ranges(&[(3, 1)]), vec![(3, 1)]);
+        assert_eq!(place_ranges(&[(0, 1)]), vec![(0, 1)]);
+    }
+
     use super::*;
 
     #[test]
