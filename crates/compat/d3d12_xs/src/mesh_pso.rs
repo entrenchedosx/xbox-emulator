@@ -716,6 +716,11 @@ unsafe fn probe_rejected_stream(
                 if p != 0 && len != 0 {
                     let bytes = core::slice::from_raw_parts(p as *const u8, len as usize);
                     let _ = std::fs::write(format!("{dir}\\rejected{n}_{}.dxil", if ty == SUB_VS { "vs" } else { "ps" }), bytes);
+                    if ty == SUB_PS {
+                        if let Some(ch) = crate::shader_xlat::console_hash_of(bytes) {
+                            record("d3d12_xs", "CreatePipelineState", &format!("rejected{n} ps is console shader {ch:016x}"));
+                        }
+                    }
                 }
             }
         }

@@ -414,6 +414,7 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
         return match r {
             Ok(c) => {
                 note_timing(xlat_ms, c.lookup_ms, c.dxc_ms, c.source == tombox_xshader::shader_cache::Source::Pack);
+                note_console_hash(&c.code, hash);
                 if c.dxc_ms > 1500.0 {
                     record("d3d12_xs", "shader_xlat", &format!("SLOW: hash={hash:016x} took {:.0} ms to compile ({} bytes in, {} HLSL lines; translate {xlat_ms:.1} ms, fast fma {})", c.dxc_ms, blob.len(), t.hlsl.lines().count(), fma.preserve));
                     if c.dxc_ms > 10_000.0 {
@@ -433,6 +434,7 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
     if let Some(p) = &cached {
         if let Ok(v) = std::fs::read(p) {
             if !v.is_empty() {
+                note_console_hash(&v, hash);
                 return Ok(v);
             }
         }
@@ -458,6 +460,7 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
             if let Some(p) = &cached {
                 let _ = std::fs::write(p, &v);
             }
+            note_console_hash(&v, hash);
             Ok(v)
         }
         Err(e) => {
@@ -465,6 +468,35 @@ fn translate_uncached_with(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Input
             Err(e)
         }
     }
+}
+
+/// PC bytecode hash -> console shader hash. Lets a dumped PC shader be traced
+/// back to its `%TEMP%\tombox_shader_dump` console blob (and thus to translated HLSL).
+fn console_hashes() -> &'static std::sync::Mutex<std::collections::HashMap<u64, u64>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, u64>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn note_console_hash(pc: &[u8], console: u64) {
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in pc {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    if let Ok(mut m) = console_hashes().lock() {
+        m.insert(h, console);
+    }
+}
+
+/// The console shader hash whose translated PC bytecode has this FNV-1a hash.
+pub fn console_hash_of(pc: &[u8]) -> Option<u64> {
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in pc {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    console_hashes().lock().ok()?.get(&h).copied()
 }
 
 /// Translate an Xbox shader blob to PC bytecode (cached). `ptr/len` come from a
