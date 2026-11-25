@@ -2111,6 +2111,15 @@ pub unsafe fn on_present(queue: *mut c_void, src: *mut c_void, plane_count: u32,
             if take_due(&s.secs, &mut g.sec_idx, t) {
                 why = Some(format!("t>={:.1}s after first present", s.secs[g.sec_idx - 1]));
             }
+            // A spec may carry no time entries at all; waiting for one that never arrives left the
+            // capture armed but permanently idle. With an empty time list the first eligible present
+            // arms it, using the real present index rather than any invented frame number.
+            if s.secs.is_empty() && why.is_none() {
+                why = Some(format!(
+                    "empty time list: arming on the first eligible present (#{})",
+                    g.presents
+                ));
+            }
             if take_due(&s.presents, &mut g.pres_idx, g.presents) {
                 why = Some(format!("present #{}", s.presents[g.pres_idx - 1]));
             }
