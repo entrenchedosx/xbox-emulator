@@ -1278,15 +1278,14 @@ fn diag_table(rs: usize, param: u32, heap: usize, index: u32, ranges: Option<&[T
         if m.len() > 24 {
             return;
         }
-        // Late binds are the ones that matter: a signature's first binds happen during setup and
-        // carry null descriptors, while the draw that is being investigated binds the same
-        // parameter much later in the frame. Skip the first 30 then record the next three.
+        // Every bind of a signature is recorded up to a generous per-signature cap, so a bind that
+        // happens late in the frame (the draw under investigation) cannot be skipped by a
+        // first-N or skip-N heuristic: those either stop before it or never reach it at all.
         let n = m.get(&rs).copied().unwrap_or(0);
-        let late = n >= 30 && n < 33;
-        m.insert(rs, n.saturating_add(1));
-        if !late {
+        if n >= 40 || m.len() > 8 {
             return;
         }
+        m.insert(rs, n.saturating_add(1));
     }
     record(M, TAG, &s);
 }
