@@ -598,21 +598,30 @@ pub fn interfaces() -> Vec<Iface> {
     let u = user_layout();
     let d = device_layout();
     vec![
-        Iface { clsid: CLSID, iid: CLSID, name: "XUser(01acd177)", slots: pick(&u, &[3, 4, 5, 7, 8, 11, 29, 30, 34]) },
-        Iface {
-            clsid: CLSID,
-            iid: IID_V1,
-            name: "XUser(eb9bf948)",
-            slots: pick(&u, &[3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 33, 34]),
-        },
-        Iface {
-            clsid: CLSID,
-            iid: IID_V2,
-            name: "XUser(1bf2f8c5)",
-            slots: pick(&u, &[3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38]),
-        },
+        // All three XUser IIDs share one API layout; the title calls GetLocalId (9),
+        // IsGuest (13), AgeGroup (19), CheckPrivilege (20) and the change-event
+        // registration (33) on 01acd177, so every interface exposes the full layout
+        // instead of a subset that turns real calls into E_NOTIMPL.
+        Iface { clsid: CLSID, iid: CLSID, name: "XUser(01acd177)", slots: u.clone() },
+        Iface { clsid: CLSID, iid: IID_V1, name: "XUser(eb9bf948)", slots: u.clone() },
+        Iface { clsid: CLSID, iid: IID_V2, name: "XUser(1bf2f8c5)", slots: u.clone() },
         Iface { clsid: CLSID, iid: IID_GAMERTAG, name: "XUserGamertag(cef4fac0)", slots: vec![(3, get_gamertag as usize)] },
-        Iface { clsid: DEVICE, iid: DEVICE, name: "XUserDevice(7d824997)", slots: pick(&d, &[3, 4, 5, 6, 7, 8]) },
-        Iface { clsid: DEVICE, iid: DEVICE_V2, name: "XUserDevice(0cc6a956)", slots: pick(&d, &[3, 4, 5, 6, 7, 8, 9, 10]) },
+        Iface { clsid: DEVICE, iid: DEVICE, name: "XUserDevice(7d824997)", slots: d.clone() },
+        Iface { clsid: DEVICE, iid: DEVICE_V2, name: "XUserDevice(0cc6a956)", slots: d.clone() },
     ]
+}
+
+#[cfg(test)]
+mod user_iface_tests {
+    #[test]
+    fn every_xuser_iid_exposes_the_calls_the_title_makes() {
+        for i in super::interfaces() {
+            if !i.name.starts_with("XUser(") {
+                continue;
+            }
+            for s in [9usize, 13, 19, 20, 33] {
+                assert!(i.slots.iter().any(|(x, _)| *x == s), "{} is missing slot {s}", i.name);
+            }
+        }
+    }
 }

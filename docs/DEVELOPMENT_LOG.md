@@ -393,3 +393,57 @@ reorder and its classifier were reverted; no other changes were involved.
   title-side startup/loading stall, not an OSD measurement error and not (per
   the measurements above) a missing present copy. No genuine title frame has
   been captured yet; this remains the open blocker.
+
+### XUser: the confirmed interface was missing the calls the title makes
+
+- The title queries `XUser(01acd177)`, then calls slots **9 (GetLocalId), 13
+  (IsGuest), 19 (AgeGroup), 20 (CheckPrivilege) and 33
+  (RegisterForChangeEvent)** on that same IID. The interface had been built from
+  a confirmed subset `[3,4,5,7,8,11,29,30,34]`, so every one of those calls
+  returned `E_NOTIMPL` right after `XUserAddAsync` succeeded. The title could
+  never obtain a local user id, age group or privileges, and never registered
+  for sign-in change events.
+- Fix: all three XUser IIDs (and both XUserDevice IIDs) now expose the full
+  layout from `user_layout()` / `device_layout()`; a regression test asserts
+  slots 9/13/19/20/33 exist on every `XUser(...)` interface.
+- Measured after the fix: no `unconfirmed-slot XUser` lines at all;
+  `XUserAddAsync options=0x1 -> local user 'XboxEmulator' hr=0x0`;
+  `XUserCheckPrivilege privilege=185/188/189 -> granted`; gamertag interface
+  queried. The startup still submits the same three draws, so user setup was a
+  real defect but not the whole stall.
+
+### Virtual pad: real reads confirmed
+
+- Before: a scripted `press start` / `press a` was consumed and the title logged
+  "read the virtual pad 0 time(s)" for the whole run.
+- After: `IGameInput::GetCurrentReading` reaches the virtual device
+  (`virtual pad reading (kind=0x40000) (#0)`, `(#1)`, `(#2)`), the title's own
+  read counter reaches 1 and more GameInput reads follow at each UI update. The
+  pad state bytes are served from `Reading::state`; no stub is involved.
+
+### Presentation ordering (measured, correct double buffering)
+
+- Present 2: `src=rt#001`, draws = `rt#022 x2, rt#000 x1`.
+- Present 3: `src=rt#000`, draws = `rt#022 x2, rt#001 x1`.
+- The title therefore draws the *next* frame's image and presents the image
+  rendered on the previous frame. `draws_into_presented=0` is an attribution
+  artifact of measuring only the current frame's draws; it does **not** mean the
+  present path skips a copy. The presented `rt#000` at present 3 contains the
+  single draw submitted at present 2, and that draw still leaves the buffer at
+  **0 of 8,294,400** non-black pixels (frames 60/120/180/240).
+- The one per-frame draw into the presented image is preceded by two draws into
+  `rt#022`; the four descriptors written per frame at increasing heap slots
+  (e.g. 978669/982765/986861) are rejected by `title_heap` with
+  "has no PC resource/format match" and replaced by null views. Their payload
+  (`[45700000, 45070000, ...]` = 3840.0, 2160.0, `[bf800000, 3f800000]` = -1.0,
+  1.0) looks like constant/viewport data, not SRV/UAV descriptors, so the
+  decoder is interpreting a non-resource table as resource descriptors.
+
+### New failure observed: device removal during cold PSO setup
+
+- A cold-cache pass-capture run failed before present 2:
+  `centroid root signature with the centroid priority constants rejected
+  hr=0x887a0005; created without them`, immediately followed by
+  `dred.removed exiting now with code 0x887a0006 (device removed)`. This is a
+  separate GPU-stability defect (invalid root-signature/driver work), not the
+  black-frame cause; warm-cache runs reached present 360+ without removal.
