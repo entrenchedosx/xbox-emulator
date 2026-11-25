@@ -2033,12 +2033,15 @@ pub unsafe fn on_present(queue: *mut c_void, src: *mut c_void, plane_count: u32,
             "d3d12_xs",
             "passcap.present",
             &format!(
-                "present #{} t={t:.2}s src=0x{src_u:x} src_desc={} into_src_zero={} out={} recording={}",
+                "present #{} t={t:.2}s src=0x{src_u:x} src_desc={} into_src_zero={} out={} recording={} shot_armed={} frames_left={} in_src={}",
                 g.presents,
                 ptext,
                 into_zero,
                 out_root().display(),
                 ACTIVE.load(Ordering::Relaxed),
+                g.shot.is_some(),
+                g.shot.as_ref().map_or(0u32, |sh| sh.frames_left),
+                !into_zero,
             ),
         );
         g.last_into_src_zero = Some(into_zero);
