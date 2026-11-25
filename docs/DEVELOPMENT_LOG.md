@@ -286,3 +286,26 @@ reorder and its classifier were reverted; no other changes were involved.
 - Tests: `cargo test -p d3d12_xs --lib` 716 passed, 1 known environmental
   failure. The PSO probe (`TOMBOX_PSO_PROBE_DUMP`) now also swaps known-good
   shaders/roots into a rejected stream and compiles matching test PS variants.
+
+### The rejected UI shaders, and why a select chain is not the fix
+
+- The rejected PSs were traced back to console shaders `506b2892ea485668` and
+  `f10a4be178ecf3e3` via a new PC-bytecode-hash to console-hash map in
+  `shader_xlat` (the probe logs it when it dumps a PS). This needed no
+  translator change, so the warm pack stayed valid.
+- Translated HLSL (obtained with `xshader_corpus --out` and the shader's own
+  `.root`): `SamplerState tb_lsb[80] : register(s0, space70000)`, a constant
+  `#define samp... tb_lsb[30]`, and one dynamic site,
+  `tex.SampleLevel(tb_lsb[tb_lit_sampler_index(s36,s37,s38,false)], ..., 0.0)`.
+- Tried: individual `SamplerState tb_lsb_N : register(sN, space70000)` for all
+  80 entries, constants rewritten, and the dynamic site expanded into an 80-way
+  select over the same sampler states. The generated HLSL had 0 arrays, 80
+  individual samplers and the chain, and was formally correct, but DXC did not
+  finish compiling the six real variants within 180 s (the array version
+  compiles in under a second). That would stall the title, so it was reverted.
+- Therefore the fix must keep the array and give it a sampler descriptor range:
+  create the 116 `litsamp::bank()` samplers as descriptors in a shader-visible
+  sampler heap, append a sampler-only root table at space 70000 (a table cannot
+  mix samplers with the SRV ranges), and bind it whenever a PSO/root carrying
+  it is set. `add_literal_samplers` changes from static-sampler records to that
+  table. No sampler heap exists in the emulator today.
