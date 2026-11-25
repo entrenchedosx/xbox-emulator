@@ -309,3 +309,29 @@ reorder and its classifier were reverted; no other changes were involved.
   mix samplers with the SRV ranges), and bind it whenever a PSO/root carrying
   it is set. `add_literal_samplers` changes from static-sampler records to that
   table. No sampler heap exists in the emulator today.
+
+### Sampler heap implemented through direct heap indexing
+
+- The title creates a shader-visible sampler heap (128 entries).
+  `CreateDescriptorHeap` now grows every shader-visible sampler heap to the
+  2048-entry D3D12 maximum and writes `litsamp::bank()` at index 1932..2047
+  (increment 32, verified in the log). The title's own descriptors keep their
+  indexes.
+- The translator declares bank entries as individual static samplers for
+  constant uses (no array) and emits, only for the dynamic S# site,
+  `SamplerState tmp = SamplerDescriptorHeap[1932u + tb_lit_sampler_index(...)]`.
+  DXC compiles the six real variants in 0.9 s (the 80-way select chain did not
+  finish in 180 s).
+- Roots now set `SAMPLER_HEAP_DIRECTLY_INDEXED` (0x20) and
+  `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` (0x10); the patched title root reports
+  flags 0x831.
+- Measured in a 120 s run: 34 presents, **6 driver rejections** (from ~203 in
+  140 s), no crash. The sampler bank is installed and the title runs.
+- **Not yet visible game content.** Presented frames 30/60 are non-black
+  (80,862 and 84,681 non-zero bytes of 24,883,200), but inspection shows those
+  pixels are the emulator's own performance OSD, not title output. The title
+  backbuffer is still 0/24,883,200.
+- The six remaining rejections are the same UI PSs (plus `a6dbf98d29c8c2b3`).
+  Next: compile a synthetic PS that uses `SamplerDescriptorHeap` on the real
+  root to prove the PSO path, then determine why the real PS still fails
+  (candidate: the PSO may still carry pre-rebuild bytecode for that shader).
