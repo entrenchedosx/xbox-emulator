@@ -2050,6 +2050,42 @@ pub unsafe fn on_present(queue: *mut c_void, src: *mut c_void, plane_count: u32,
                 g.fc.into_src,
             ),
         );
+        // The named fields the capture needs, derived from what this function already holds: the
+        // presented target and the size of its descriptor, the capture-completion predicate, the
+        // fact that the hook is running (this line is emitted from inside it), whether the flush
+        // path finalised anything, the decline reason with the values it was decided from, and the
+        // resolved absolute output path with the OS error of the create attempt.
+        {
+            let tgt_size = d.len();
+            let shot_pred = g.shot.as_ref().is_some_and(|sh| sh.frames_left <= 1);
+            let root = out_root();
+            let made = std::fs::create_dir_all(&root);
+            let probes_txt = root.join("probes.txt").exists();
+            let passes_txt = root.join("passes.txt").exists();
+            let decline = if !(changed || flip || periodic || recording_end) {
+                "no chain predicate true"
+            } else if !quota {
+                "chain line quota exhausted"
+            } else {
+                "chain line admitted"
+            };
+            record(
+                "d3d12_xs",
+                "passcap.present.target",
+                &format!(
+                    "present #{} tgt=0x{src_u:x} tgt_size={tgt_size} shot_pred={shot_pred} hook_invoked=true flush_ran={} decline={decline} caps={} frames_per_shot={} probes_txt={probes_txt} passes_txt={passes_txt} create_path={} create_err={}",
+                    g.presents,
+                    finalize.is_some(),
+                    s.max_caps,
+                    s.frames,
+                    root.display(),
+                    match &made {
+                        Ok(()) => "none".to_string(),
+                        Err(e) => e.to_string(),
+                    }
+                ),
+            );
+        }
         g.last_into_src_zero = Some(into_zero);
         g.last_src = src_u;
         g.last_src_desc = d.to_vec();
