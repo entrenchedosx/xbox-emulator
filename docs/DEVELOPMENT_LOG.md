@@ -249,3 +249,40 @@ reorder and its classifier were reverted; no other changes were involved.
   `D:\xbox-pc-port\games`).
 - Next: warm the shader/PSO pack over repeated runs (or run `xshader_prelaunch`
   to completion) with the new root hash, then capture frames and `PresentX.draws`.
+
+### The remaining PSO rejections are sampler arrays against static samplers
+
+- A 560 s warm run presented frames 280 and 540 but had **112 driver
+  rejections** (a 140 s run had 203), so the earlier 0/0 window only ended before
+  the UI pipelines appeared. Backbuffer still 0/8,294,400 non-black.
+- The root is now fully patched: `SRV(reg 27, space 4100001)`, unbounded
+  `SRV`/`UAV` at 60000, unbounded raw `SRV` at 4160000 and 116 static samplers
+  at 70000 (`console blob 6240 bytes`).
+- Probe on that rejected stream (PS dumped with `SV_Target0` float4, inputs
+  matching the VS outputs exactly):
+  - removing the PS succeeds; removing anything else, including the RTV, fails;
+  - a DXC-compiled, resource-free PS with the **same input signature** succeeds;
+  - single bindings all succeed: `t1@60000`, `StructuredBuffer t6@60000`, and a
+    single `SamplerState s0@70000`;
+  - all four textures plus `t6` succeed;
+  - **`SamplerState s[2]`, `s[8]`, `s[16]`, `s[64]`, `s[80]` all fail** with
+    constant or dynamic indexing.
+- Cause: the D3D12 specification says samplers in a descriptor heap can be
+  dynamically assigned and indexed, **which static samplers cannot**. The
+  translator emits `SamplerState tb_lsb[80]` and `litsamp` supplies the bank as
+  static samplers, so every PSO that samples through the bank is rejected at
+  creation. This accounts for the remaining UI/decal pipelines.
+- The fix is a **sampler descriptor heap**: materialize `litsamp::bank()` as 116
+  sampler descriptors, change the appended root entry from static samplers to a
+  sampler descriptor range at space 70000, and bind that table for PSOs whose
+  root carries it. The emulator has no sampler heap today (only `CreateSampler`
+  forwarding and a heap-limit check), so this is a new feature, not a one-line
+  patch.
+- Translator fix in the same pass: `buffer_load_format_x/xy/xyz/xyzw` on a
+  memory-based CBV table now translates as 1/2/3/4 raw dwords (the SDF shaders
+  use `32_32_FLOAT`). The dumped `PS_AreaPolySdf` / `PS_AreaDecalPolySdf` no
+  longer fail with `constant-buffer MUBUF form unsupported`; they remain blocked
+  on the sampler-array issue at PSO creation.
+- Tests: `cargo test -p d3d12_xs --lib` 716 passed, 1 known environmental
+  failure. The PSO probe (`TOMBOX_PSO_PROBE_DUMP`) now also swaps known-good
+  shaders/roots into a rejected stream and compiles matching test PS variants.

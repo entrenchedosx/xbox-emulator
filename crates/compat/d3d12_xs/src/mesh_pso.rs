@@ -585,6 +585,16 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
     hr
 }
 
+/// First stream the driver accepted that carries VS, PS and a root signature: a known-good set
+/// of subobjects to substitute into a rejected stream (diagnostic, TOMBOX_PSO_PROBE_DUMP).
+static GOOD_STREAM: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+/// Process-lifetime copies of the accepted pipeline's shader bytecode. The stream only carries
+/// pointers, which may belong to startup prewarm buffers that are freed later.
+static GOOD_PS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static GOOD_PS_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static GOOD_VS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static GOOD_VS_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) unsafe fn create_translated_stream(real: *mut c_void, out: &[u8], riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
     let vt = *(real as *const *const usize);
     let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(*vt);
@@ -611,6 +621,38 @@ pub(crate) unsafe fn create_translated_stream(real: *mut c_void, out: &[u8], rii
         record("d3d12_xs", "CreatePipelineState", &format!("PC driver rejected stream hr={hr:#010x} subs=[{}]", stream_summary(out)));
         if hr == E_INVALIDARG && std::env::var_os("TOMBOX_PSO_PROBE_DUMP").is_some() {
             probe_rejected_stream(dev2, f, out, riid);
+        }
+    }
+    if hr >= 0 {
+        if let Ok(subs) = parse(out) {
+            let has = |t: u32| subs.iter().any(|(x, _)| *x == t);
+            if has(SUB_VS) && has(SUB_PS) && has(SUB_ROOT_SIGNATURE) {
+                if let Ok(mut g) = GOOD_STREAM.lock() {
+                    if g.is_none() {
+                        for (ty, ptr, len) in [
+                            (SUB_PS, &GOOD_PS, &GOOD_PS_LEN),
+                            (SUB_VS, &GOOD_VS, &GOOD_VS_LEN),
+                        ] {
+                            if let Some(&(_, o)) = subs.iter().find(|(t, _)| *t == ty) {
+                                let (p, n) = bytecode(out, o);
+                                if p != 0 && n != 0 {
+                                    let bytes = unsafe { core::slice::from_raw_parts(p as *const u8, n as usize) }.to_vec();
+                                    let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+                                    ptr.store(leaked.as_ptr() as usize, std::sync::atomic::Ordering::Relaxed);
+                                    len.store(leaked.len(), std::sync::atomic::Ordering::Relaxed);
+                                    if ty == SUB_PS {
+                                        if let Ok(dir) = std::env::var("TOMBOX_PSO_PROBE_DUMP") {
+                                            let _ = std::fs::create_dir_all(&dir);
+                                            let _ = std::fs::write(format!("{dir}\\accepted_ps.dxil"), leaked);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        *g = Some(out.to_vec());
+                    }
+                }
+            }
         }
     }
     if hr >= 0 && std::env::var_os("TOMBOX_PSO_PROBE_DUMP").is_some() {
@@ -733,6 +775,125 @@ unsafe fn probe_rejected_stream(
         }
         hr
     };
+    let swap = |ty: u32| -> i32 {
+        let Some(good) = GOOD_STREAM.lock().ok().and_then(|g| g.clone()) else { return 0x7fff_ffff };
+        let Ok(gs) = parse(&good) else { return 0x7fff_fffe };
+        let Some(&(_, gi)) = gs.iter().find(|(t, _)| *t == ty) else { return 0x7fff_fffd };
+        let Some((_, n)) = inner_layout(ty) else { return 0x7fff_fffc };
+        let mut v = Vec::with_capacity(out.len());
+        for &(t, inner) in &subs {
+            let Some((a, sz)) = inner_layout(t) else { continue };
+            let start = inner - align(4, a);
+            let end = align(inner + sz, 8).min(out.len());
+            let at = v.len();
+            v.extend_from_slice(&out[start..end]);
+            if t == ty {
+                let o = at + (inner - start);
+                let stable = match ty {
+                    SUB_PS => (GOOD_PS.load(std::sync::atomic::Ordering::Relaxed), GOOD_PS_LEN.load(std::sync::atomic::Ordering::Relaxed)),
+                    SUB_VS => (GOOD_VS.load(std::sync::atomic::Ordering::Relaxed), GOOD_VS_LEN.load(std::sync::atomic::Ordering::Relaxed)),
+                    _ => (0, 0),
+                };
+                if stable.0 != 0 && stable.1 != 0 {
+                    v[o..o + 8].copy_from_slice(&(stable.0 as u64).to_le_bytes());
+                    v[o + 8..o + 16].copy_from_slice(&(stable.1 as u64).to_le_bytes());
+                } else {
+                    v[o..o + n].copy_from_slice(&good[gi..gi + n]);
+                }
+            }
+        }
+        let d = [v.len(), v.as_ptr() as usize];
+        let mut pso: *mut c_void = core::ptr::null_mut();
+        let hr = create(dev2, &d, riid, &mut pso);
+        if hr >= 0 && !pso.is_null() {
+            let vt = *(pso as *const *const usize);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*vt.add(2));
+            rel(pso);
+        }
+        hr
+    };
+    let matching_ps = || -> Option<(usize, usize)> {
+        static P: std::sync::OnceLock<Option<&'static [u8]>> = std::sync::OnceLock::new();
+        let b = P.get_or_init(|| {
+            let src = "struct I { float4 pos : SV_Position; float4 col : COLOR0; float4 uv : TEXCOORD0; };\nfloat4 main(I i) : SV_Target0 { return i.col + i.uv * 0.0 + i.pos * 0.0; }\n";
+            tombox_xshader::dxc::compile(src, "ps_6_0")
+                .ok()
+                .map(|v| Box::leak(v.into_boxed_slice()) as &'static [u8])
+        });
+        b.as_ref().map(|b| (b.as_ptr() as usize, b.len()))
+    };
+    let swap_matching_ps = |ty: u32| -> i32 {
+        let Some((ptr, len)) = matching_ps() else { return 0x7fff_fffb };
+        let mut v = Vec::with_capacity(out.len());
+        for &(t, inner) in &subs {
+            let Some((a, sz)) = inner_layout(t) else { continue };
+            let start = inner - align(4, a);
+            let end = align(inner + sz, 8).min(out.len());
+            let at = v.len();
+            v.extend_from_slice(&out[start..end]);
+            if t == ty {
+                let o = at + (inner - start);
+                v[o..o + 8].copy_from_slice(&(ptr as u64).to_le_bytes());
+                v[o + 8..o + 16].copy_from_slice(&(len as u64).to_le_bytes());
+            }
+        }
+        let d = [v.len(), v.as_ptr() as usize];
+        let mut pso: *mut c_void = core::ptr::null_mut();
+        let hr = create(dev2, &d, riid, &mut pso);
+        if hr >= 0 && !pso.is_null() {
+            let vt = *(pso as *const *const usize);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*vt.add(2));
+            rel(pso);
+        }
+        hr
+    };
+    let swap_ps_src = |src: &str| -> i32 {
+        let Ok(blob) = tombox_xshader::dxc::compile(src, "ps_6_0") else { return 0x7fff_fff0 };
+        let leaked: &'static [u8] = Box::leak(blob.into_boxed_slice());
+        let (ptr, len) = (leaked.as_ptr() as usize, leaked.len());
+        let mut v = Vec::with_capacity(out.len());
+        for &(t, inner) in &subs {
+            let Some((a, sz)) = inner_layout(t) else { continue };
+            let start = inner - align(4, a);
+            let end = align(inner + sz, 8).min(out.len());
+            let at = v.len();
+            v.extend_from_slice(&out[start..end]);
+            if t == SUB_PS {
+                let o = at + (inner - start);
+                v[o..o + 8].copy_from_slice(&(ptr as u64).to_le_bytes());
+                v[o + 8..o + 16].copy_from_slice(&(len as u64).to_le_bytes());
+            }
+        }
+        let d = [v.len(), v.as_ptr() as usize];
+        let mut pso: *mut c_void = core::ptr::null_mut();
+        let hr = create(dev2, &d, riid, &mut pso);
+        if hr >= 0 && !pso.is_null() {
+            let vt = *(pso as *const *const usize);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*vt.add(2));
+            rel(pso);
+        }
+        hr
+    };
+    const PS_HEAD: &str = "struct I { float4 pos : SV_Position; float4 col : COLOR0; float4 uv : TEXCOORD0; };\n";
+    for (name, tail) in [
+        ("t1@60000 SRV", "Texture2D<float4> t : register(t1, space60000);\nfloat4 main(I i) : SV_Target0 { return t.Load(int3(0,0,0)) + i.col * 0.0; }\n"),
+        ("t6@60000 structured", "StructuredBuffer<float2> b : register(t6, space60000);\nfloat4 main(I i) : SV_Target0 { float2 v = b[0]; return float4(v, 0, 1) + i.col * 0.0; }\n"),
+        ("s0@70000 sampler", "SamplerState s : register(s0, space70000);\nTexture2D<float4> t : register(t1, space60000);\nfloat4 main(I i) : SV_Target0 { return t.SampleLevel(s, i.uv.xy, 0) + i.col * 0.0; }\n"),
+        ("s[2] constant index", "SamplerState s[2] : register(s0, space70000);\nTexture2D<float4> t : register(t1, space60000);\nfloat4 main(I i) : SV_Target0 { return t.SampleLevel(s[0], i.uv.xy, 0) + i.col * 0.0; }\n"),
+        ("s[8] constant index", "SamplerState s[8] : register(s0, space70000);\nTexture2D<float4> t : register(t1, space60000);\nfloat4 main(I i) : SV_Target0 { return t.SampleLevel(s[0], i.uv.xy, 0) + i.col * 0.0; }\n"),
+        ("s[16] constant index", "SamplerState s[16] : register(s0, space70000);\nTexture2D<float4> t : register(t1, space60000);\nfloat4 main(I i) : SV_Target0 { return t.SampleLevel(s[0], i.uv.xy, 0) + i.col * 0.0; }\n"),
+        ("s[64] constant index", "SamplerState s[64] : register(s0, space70000);\nTexture2D<float4> t : register(t1, space60000);\nfloat4 main(I i) : SV_Target0 { return t.SampleLevel(s[0], i.uv.xy, 0) + i.col * 0.0; }\n"),
+        ("s[80] constant index", "SamplerState s[80] : register(s0, space70000);\nTexture2D<float4> t : register(t1, space60000);\nfloat4 main(I i) : SV_Target0 { return t.SampleLevel(s[0], i.uv.xy, 0) + i.col * 0.0; }\n"),
+        ("s[80] dynamic index", "SamplerState s[80] : register(s0, space70000);\nTexture2D<float4> t : register(t1, space60000);\nfloat4 main(I i) : SV_Target0 { uint k = (uint)abs(i.uv.x) % 80u; return t.SampleLevel(s[k], i.uv.xy, 0) + i.col * 0.0; }\n"),
+        ("all four textures + t6", "Texture2D<float4> t1 : register(t1, space60000);\nTexture2D<float4> t2 : register(t2, space60000);\nTexture2D<float4> t3 : register(t3, space60000);\nTexture3D<float4> t4 : register(t4, space60000);\nStructuredBuffer<float2> b : register(t6, space60000);\nfloat4 main(I i) : SV_Target0 { float2 v = b[0]; return t1.Load(int3(0,0,0)) + t2.Load(int3(0,0,0)) + t3.Load(int3(0,0,0)) + t4.Load(int4(0,0,0,0)) + float4(v, 0, 1) + i.col * 0.0; }\n"),
+    ] {
+        let src = format!("{PS_HEAD}{tail}");
+        verdicts.push(format!("{name}: {:#010x}", swap_ps_src(&src)));
+    }
+    verdicts.push(format!("matching trivial PS: {:#010x}", swap_matching_ps(SUB_PS)));
+    verdicts.push(format!("PS from the accepted stream: {:#010x}", swap(SUB_PS)));
+    verdicts.push(format!("VS from the accepted stream: {:#010x}", swap(SUB_VS)));
+    verdicts.push(format!("root from the accepted stream: {:#010x}", swap(SUB_ROOT_SIGNATURE)));
     verdicts.push(format!("VS only (no PS, no render targets): {:#010x}", variant(&[2], true)));
     verdicts.push(format!("VS only, no input layout: {:#010x}", variant(&[2, 12], true)));
     verdicts.push(format!("VS only, no input layout, no root signature: {:#010x}", variant(&[2, 12, 0], true)));

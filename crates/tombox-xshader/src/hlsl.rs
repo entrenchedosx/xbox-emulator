@@ -5737,10 +5737,10 @@ impl<'a> Emitter<'a> {
     /// Number of dwords moved by a MUBUF dword load/store mnemonic.
     fn mubuf_dwords(m: &str) -> Option<u32> {
         Some(match m.rsplit('_').next()? {
-            "dword" => 1,
-            "dwordx2" => 2,
-            "dwordx3" => 3,
-            "dwordx4" => 4,
+            "dword" | "x" => 1,
+            "dwordx2" | "xy" => 2,
+            "dwordx3" | "xyz" => 3,
+            "dwordx4" | "xyzw" => 4,
             _ => return None,
         })
     }
@@ -5757,8 +5757,18 @@ impl<'a> Emitter<'a> {
         }
         if let Some(Res::CbDyn(slot)) = self.res.get(&idx).and_then(|v| v.first()).copied() {
             let (offen, idxen) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0);
-            if (idxen && offen) || !matches!(ins.src[2], Opnd::ConstInt(0)) || !ins.mnemonic.starts_with("buffer_load_dword") {
-                return Err("constant-buffer MUBUF form unsupported".into());
+            // `buffer_load_format_*` reads a typed element through the V# table. The format is
+            // not visible here; these shaders use 32_32_FLOAT, where the raw dwords are the two
+            // floats, so the dword path is correct for them. Other V# formats remain a gap.
+            let typed = ins.mnemonic.starts_with("buffer_load_format_");
+            if (idxen && offen)
+                || !matches!(ins.src[2], Opnd::ConstInt(0))
+                || !(ins.mnemonic.starts_with("buffer_load_dword") || typed)
+            {
+                return Err(format!(
+                    "constant-buffer MUBUF form unsupported [{} offen={offen} idxen={idxen} soffset={:?} imm={:#x}]",
+                    ins.mnemonic, ins.src[2], ins.aux.imm
+                ));
             }
             let n = Self::mubuf_dwords(&ins.mnemonic).ok_or("unsupported MUBUF op")?;
             let vd = match ins.dst[0] {
