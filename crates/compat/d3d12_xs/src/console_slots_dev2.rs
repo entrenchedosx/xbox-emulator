@@ -377,6 +377,9 @@ unsafe extern "system" fn component_placed_x(
         return E_NOINTERFACE;
     }
     if locations.is_null() || desc.is_null() {
+        record("d3d12_xs", "CreatePlacedResourceX", &format!(
+            "refused null argument: locations={locations:p} desc={desc:p} riid={riid:p} -> hr=0x{:08X}",
+            E_INVALIDARG as u32));
         return E_INVALIDARG;
     }
     let va = unsafe { core::ptr::read_unaligned(locations) };
@@ -431,6 +434,9 @@ unsafe extern "system" fn committed_opaque_x(
         return E_FAIL;
     }
     if desc.is_null() {
+        record("d3d12_xs", "opaque_resource.create", &format!(
+            "refused null desc: desc={desc:p} riid={riid:p} -> hr=0x{:08X}",
+            E_INVALIDARG as u32));
         return E_INVALIDARG;
     }
     let d = opaque_desc(&unsafe { core::ptr::read_unaligned(desc as *const [u8; 0x38]) }, opaque_type);
@@ -461,6 +467,9 @@ unsafe extern "system" fn placed_opaque_x(
         return E_FAIL;
     }
     if desc.is_null() {
+        record("d3d12_xs", "opaque_resource.create", &format!(
+            "refused null desc: desc={desc:p} riid={riid:p} -> hr=0x{:08X}",
+            E_INVALIDARG as u32));
         return E_INVALIDARG;
     }
     if !heap.is_null() && unsafe { heap_flags(heap) } & HEAP_FLAG_ALLOW_DISPLAY != 0 {
