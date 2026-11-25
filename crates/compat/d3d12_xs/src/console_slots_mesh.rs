@@ -166,6 +166,11 @@ type RsFn = unsafe extern "system" fn(*mut c_void, u32, *const u8, usize, *const
 unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, blob: *const u8, len: usize, riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
     let prev = PREV_RS.load(Ordering::Relaxed);
     if prev == 0 {
+        // A root signature asked for before the host device installed its own is refused here with
+        // the blob the title wanted; log it so the refused blob is named, not just the HRESULT.
+        record("d3d12_xs", "CreateRootSignatureX", &format!(
+            "refused before host device install: mask={mask:#x} blob={blob:p} len={len} riid={riid:p} ppv={ppv:p} -> hr=0x{:08X}",
+            E_INVALIDARG as u32));
         return E_INVALIDARG;
     }
     let f: RsFn = unsafe { core::mem::transmute(prev) };
