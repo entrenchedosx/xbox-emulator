@@ -355,6 +355,13 @@ unsafe extern "system" fn committed_x(
         return E_NOINTERFACE;
     }
     if desc.is_null() || heap.is_null() {
+        // A resource create handed no desc or no heap is refused here; name the pointers and the
+        // code rather than returning silently, and log the desc fields the contract cares about
+        // when the desc is present.
+        // The desc here is an opaque byte blob, so only its presence can be reported.
+        record("d3d12_xs", "CreateCommittedResourceX", &format!(
+            "refused null argument: desc={desc:p} heap={heap:p} riid={riid:p} -> hr=0x{:08X}",
+            E_INVALIDARG as u32));
         return E_INVALIDARG;
     }
     let f: unsafe extern "system" fn(*mut c_void, *const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
