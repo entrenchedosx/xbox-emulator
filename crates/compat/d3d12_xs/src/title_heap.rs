@@ -1237,18 +1237,9 @@ fn diag_table(rs: usize, param: u32, heap: usize, index: u32, ranges: Option<&[T
         return;
     }
     static PER: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
-    {
-        let mut g = PER.lock().unwrap_or_else(|e| e.into_inner());
-        let m = g.get_or_insert_with(HashMap::new);
-        if m.len() > 12 {
-            return;
-        }
-        let n = m.get(&rs).copied().unwrap_or(0);
-        if n >= 3 {
-            return;
-        }
-        m.insert(rs, n + 1);
-    }
+    // Binds whose slots all read zero are not interesting and must not consume the per-signature
+    // budget: they are what crowded out the composite's own root signature in an earlier run.
+    let mut any = false;
     let (slot0, w) = heaps(|m| m.get(&heap).map(|h| (h.slot0, h.words()))).unwrap_or((0, 0));
     let list: Vec<TableRange> = ranges.map(|r| r.to_vec()).unwrap_or_default();
     let mut s = format!(
@@ -1262,6 +1253,7 @@ fn diag_table(rs: usize, param: u32, heap: usize, index: u32, ranges: Option<&[T
         if read.is_none() {
             continue;
         }
+        any |= q.iter().any(|v| *v != 0);
         let va = q[0] as u64 | (q[1] as u64) << 32;
         let mut t = format!(" [off{} n{} k{} slot{at} {q:08x?} va={va:#x} size={} fl={}]", x.offset, x.count, x.kind, q[2], q[3]);
         if let Some((e, off)) = crate::gpu_va::lookup(va) {
@@ -1278,6 +1270,21 @@ fn diag_table(rs: usize, param: u32, heap: usize, index: u32, ranges: Option<&[T
             t.push_str(" va not in any buffer");
         }
         s.push_str(&t);
+    }
+    if !any {
+        return;
+    }
+    {
+        let mut g = PER.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.len() > 24 {
+            return;
+        }
+        let n = m.get(&rs).copied().unwrap_or(0);
+        if n >= 6 {
+            return;
+        }
+        m.insert(rs, n + 1);
     }
     record(M, TAG, &s);
 }
