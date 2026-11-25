@@ -56,6 +56,14 @@ pub fn mode() -> Mode {
     })
 }
 
+/// True when a console descriptor-table CBV range has been rebound as a raw SRV range in the PC
+/// root signature. The translated shaders then read it as a ByteAddressBuffer at space 4100000+n,
+/// so the descriptor behind it has to be a raw buffer view; a real CBV in that slot has a buffer
+/// address where the view format belongs and reads back nothing.
+pub fn table_cbv_as_raw() -> bool {
+    enabled() || copy_on()
+}
+
 pub fn copy_on() -> bool {
     static C: OnceLock<bool> = OnceLock::new();
     *C.get_or_init(|| mode() == Mode::Copy)

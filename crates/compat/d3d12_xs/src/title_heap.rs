@@ -750,6 +750,36 @@ unsafe fn write_slot(h: &Heap, i: usize, host_slot: u32, words: &[u32], kind: u8
     let slot = decode_slot(h.family, &d);
     let mut ok = true;
     if kind == KIND_CBV {
+        let size = if let Slot::Buffer(b) = slot { cbv_size(&b) } else { 0 };
+        if crate::cbv_raw::table_cbv_as_raw() {
+            // The console signature's CBV ranges are rebound as raw SRVs at space 4100000+n, which is
+            // how the translated shader reads them, so the slot must hold the same raw buffer view
+            // the CreateConstantBufferView path writes. A real CBV here would put a buffer address
+            // where an SRV view format belongs and the shader would read nothing.
+            let (res, view) = match slot {
+                Slot::Buffer(b) => match crate::cbv_raw::raw_view(b.va, size, &crate::gpu_va::lookup) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        if once(25) {
+                            record(M, TAG, &format!("heap slot {i}: console CBV {:#x} cannot become a raw SRV ({e}); null view written", b.va));
+                        }
+                        ok = false;
+                        (0, null_view(false))
+                    }
+                },
+                Slot::Null => (0, null_view(false)),
+                _ => {
+                    ok = false;
+                    (0, null_view(false))
+                }
+            };
+            if crate::rtcap::enabled() || crate::passcap::tables_on() {
+                crate::bindtrace::note_desc(handle as usize, crate::bindtrace::Desc::Srv { res, desc: Some(view) });
+            }
+            let f: unsafe extern "system" fn(usize, usize, *const [u8; 40], u64) = core::mem::transmute(vfn(dev, 18));
+            f(dev, res, &view, handle);
+            return ok;
+        }
         let f: unsafe extern "system" fn(usize, *const [u8; 16], u64) = core::mem::transmute(vfn(dev, 17));
         let mut c = [0u8; 16];
         if let Slot::Buffer(b) = slot {
@@ -1844,9 +1874,17 @@ mod tests {
             mem[3] = t_img(FAMILY_SCARLETT, tex_va, 56, 0, 9, 0, 0, [4, 5, 6, 7]);
             assert_eq!(ex(&[l1]), 7);
             let c = calls();
-            assert_eq!((c[0].0, c[0].3), (17, 0x10_0000 + 64));
-            assert_eq!(u64::from_le_bytes(c[0].2[0..8].try_into().unwrap()), 0x7700_0100);
-            assert_eq!(u32::from_le_bytes(c[0].2[8..12].try_into().unwrap()), 512);
+            // Console CBV ranges are rebound as raw SRVs by default (cbv_raw mode `copy`), so this
+            // slot carries the same raw buffer view the CreateConstantBufferView path writes: an
+            // R32_TYPELESS buffer SRV over the constant buffer's own bytes at its own offset.
+            assert_eq!((c[0].0, c[0].1, c[0].3), (18, buf, 0x10_0000 + 64));
+            assert_eq!(u32::from_le_bytes(c[0].2[0..4].try_into().unwrap()), 39);
+            assert_eq!(u32::from_le_bytes(c[0].2[4..8].try_into().unwrap()), 1);
+            assert_eq!(u64::from_le_bytes(c[0].2[16..24].try_into().unwrap()), 0x100 / 4);
+            assert_eq!(u32::from_le_bytes(c[0].2[24..28].try_into().unwrap()), 128);
+            // The buffer view's flag word as this descriptor ABI writes it (`raw_view`'s
+            // BUFFER_SRV_FLAG_RAW), i.e. a raw view and not a structured one.
+            assert_eq!(u32::from_le_bytes(c[0].2[32..36].try_into().unwrap()), 1);
             assert_eq!((c[1].0, c[1].1, c[1].3), (19, buf, 0x10_0000 + 128));
             assert_eq!(u32::from_le_bytes(c[1].2[0..4].try_into().unwrap()), 41);
             assert_eq!((c[2].0, c[2].1, c[2].3), (18, tex, 0x10_0000 + 192));
@@ -1864,7 +1902,9 @@ mod tests {
             assert_eq!(ex(&[l1, l2]), 2);
             assert!(calls().iter().all(|x| x.0 == 18));
             assert_eq!(ex(&[l1]), 2);
-            assert_eq!(calls().iter().map(|x| x.0).collect::<Vec<_>>(), vec![17, 19]);
+            // The console CBV range became a raw SRV range, so its slot is rewritten with vfn 18;
+            // the UAV range keeps vfn 19.
+            assert_eq!(calls().iter().map(|x| x.0).collect::<Vec<_>>(), vec![18, 19]);
             on_reset(l1);
             mem[4][0] = 0x77;
             mem[4][3] = 9 << 28;
@@ -1885,7 +1925,7 @@ mod tests {
             mem[7][0] = 0x55;
             mem[7][3] = 9 << 28;
             assert_eq!(ex(&[l6]), 2);
-            assert_eq!(calls().iter().map(|x| (x.0, x.3)).collect::<Vec<_>>(), vec![(17, 0x10_0000 + 6 * 64), (19, 0x10_0000 + 7 * 64)]);
+            assert_eq!(calls().iter().map(|x| (x.0, x.3)).collect::<Vec<_>>(), vec![(18, 0x10_0000 + 6 * 64), (19, 0x10_0000 + 7 * 64)]);
             assert_eq!(locate(memory + 8 * 32), None);
             assert_eq!(translate(0x40), 0x40);
             assert!(forget(heap));

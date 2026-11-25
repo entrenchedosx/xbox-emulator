@@ -742,3 +742,73 @@ presented swapchain OSD only. Open lead: `title_heap` reports 1,032
 events, and the one-shot block dump shows the first one in a UAV range over an
 all-zero heap region, so which of the composite's table descriptors (if any) are
 null is not yet established.
+
+## The composite's transform constants: a table CBV written where the PC signature declares a raw SRV
+
+The open lead was the constants. `cbv_raw` (mode `copy`) rewrites every console
+descriptor-table CBV range to `RANGE_SRV` in `space 4100000+n` and rewrites the
+translated shader to read it as a `ByteAddressBuffer` (that is how it keeps a
+console CBV readable on PC without a heap of its own). Individually created CBVs
+go through `cbv_raw::create_cbv`, which writes a *raw buffer SRV* to match. Heap
+slots do not: `title_heap::write_slot`'s `KIND_CBV` branch called
+`CreateConstantBufferView` (device vfn 17) unconditionally. A real CBV handed to
+a range the PC root signature declares as an SRV has a buffer address where the
+view format belongs, so the read returns nothing: the composite's VS took its
+`t27, space4100001` term as zero, `SV_Position` collapsed and the quad shaded no
+pixels.
+
+Fix (`title_heap::write_slot` + `cbv_raw::table_cbv_as_raw`): when the CBV ranges
+of the signature were rebound (the same predicate `create_cbv` converts under),
+the heap slot is written with `CreateShaderResourceView` (vfn 18) over
+`cbv_raw::raw_view(va, cbv_size, gpu_va::lookup)` - the identical view the
+CreateConstantBufferView path writes - and recorded as `Desc::Srv` in the
+binding trace. The plain CBV path stays for signatures that were not rebound. No
+draw is special-cased; every table CBV slot of every signature goes through it.
+
+### Measured on the title (`pass-c10`, presents 100 and 140)
+
+```
+draw 00 topo=TRIANGLELIST rt=0x1e3538700c0 ... PSInvocations=8294400
+draw 01 topo=RECTLIST     rt=0x1e3538700c0 ... PSInvocations=8294400
+```
+
+Both full-target draws went from `PSInvocations=0` to **8,294,400** invocations,
+exactly the 3840x2160 pixel count, in two consecutive captured frames (presents
+100 and 140). The composite's VS now reads the constants the title set.
+
+### Attribution of the null descriptors (asked and answered)
+
+The binds are not among the mis-decoded ones. `title_heap` reported
+`console slots=1245184 host slots=1000000 ... slot 0 at 0x1cb95840000, console
+stride 32`; the composite's table handle `0x1cb974fede0` is console slot
+**964,495**, and the `no PC resource/format match; null view written` events of
+that run (1,508 of them, min slot 11, max slot 1,236,848) contain **zero** slots
+in the 964,xxx band - they are float data (`3840.0 2160.0 0 NaN 1.0 1.0 ...`,
+`0 0 0 0 -1.0 1.0 0 NaN`) sitting in unused regions of the 1.25M-slot bindless
+heap, not the composite's range. The register mapping is also not at fault: the
+root-signature patch appends parameters, so console parameter indices are
+preserved, and the journal shows the same signature re-set rather than replaced.
+
+### Next break, located and measured but not fixed
+
+The composite shades but the target is still black, and the frame never reaches
+the presented surface:
+
+* every capture of the frame is `zero_px=1.0000`: RT0 (`cap 0000`, 0x1d3dba03680,
+  flags=0x1), the DSV (`cap 0001`, all-zero depth), and the presented source
+  (`cap 0005`, 0 of 8,294,400 non-black);
+* both draws render into a *placed* 3840x2160 target (VA `0x1e1e6260000`), while
+  `PresentX` names a *committed* 3840x2160 resource, and the recorded frame has
+  `resolves=0 copies=0` with `WRITES-PRESENTED-SRC ps=[]`.
+
+The composite's PS is not a passthrough either: it declares inputs
+`SV_Position/COLOR0/TEXCOORD0`, one `SV_Target0`, and a
+`Resource bind info for sbuf...` buffer - an SRV buffer from the same table. The
+PS therefore still reads black there, which is the next thing to attribute.
+
+### State on this build
+
+Composite `PSInvocations=8,294,400` (was 0); title backbuffer 0 of 8,294,400
+non-black pixels; presented source 0 of 8,294,400 non-black, so the swapchain
+still shows only the OSD the emulator draws after the copy. The visible frame is
+still black.
