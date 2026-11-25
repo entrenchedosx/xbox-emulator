@@ -187,6 +187,20 @@ pub fn alias_blob(blob: &[u8]) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
+/// Root signature for a **title-created** root (as opposed to one synthesized from a shader's
+/// RTS0 part). Translated shaders read console V# tables as raw SRVs in `map_space(space)`, so
+/// this must perform the CBV→SRV conversion, not only add alias/positional/sampler ranges:
+/// otherwise every PS that reads the table binds a space the root does not expose and the driver
+/// rejects the PSO with E_INVALIDARG while the same shader links fine without the PS.
+/// `copy` keeps root CBVs as PC CBVs (`table_blob`); `on`/`auto` convert those too (`patch_blob`).
+pub fn title_root_blob(blob: &[u8]) -> Option<Vec<u8>> {
+    let patched = if copy_on() { table_blob(blob) } else { patch_blob(blob) };
+    match patched {
+        Ok(Some((b, _))) => Some(b),
+        _ => alias_blob(blob).ok().flatten(),
+    }
+}
+
 pub fn patch_blob(blob: &[u8]) -> Result<Option<(Vec<u8>, RsPatch)>, String> {
     patch_blob_with(blob, true)
 }
@@ -669,6 +683,47 @@ pub fn install_draw_check(xbox_vt: &[AtomicUsize]) {
 mod tests {
     use super::*;
     use crate::gpu_va::Entry;
+
+    #[test]
+    fn title_root_with_a_console_cbv_table_gets_the_raw_srv_range() {
+        use tombox_xshader::hlsl::TB_TABLE_FALLBACK_SPACE;
+        // RTS0 v2: one descriptor table with one CBV range at space 1, register 27 — the
+        // memory-based V# table console roots carry (112-byte root container).
+        let mut body = vec![0u8; 68];
+        let w = |b: &mut Vec<u8>, o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        w(&mut body, 0, 2);
+        w(&mut body, 4, 1);
+        w(&mut body, 8, 24);
+        w(&mut body, 24, 0); // PARAM_TABLE
+        w(&mut body, 32, 36);
+        w(&mut body, 36, 1);
+        w(&mut body, 40, 44);
+        w(&mut body, 44, 2); // RANGE_CBV
+        w(&mut body, 48, 1);
+        w(&mut body, 52, 27);
+        w(&mut body, 56, 1);
+        w(&mut body, 64, 0);
+        let mut container = b"DXBC".to_vec();
+        container.extend_from_slice(&[0u8; 16]);
+        container.extend_from_slice(&1u16.to_le_bytes());
+        container.extend_from_slice(&0u16.to_le_bytes());
+        container.extend_from_slice(&(44 + body.len() as u32).to_le_bytes());
+        container.extend_from_slice(&1u32.to_le_bytes());
+        container.extend_from_slice(&36u32.to_le_bytes());
+        container.extend_from_slice(b"RTS0");
+        container.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        container.extend_from_slice(&body);
+        let out = title_root_blob(&container).expect("title root patched");
+        let (o, n) = crate::console_slots_mesh::rts0_range(&out).expect("RTS0 in output");
+        let p = tombox_xshader::meta::parse_rts0(&out[o..o + n]).unwrap();
+        let tombox_xshader::meta::RootParamKind::Table(r) = &p.params[0].kind else { panic!("table") };
+        assert!(
+            r.iter().any(|x| x.range_type == 0 && x.space == map_space(1).unwrap() && x.base_register == 27),
+            "the table CBV must become a raw SRV in map_space(1): {r:?}"
+        );
+        assert!(r.iter().any(|x| x.space == TB_TABLE_FALLBACK_SPACE), "positional SRV range at 60000: {r:?}");
+        assert_eq!(p.num_static_samplers as usize, tombox_xshader::hlsl::litsamp::bank().len());
+    }
 
     #[test]
     fn hoist_moves_constant_raw_loads_before_the_dispatcher() {

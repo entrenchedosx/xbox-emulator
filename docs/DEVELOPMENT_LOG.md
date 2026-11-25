@@ -218,3 +218,34 @@ reorder and its classifier were reverted; no other changes were involved.
    and draws with zero rejected PSOs.
 2. Otherwise make stream PSO root signatures go through the same `cbv_raw`
    patch as descriptor-created roots, so the shader spaces exist in the root.
+
+### Correction and root-signature fix (same day, later)
+
+- The earlier `cbv_raw=on` result above was a **pre-presentation** artifact: once a
+  longer run reached the UI, the same 191 driver and 20 semantic rejections
+  returned. `on` does not fix them.
+- Title-created root signatures were never converted for the PC runtime in normal
+  mode. `patch_real_device` installs its `CreateRootSignature` hook only when
+  `rtcap::enabled()`; otherwise the wrapper (`create_root_signature_abi`) applied
+  only `global_bind`, and `pso_lib::create_root_signature` forwarded the console
+  blob untouched. `alias_blob` (the old path) adds the 60000/70000 spaces but
+  does **not** perform the descriptor-table CBV→raw-SRV conversion in
+  `cbv_raw::map_space`, so a PS reading `space4160000` failed PSO creation while
+  the same stream without the PS was accepted.
+- Fix: `cbv_raw::title_root_blob` (`table_blob` in `copy`, `patch_blob` in
+  `on`), applied in both the wrapper and `pso_lib`'s root hook; idempotent on an
+  already-patched blob. Regression test
+  `cbv_raw::tests::title_root_with_a_console_cbv_table_gets_the_raw_srv_range`
+  builds the 112-byte console root shape and asserts the range becomes a raw SRV
+  in `map_space(1)`, that a positional range at 60000 exists, and that the
+  literal sampler bank at 70000 was appended.
+- Live: a 285 s run had **0 driver and 0 semantic rejections** (baseline at the
+  same duration: 200 + 20). The title also compiles further (700 shaders vs 500)
+  but did not reach frame 120 in that window: the patched-root key invalidated
+  the shader pack and 224 shaders recompiled (206 s of DXC). Backbuffer pixels
+  were not observed this run; no rendering claim.
+- Tests: `cargo test -p d3d12_xs --lib` 716 passed, 1 failed (the known
+  environmental `xs_exports` console-DLL oracle that needs
+  `D:\xbox-pc-port\games`).
+- Next: warm the shader/PSO pack over repeated runs (or run `xshader_prelaunch`
+  to completion) with the new root hash, then capture frames and `PresentX.draws`.

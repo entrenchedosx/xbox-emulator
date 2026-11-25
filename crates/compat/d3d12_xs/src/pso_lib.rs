@@ -361,6 +361,15 @@ pub fn root_key_hash(rs: usize) -> Option<u64> {
 
 unsafe extern "system" fn create_root_signature(this: *mut c_void, mask: u32, blob: *const u8, len: usize, riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
     let f: unsafe extern "system" fn(*mut c_void, u32, *const u8, usize, *const c_void, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(PREV_RS.load(Relaxed)) };
+    // This hook may sit in front of the unpatched real function (normal mode has no real-device
+    // root hook), so convert the console root here as well. Already-patched blobs come back
+    // unchanged, which makes this idempotent when the wrapper also patched.
+    let patched = if blob.is_null() || len == 0 {
+        None
+    } else {
+        crate::cbv_raw::title_root_blob(unsafe { core::slice::from_raw_parts(blob, len) })
+    };
+    let (blob, len) = patched.as_ref().map_or((blob, len), |b| (b.as_ptr(), b.len()));
     let hr = unsafe { f(this, mask, blob, len, riid, ppv) };
     if hr >= 0 && !ppv.is_null() && !blob.is_null() && len != 0 {
         note_root(unsafe { *ppv } as usize, mask, unsafe { core::slice::from_raw_parts(blob, len) }, false);

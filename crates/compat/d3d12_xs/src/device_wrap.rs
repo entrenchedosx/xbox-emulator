@@ -1377,7 +1377,7 @@ unsafe extern "system" fn real_create_root_signature(real: *mut c_void, mask: u3
     let f: unsafe extern "system" fn(*mut c_void, u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(real_orig(16)) };
     let stripped = unsafe { crate::rs_xbox::pc_blob_raw(blob, len) };
     let (blob, len) = stripped.as_ref().map_or((blob, len), |b| (b.as_ptr(), b.len()));
-    let aliased = if blob.is_null() || len == 0 { None } else { crate::cbv_raw::alias_blob(unsafe { core::slice::from_raw_parts(blob, len) }).ok().flatten() };
+    let aliased = if blob.is_null() || len == 0 { None } else { crate::cbv_raw::title_root_blob(unsafe { core::slice::from_raw_parts(blob, len) }) };
     let (blob, len) = aliased.as_ref().map_or((blob, len), |b| (b.as_ptr(), b.len()));
     let copy = |b: *const u8, l: usize| if b.is_null() || l == 0 { Vec::new() } else { unsafe { core::slice::from_raw_parts(b, l) }.to_vec() };
     let sent = core::cell::RefCell::new(Vec::<u8>::new());
@@ -1441,6 +1441,15 @@ unsafe extern "system" fn create_root_signature_abi(this: *mut DeviceWrapper, ma
     if real_orig(16) != 0 {
         return unsafe { f(real, mask, blob, len, riid, ppv) };
     }
+    // Normal mode has no real-device hook, so this is the only place a title-created root is
+    // patched. The translated shaders bind the console V# tables as raw SRVs and the
+    // translator's positional/sampler spaces; without those ranges every such PSO is rejected.
+    let patched = if blob.is_null() || len == 0 {
+        None
+    } else {
+        crate::cbv_raw::title_root_blob(unsafe { core::slice::from_raw_parts(blob, len) })
+    };
+    let (blob, len) = patched.as_ref().map_or((blob, len), |b| (b.as_ptr(), b.len()));
     let mut glob = unsafe { crate::global_bind::patch_root_signature(blob, len) };
     let mut hr = match &glob {
         Some((b, _)) => unsafe { f(real, mask, b.as_ptr(), b.len(), riid, ppv) },
