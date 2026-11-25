@@ -92,6 +92,23 @@ unsafe extern "system" fn qi(this: *mut DxgiDeviceShim, riid: *const Guid, ppv: 
         }
         return S_OK;
     }
+    // Observation only: name the refused interface and the shim that refused it. Gated behind
+    // TOMBOX_QI_TRACE, capped, and the returned code below is unchanged.
+    if std::env::var_os("TOMBOX_QI_TRACE").is_some() {
+        static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            let vt = unsafe { core::ptr::read_volatile(this as *const usize) };
+            record(
+                "d3d12_xs",
+                "qi.refused",
+                &format!(
+                    "IID={} obj={:p} vt={vt:#x} slot=0 site=dxgi_device::qi",
+                    crate::guid_fmt::guid_str(g.d1, g.d2, g.d3, g.d4, Some(0)),
+                    this as *mut c_void
+                ),
+            );
+        }
+    }
     E_NOINTERFACE
 }
 
