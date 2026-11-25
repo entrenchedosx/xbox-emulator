@@ -376,6 +376,10 @@ struct Heap {
     inc: u32,
     raw: Vec<u32>,
     written: Vec<u8>,
+    /// Whether the console slot ever held a non-null descriptor this run. A slot the title cleared
+    /// is reset to the null view on the host but is not live: it must not keep a page out of the
+    /// reclaim pool.
+    live: Vec<bool>,
     kinds: Vec<u8>,
     /// Console page -> host page. `NO_PAGE` until the page is remapped; pages below the host capacity
     /// are identity and never appear here.
@@ -423,7 +427,26 @@ impl Heap {
             return false;
         }
         let end = ((first + PAGE_SLOTS as usize).min(self.host as usize)).min(self.written.len());
-        self.written[first..end].iter().all(|w| *w == 0) && self.raw[first * self.words()..end * self.words()].iter().all(|w| *w == 0)
+        // Only descriptors this run actually synced make a page live. The title's heap memory can
+        // hold nonzero bytes in slots it never bound, and refusing to reuse such a page leaves an
+        // oversized heap with no page to remap descriptors above the host ceiling into.
+        self.live[first..end].iter().all(|w| !*w)
+    }
+
+    /// The host slot a console descriptor lives in, without allocating a page for a console page past
+    /// the host ceiling. Used to clean a cleared descriptor only where a host copy already exists.
+    fn hosted_slot(&self, console: u32) -> Option<u32> {
+        if console >= self.console || (self.null_slot != u32::MAX && console == self.null_slot) {
+            return None;
+        }
+        let page = console >> PAGE_SHIFT;
+        let off = console & (PAGE_SLOTS - 1);
+        if page < self.host_pages() && !self.stolen[page as usize] && self.pages[page as usize] == NO_PAGE {
+            let slot = (page << PAGE_SHIFT) + off;
+            return (slot < self.host).then_some(slot);
+        }
+        let mapped = *self.pages.get(page as usize)?;
+        (mapped != NO_PAGE).then(|| (mapped << PAGE_SHIFT) + off)
     }
 
     /// The host slot a console descriptor lives in. Allocates a host page for a console page beyond the
@@ -481,6 +504,19 @@ impl Heap {
             return None;
         }
         Some(self.gpu + base as u64 * self.inc as u64)
+    }
+
+    /// The host GPU handle of the longest contiguous run of hosted slots starting at `first`, and how
+    /// long that run is. Used for a table whose root signature layout is unknown: the title can only
+    /// index what the table exposes, and a D3D12 table has to be one contiguous range, so binding the
+    /// run is the representable choice (the mirror still syncs the whole heap).
+    fn run_host(&mut self, first: u32) -> Option<(u64, u32)> {
+        let base = self.host_slot(first)?;
+        let mut n = 1u32;
+        while n < 256 && self.host_slot(first.saturating_add(n)) == Some(base + n) {
+            n += 1;
+        }
+        Some((self.gpu + base as u64 * self.inc as u64, n))
     }
 
     fn null_handle(&self) -> u64 {
@@ -557,7 +593,7 @@ pub unsafe fn register(heap: usize, memory: u64, desc: u64, family: u32, host: u
     heaps(|m| {
         m.insert(heap, Heap {
             device, memory, slot0, ty, console: num, host, family, cpu, gpu, inc,
-            raw: vec![0; num as usize * words], written: vec![0; num as usize], kinds: vec![kind; num as usize],
+            raw: vec![0; num as usize * words], written: vec![0; num as usize], live: vec![false; num as usize], kinds: vec![kind; num as usize],
             pages: vec![NO_PAGE; console_pages as usize],
             stolen: vec![false; host_pages as usize],
             // Only an oversized heap needs a reserved null descriptor; a normal heap loses nothing.
@@ -796,18 +832,39 @@ unsafe fn sync_range(h: &mut Heap, first: usize, end: usize, kind: u8, failed: &
                 if h.written[s] == want && h.raw[s * w..(s + 1) * w] == *words {
                     continue;
                 }
-                match h.host_slot(s as u32) {
+                // A cleared slot is the null descriptor. Reset a host copy that already exists so it
+                // cannot keep sampling a resource the title unbound, but never allocate a host page
+                // for a null: this heap is mostly zeros past the live tail and doing so both burns
+                // every reclaimable page and makes each submit walk a million slots.
+                let zero = words.iter().all(|&x| x == 0);
+                match if zero { h.hosted_slot(s as u32) } else { h.host_slot(s as u32) } {
                     Some(host_slot) => {
-                        if !write_slot(h, s, host_slot, words, want) {
+                        if !write_slot(h, s, host_slot, words, want) && !zero {
                             failed.push((s, words.to_vec()));
                         }
                     }
+                    None if zero => {}
                     None => {
                         // No host descriptor behind this console slot: keep the title's words, do not
                         // write anywhere, and count it so the run reports a real gap instead of a hang.
                         h.unhosted = h.unhosted.saturating_add(1);
                     }
                 }
+                if once(24) {
+                    // One-shot hexdump of the block around the first descriptor that could not be
+                    // decoded. A block that is a real descriptor table reads as resource views;
+                    // a block that is a constant/vertex ring reads as floats and padding, and only
+                    // one of the two means the decoder is wrong.
+                    let first = s.saturating_sub(8) & !3;
+                    let mut dump = String::new();
+                    for j in first..(first + 32).min(h.console as usize) {
+                        let slot = &h.raw[j * w..(j + 1) * w];
+                        dump.push_str(&format!("\n    slot {j}: {slot:08x?}"));
+                    }
+                    record(M, TAG, &format!("first undescribed descriptor slot {s} (kind {want}); 32-slot block:{dump}"));
+                }
+                // Only a slot that ever held a real descriptor keeps its page out of the reclaim pool.
+                h.live[s] = !zero;
                 h.raw[s * w..(s + 1) * w].copy_from_slice(words);
                 h.written[s] = want;
                 written += 1;
@@ -873,7 +930,7 @@ pub fn locate(handle: u64) -> Option<(usize, u32, u64, u32)> {
 pub unsafe fn translate(handle: u64) -> u64 {
     match locate(handle) {
         Some((heap, index, pc, _)) => {
-            sync(heap, index, u32::MAX);
+            sync(heap, index, 256);
             pc
         }
         None => handle,
@@ -914,20 +971,93 @@ pub fn table_ranges(r: &[tombox_xshader::meta::RootRange]) -> Vec<TableRange> {
         .collect()
 }
 
-pub fn layout_from_blob(blob: &[u8]) -> Option<RootLayout> {
-    let body = if blob.get(0..4) == Some(b"DXBC") {
-        let c = tombox_xshader::Dxbc::parse(blob).ok()?;
-        let ch = c.chunk(b"RTS0")?;
-        blob.get(ch.offset..ch.offset + ch.size)?
+#[repr(C)]
+struct Guid16([u8; 16]);
+
+// {7f91ce67-090c-4bb7-b78e-ed8ff2e31da0}
+const IID_VERSIONED_DESERIALIZER: Guid16 = Guid16([0x67, 0xce, 0x91, 0x7f, 0x0c, 0x09, 0xb7, 0x4b, 0xb7, 0x8e, 0xed, 0x8f, 0xf2, 0xe3, 0x1d, 0xa0]);
+
+fn u32_at(p: *const u8, o: usize) -> u32 {
+    u32::from_le_bytes(unsafe { core::slice::from_raw_parts(p.add(o), 4) }.try_into().unwrap())
+}
+
+fn u64_at(p: *const u8, o: usize) -> u64 {
+    u64::from_le_bytes(unsafe { core::slice::from_raw_parts(p.add(o), 8) }.try_into().unwrap())
+}
+
+/// Table sizes and range kinds straight from the versioned root-signature description. A root
+/// signature can be a serialized versioned blob rather than an RTS0 chunk; parsing it is the only
+/// way to know that root parameter 0 is a CBV table with four entries instead of syncing the heap
+/// end as KIND_DEFAULT and decoding constant buffers as SRV buffers.
+fn layout_from_versioned(blob: &[u8]) -> Option<RootLayout> {
+    let mk = crate::host_proc(b"D3D12CreateVersionedRootSignatureDeserializer\0");
+    if mk == 0 || blob.len() < 4 {
+        return None;
+    }
+    let mk: unsafe extern "system" fn(*const u8, usize, *const Guid16, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(mk) };
+    let mut d: *mut c_void = core::ptr::null_mut();
+    if unsafe { mk(blob.as_ptr(), blob.len(), &IID_VERSIONED_DESERIALIZER, &mut d) } < 0 || d.is_null() {
+        return None;
+    }
+    let get: unsafe extern "system" fn(*mut c_void, u32, *mut *const u8) -> i32 = unsafe { core::mem::transmute(vfn(d as usize, 3)) };
+    let mut desc: *const u8 = core::ptr::null();
+    let out = if unsafe { get(d, 2, &mut desc) } >= 0 && !desc.is_null() {
+        let n = u32_at(desc, 8) as usize;
+        let pp = u64_at(desc, 16) as *const u8;
+        let flags = u32_at(desc, 40);
+        let mut tables = Vec::with_capacity(n);
+        for i in 0..n {
+            let p = unsafe { pp.add(i * 32) };
+            // D3D12_ROOT_PARAMETER1: type@0, DescriptorTable{count@4, ranges@8}.
+            if u32_at(p, 0) == 2 && u32_at(p, 4) != 0 {
+                let cnt = u32_at(p, 4) as usize;
+                let rp = u64_at(p, 8) as *const u8;
+                let mut ranges = Vec::with_capacity(cnt);
+                for j in 0..cnt {
+                    let r = unsafe { rp.add(j * 24) };
+                    // D3D12_DESCRIPTOR_RANGE1: RangeType@0, NumDescriptors@4, ... Offset@20.
+                    ranges.push(TableRange {
+                        offset: u32_at(r, 20),
+                        count: u32_at(r, 4),
+                        kind: range_kind(u32_at(r, 0)),
+                    });
+                }
+                tables.push(Some(ranges));
+            } else {
+                tables.push(None);
+            }
+        }
+        Some(RootLayout {
+            tables,
+            direct_resources: flags & ROOT_FLAG_DIRECT_RESOURCES != 0,
+            direct_samplers: flags & ROOT_FLAG_DIRECT_SAMPLERS != 0,
+        })
     } else {
-        blob
+        None
     };
-    let rs = tombox_xshader::meta::parse_rts0(body).ok()?;
-    let tables = rs.params.iter().map(|p| match &p.kind {
-        tombox_xshader::meta::RootParamKind::Table(r) => Some(table_ranges(r)),
-        _ => None,
+    let rel: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(vfn(d as usize, 2)) };
+    unsafe { rel(d) };
+    out
+}
+
+pub fn layout_from_blob(blob: &[u8]) -> Option<RootLayout> {
+    let rts0 = if blob.get(0..4) == Some(b"DXBC") {
+        tombox_xshader::Dxbc::parse(blob).ok().and_then(|c| c.chunk(b"RTS0").and_then(|ch| blob.get(ch.offset..ch.offset + ch.size)))
+    } else {
+        Some(blob)
+    }
+    .and_then(|body| {
+        let rs = tombox_xshader::meta::parse_rts0(body).ok()?;
+        let tables: Vec<Option<Vec<TableRange>>> = rs.params.iter().map(|p| match &p.kind {
+            tombox_xshader::meta::RootParamKind::Table(r) => Some(table_ranges(r)),
+            _ => None,
+        }).collect();
+        Some(RootLayout { tables, direct_resources: rs.flags & ROOT_FLAG_DIRECT_RESOURCES != 0, direct_samplers: rs.flags & ROOT_FLAG_DIRECT_SAMPLERS != 0 })
     });
-    Some(RootLayout { tables: tables.collect(), direct_resources: rs.flags & ROOT_FLAG_DIRECT_RESOURCES != 0, direct_samplers: rs.flags & ROOT_FLAG_DIRECT_SAMPLERS != 0 })
+    if rts0.as_ref().is_some_and(|l| l.tables.iter().any(|t| t.is_some())) {
+        return rts0;
+    }
+    layout_from_versioned(blob).or(rts0)
 }
 
 static ROOTS: Mutex<Option<HashMap<usize, RootLayout>>> = Mutex::new(None);
@@ -943,7 +1073,12 @@ pub fn note_root_signature(rs: usize, blob: &[u8]) -> bool {
     }
     match layout_from_blob(blob) {
         Some(l) => {
+            let tables = l.tables.iter().filter(|t| t.is_some()).count();
+            let first = l.tables.first().cloned().flatten();
             roots(|m| m.insert(rs, l));
+            if once(23) {
+                record(M, TAG, &format!("root signature {rs:#x}: {tables} table parameter(s); param 0 = {first:?}"));
+            }
             true
         }
         None => {
@@ -1034,6 +1169,38 @@ pub fn on_table(list: usize, side: usize, param: u32, handle: u64) -> u64 {
     };
     let rs = root_of(list, side);
     let ranges = rs.and_then(|rs| roots(|m| m.get(&rs).and_then(|l| l.tables.get(param as usize).cloned().flatten())));
+    if ranges.is_none() {
+        // Bounded diagnostic: a table with no range list is either a parameter the root signature
+        // declares as something other than a table (a root CBV/SRV, in which case the title should
+        // not be binding a table to it) or a list whose SetGraphicsRootSignature was never seen.
+        // Both used to look the same in the log, which made the failing table unattributable.
+        static NO_LAYOUT: AtomicUsize = AtomicUsize::new(0);
+        let n = NO_LAYOUT.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            let (known, params) = roots(|m| m.get(&rs.unwrap_or(0)).map_or((false, 0), |l| (true, l.tables.len())));
+            let head = heaps(|m| {
+                m.get(&heap).map(|h| {
+                    let base = h.slot0 + index as u64 * h.words() as u64 * 4;
+                    let mut w = [0u32; 4];
+                    for (i, v) in w.iter_mut().enumerate() {
+                        *v = unsafe { core::ptr::read_volatile((base + i as u64 * 4) as *const u32) };
+                    }
+                    w
+                })
+            })
+            .unwrap_or([0; 4]);
+            let why = if !known {
+                "the list has no root signature recorded"
+            } else if param as usize >= params {
+                "the root signature has no parameter with that index"
+            } else {
+                "the parameter is not a descriptor table in the root signature"
+            };
+            record(M, TAG, &format!(
+                "table without a layout ({n}): list {list:#x} side {side} param {param} handle {handle:#x} -> heap {heap:#x} index {index} ty {ty} rs {rs:x?} ({known}: {params} params); {why}; first words {head:08x?}"
+            ));
+        }
+    }
     // A descriptor table is one contiguous host range. When the console range cannot be hosted
     // contiguously, bind the heap's null table (a real handle in the heap) and say so: never a
     // console address and never a live descriptor standing in for another one.
@@ -1043,17 +1210,32 @@ pub fn on_table(list: usize, side: usize, param: u32, handle: u64) -> u64 {
             let end = r.iter().fold(0u32, |e, t| e.max(if t.count == u32::MAX { u32::MAX } else { t.offset.saturating_add(t.count) }));
             (offset, end.saturating_sub(offset).max(1))
         }
-        None => (0, u32::MAX),
+        // Unknown layout: the shader cannot index past the range the title actually uses, and a
+        // bounded window keeps the sync from marking the whole oversized heap live.
+        None => (0, 256),
     };
-    let hosted = heaps(|m| m.get_mut(&heap).and_then(|h| h.range_host(index.saturating_add(offset), span)));
+    let (hosted, free_pages) = heaps(|m| {
+        m.get_mut(&heap).map_or((None, 0), |h| {
+            let free = (0..h.host_pages() as usize)
+                .take(1 << 20)
+                .filter(|p| h.page_is_free(*p as u32))
+                .count();
+            let hosted = if ranges.is_some() {
+                h.range_host(index.saturating_add(offset), span)
+            } else {
+                h.run_host(index).map(|(h, _)| h)
+            };
+            (hosted, free)
+        })
+    });
     let pc = match hosted {
         Some(h) => h,
         None => {
             UNREPRESENTABLE_TABLES.fetch_add(1, Ordering::Relaxed);
             if once(21) {
                 record(M, TAG, &format!(
-                    "descriptor table {handle:#x} (heap {heap:#x}, root parameter {param}) has no contiguous host range ({span} descriptors from console index {}); bound the heap's null table instead",
-                    index.saturating_add(offset)));
+                    "descriptor table {handle:#x} (heap {heap:#x}, root parameter {param}) has no contiguous host range ({span} descriptors from console index {}; rs {rs:x?}, layout {layout}, {free_pages} free host pages); bound the heap's null table instead",
+                    index.saturating_add(offset), layout = ranges.is_some()));
             }
             heaps(|m| m.get(&heap).map(|h| h.null_handle()).unwrap_or(pc))
         }
@@ -1356,7 +1538,7 @@ mod tests {
         heaps(|m| {
             m.insert(0xabc0, Heap {
                 device: 0, memory, slot0: first_slot(memory, 0), ty: 0, console: num, host: num, family: 0, cpu: cpu as u64, gpu, inc,
-                raw: vec![0; num as usize * 8], written: vec![0; num as usize], kinds: vec![KIND_SRV; num as usize],
+                raw: vec![0; num as usize * 8], written: vec![0; num as usize], live: vec![false; num as usize], kinds: vec![KIND_SRV; num as usize],
                 pages: vec![NO_PAGE; num.div_ceil(PAGE_SLOTS) as usize], stolen: vec![false; num.div_ceil(PAGE_SLOTS) as usize],
                 null_slot: u32::MAX, unhosted: 0,
             });
@@ -1856,6 +2038,7 @@ mod descriptor_capacity_tests {
             inc: 32,
             raw: vec![0; console as usize * 8],
             written: vec![0; console as usize],
+            live: vec![false; console as usize],
             kinds: vec![KIND_SRV; console as usize],
             pages: vec![NO_PAGE; console.div_ceil(PAGE_SLOTS) as usize],
             stolen: vec![false; host.div_ceil(PAGE_SLOTS) as usize],

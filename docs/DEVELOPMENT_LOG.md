@@ -447,3 +447,98 @@ reorder and its classifier were reverted; no other changes were involved.
   `dred.removed exiting now with code 0x887a0006 (device removed)`. This is a
   separate GPU-stability defect (invalid root-signature/driver work), not the
   black-frame cause; warm-cache runs reached present 360+ without removal.
+
+## Session: black title buffer localized to the title's own empty UI table
+
+### Fixed: stale pipeline library caused the cold-run device removal
+
+The 255 MB pipeline library on disk predated the current stream-PSO translation
+ABI. It was loaded, then every lookup missed and the driver recompiled ~50k PSOs;
+the first cold run died with `0x887A0005`/`0x887A0006` while building them. The
+library file now carries `FILE_VERSION=3`, the `PIPELINE_ABI` hash in its cache
+identity and an FNV64 checksum trailer, so a library from another ABI is refused
+instead of half-loaded, and a damaged file is rejected rather than trusted.
+Measured on the last three runs: `0 rejected loads, 0 unkeyed`; the warm library
+answers `50,920 hits, 165 misses` (all misses are genuinely new stream PSOs).
+A tamper/truncation test covers the checksum path (12 pso_lib tests).
+
+### Fixed: root-signature layouts, pages above the host ceiling, cleared slots
+
+- Root layouts are registered from the title's original root-signature blob
+  (versioned parser), so a descriptor table is mirrored with the parameter's real
+  kinds and ranges instead of guessing.
+- A console descriptor page past the host heap capacity is remapped onto a host
+  page no live descriptor uses (`descriptors 979/983/987/991/995 -> host
+  974/973/972/970/969` in the title run), so high console indices translate
+  instead of clamping.
+- A cleared console slot is the null descriptor: an existing host copy is reset so
+  it cannot keep sampling an unbound resource, but a null never allocates a page
+  and never keeps one out of the reclaim pool (`live` is tracked separately from
+  "has a host copy"). Doing this naively (allocating for every zero slot) made the
+  title miss frame 800 entirely: one run presented only a few frames in 102 s.
+- A table whose root-signature layout is unknown now binds the longest contiguous
+  hosted run starting at its first descriptor (a D3D12 table must be one contiguous
+  range) instead of falling back to the null table for small heaps.
+
+Tests: `d3d12_xs` 717 passed, 1 failed (the known environmental
+`xs_exports` oracle that needs `D:\xbox-pc-port\games`); `tombox-xshader` 126
+passed. Zero PSO rejections in every run of this session.
+
+### Measured: the presented image is the OSD, the title buffer is exactly zero
+
+With `TOMBOX_PRESENT_SNAP` on the final build:
+
+| frame | title backbuffer | presented swapchain | distinct rows |
+|------:|-----------------:|--------------------:|--------------:|
+| 10    | 0 / 8,294,400    | 26,295 / 8,294,400 (0.32%) | 185 |
+| 400   | 0 / 8,294,400    | 30,279 / 8,294,400 (0.37%) | 205 |
+
+Earlier runs measured frame 800 and 1000 at `0 / 8,294,400` and
+`29,422 / 8,294,400 (0.35%)`, 194-195 distinct rows. The non-black pixels are the
+OSD overlay text, which is drawn only into the presented copy; the title's own
+backbuffer is read before that draw.
+
+### Measured: what the rendering passes actually do
+
+- Pass capture at present 300 sees three draws: two into a 3840x2160 offscreen
+  target with a DSV (flags `0x1`), one into the presented-chain buffer. All three
+  captures are black.
+- Viewport and scissor are full for every captured draw
+  (`0,0 3840x2160`, scissor `0..3840 x 0..2160`), so this is not a raster area
+  problem.
+- Both offscreen draws report `ia=[no vertex buffer bound]` (procedural geometry)
+  and both pipelines have a real VS and PS (`stages=(true,true)`); no accepted
+  stream pipeline in any run lacks a pixel shader.
+- Pipeline statistics at present 300: offscreen draw 1 `PSInvocations=8,294,400`
+  (full screen); offscreen draw 2 `GSPrimitives=2, PSInvocations=4,147,200`
+  (exactly half the screen); the composite draw into the presented buffer
+  `IAVertices=3, GSPrimitives=2, CInvocations=2, PSInvocations=0`.
+- The offscreen target's alpha is `mean 0.50000, min 0, max 1` with half the
+  pixels at alpha=1 (the half-screen rect) and RGB zero everywhere.
+
+### Corrected: the four "rejected descriptors" are not descriptors
+
+The per-frame `has no PC resource/format match` lines are **not** the title's UI
+descriptor table. Probing the composite's table address (`0x5678a0253dd80` ->
+host slot 696,044) shows its six SRVs are all null, and the failing slots
+(1,220,333/335/337 and 1,220,464) are produced by the whole-heap `DIRECT_RESOURCES`
+mirror, which scans past the live descriptor tail into a constant/vertex ring. The
+payload (`3840.0, 2160.0, -1.0, 1.0`, `ffffffff`) is viewport-like constant data.
+Those lines are mirror noise, not a descriptor-decoding defect, and fixing them
+would not change the image.
+
+### Remaining blockers (honest)
+
+- The title's UI descriptor table is literally all-zero at present 300, and the
+  composite draw shades zero samples on a two-primitive rect while a real PS is
+  bound: the rect is degenerate or entirely off-screen. That is the immediate
+  black-frame cause, and it is consistent with a title that has not uploaded its
+  UI constants yet rather than with a translation bug.
+- The title raises `0xC0000005` writing to `0x0` at
+  `game_scarlett_master.exe+0x2215c35` after 135-150 s (its own heap allocator,
+  3-4 GB RSS), before it ever leaves this state. Runs that reach frame 1000 exist,
+  but the crash usually lands first, so the title has not been observed
+  completing its first scene.
+- The warm pipeline library still misses ~165 stream PSOs per run, and every miss
+  is a driver compile. That is the dominant cold-start cost, not a correctness
+  defect.

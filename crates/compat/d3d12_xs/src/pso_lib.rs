@@ -6,8 +6,13 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use crate::device_wrap::Guid;
 
 const MAGIC: &[u8; 4] = b"TBPL";
-const FILE_VERSION: u32 = 2;
-const KEY_VERSION: &[u8] = b"pso-lib-key v2 final-root";
+// Bumped whenever the root-signature or shader ABI the cached PSOs were built against changes.
+// A driver pipeline library whose PSOS reference an older ABI is accepted by CreatePipelineLibrary
+// but can take the driver down (DXGI_ERROR_DRIVER_INTERNAL_ERROR) on the first compile, so the
+// version is part of the file identity and old caches are rebuilt instead of deserialized.
+const FILE_VERSION: u32 = 3;
+const PIPELINE_ABI: &str = "pso-abi 3: direct-heap flags 0x400/0x800, centroid/gds patched roots";
+const KEY_VERSION: &[u8] = b"pso-lib-key v3 final-root";
 const GFX_DESC: usize = 0x290;
 const CS_DESC: usize = 0x38;
 const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
@@ -415,17 +420,29 @@ pub fn check_file<'a>(file: Option<&'a [u8]>, ident: &str) -> FileCheck<'a> {
     if id != ident.as_bytes() {
         return FileCheck::Rebuild(format!("built for [{}], this run is [{ident}]", String::from_utf8_lossy(id)));
     }
-    let blob = &b[12 + n..];
+    // The trailer is an FNV-1a over everything before it. A save that was cut short, a partially
+    // written file or a damaged one is rebuilt instead of being handed to the driver.
+    if b.len() < 12 + n + 8 {
+        return FileCheck::Rebuild("truncated payload or missing checksum".into());
+    }
+    let body = &b[..b.len() - 8];
+    let want = u64::from_le_bytes(b[b.len() - 8..].try_into().unwrap());
+    if fnv64(body) != want {
+        return FileCheck::Rebuild("checksum mismatch (truncated or corrupt cache)".into());
+    }
+    let blob = &b[12 + n..b.len() - 8];
     if blob.is_empty() { FileCheck::Empty } else { FileCheck::Blob(blob) }
 }
 
 pub fn file_bytes(ident: &str, blob: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(12 + ident.len() + blob.len());
+    let mut v = Vec::with_capacity(12 + ident.len() + blob.len() + 8);
     v.extend_from_slice(MAGIC);
     v.extend_from_slice(&FILE_VERSION.to_le_bytes());
     v.extend_from_slice(&(ident.len() as u32).to_le_bytes());
     v.extend_from_slice(ident.as_bytes());
     v.extend_from_slice(blob);
+    let sum = fnv64(&v);
+    v.extend_from_slice(&sum.to_le_bytes());
     v
 }
 
@@ -461,7 +478,7 @@ static LIB: OnceLock<Option<Lib>> = OnceLock::new();
 
 fn ident() -> String {
     let p = tombox_xshader::fma_probe::probe();
-    format!("{} | {}", p.adapter, mode_tag())
+    format!("{} | {} | {PIPELINE_ABI}", p.adapter, mode_tag())
 }
 
 unsafe fn luid(real: *mut c_void) -> u64 {
@@ -1091,6 +1108,20 @@ void main() { o.Store(0, 5u); }
         assert!(!save_due(130, 100, 129));
         assert!(!save_due(219, 100, 219));
         assert!(save_due(220, 100, 220));
+    }
+
+    #[test]
+    fn a_tampered_or_truncated_library_file_is_rebuilt_not_loaded() {
+        let f = file_bytes("test ident", b"driver blob");
+        let FileCheck::Blob(b) = check_file(Some(&f), "test ident") else { panic!("round trip") };
+        assert_eq!(b, b"driver blob");
+        let mut bad = f.clone();
+        bad[12 + "test ident".len() + 2] ^= 0x40;
+        assert!(matches!(check_file(Some(&bad), "test ident"), FileCheck::Rebuild(_)));
+        assert!(matches!(check_file(Some(&f[..f.len() - 1]), "test ident"), FileCheck::Rebuild(_)));
+        let mut old = f.clone();
+        old[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert!(matches!(check_file(Some(&old), "test ident"), FileCheck::Rebuild(_)));
     }
 
     #[test]

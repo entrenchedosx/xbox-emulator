@@ -609,6 +609,10 @@ struct LState {
     sref: Option<u32>,
     stencil_notes: Vec<String>,
     stencil_seen: Vec<(usize, Option<u32>)>,
+    /// Viewport/scissor/RT/PSO at the first draws of the captured frame. A draw that leaves a
+    /// target at zero bytes has either an empty raster area (no coverage at all) or a shader
+    /// that writes zeroes; this is what tells the two apart.
+    raster: Vec<String>,
     probe_caps: Vec<usize>,
     probe_notes: Vec<String>,
     probe_q: usize,
@@ -821,7 +825,7 @@ unsafe fn boundary(g: &mut G, list: *mut c_void, end: &str) {
     let want = st.dirty || all;
     let (rts, dsv) = (st.rts.clone(), st.dsv);
     let mut pass = Pass { list: list as usize, key: k, order: 0, seq: st.seq, end: end.to_string(), draws: st.draws, dispatches: st.dispatches, indirect: st.indirect,
-        clears: st.clears.clone(), ps: st.ps.clone(), targets: Vec::new(), caps: st.probe_caps.clone(), notes: st.probe_notes.iter().chain(st.stencil_notes.iter()).cloned().collect(), writes_src: false };
+        clears: st.clears.clone(), ps: st.ps.clone(), targets: Vec::new(), caps: st.probe_caps.clone(), notes: st.probe_notes.iter().chain(st.stencil_notes.iter()).chain(st.raster.iter()).cloned().collect(), writes_src: false };
     if st.pso_dirty && st.draws + st.indirect == 0 {
         pass.notes.push("SetPipelineState with targets bound but no hooked draw: captured anyway; draw count is a lower bound (the title may draw through an unhooked slot)".into());
     }
@@ -1343,6 +1347,28 @@ fn note_draw(this: *mut c_void, kind: u8) {
                 let st = g.lists.get_mut(&k).unwrap();
                 if !st.ps.contains(&h) && st.ps.len() < 160 {
                     st.ps.push(h);
+                }
+                if st.raster.len() < 8 {
+                    if let Some((vp, sc, _sref, rpso)) = crate::cl2_state::raster_snapshot(this as usize) {
+                        let v: Vec<String> = vp.chunks_exact(24).map(|b| {
+                            let f = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+                            format!("x={} y={} w={} h={} minz={} maxz={}", f(0), f(4), f(8), f(12), f(16), f(20))
+                        }).collect();
+                        let s: Vec<String> = sc.chunks_exact(16).map(|b| {
+                            let i = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+                            format!("x={}..{} y={}..{}", i(0), i(8), i(4), i(12))
+                        }).collect();
+                        let vb: Vec<String> = crate::rtcap::bound_vbs(this as usize).iter()
+                            .map(|(slot, va, size, stride)| format!("vb{slot}=(va {va:#x} size {size} stride {stride})"))
+                            .collect();
+                        st.raster.push(format!(
+                            "draw #{} pso={rpso:x?} (pass pso {pso:x}) stages={:?} rt=[{}] dsv={:#x} ia=[{}] viewport [{}] scissor [{}]",
+                            st.draws, rpso.and_then(crate::mesh_pso::stages_of), st.rts.iter().map(|r| format!("{r:#x}")).collect::<Vec<_>>().join(","), st.dsv,
+                            if vb.is_empty() { "no vertex buffer bound".to_string() } else { vb.join("; ") },
+                            if v.is_empty() { "never set on this list".to_string() } else { v.join("; ") },
+                            if s.is_empty() { "never set on this list".to_string() } else { s.join("; ") }
+                        ));
+                    }
                 }
                 if st.dsv != 0 {
                     let sref = st.sref;

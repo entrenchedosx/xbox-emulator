@@ -526,6 +526,23 @@ pub fn translate_stream(stream: &[u8], xlat: &dyn Fn(u32, &[u8], (u32, [u32; 8])
     Ok((out, keep))
 }
 
+/// Stage set of every stream PSO this process accepted, so a draw that rasterizes nothing can be
+/// attributed to a pipeline that really has no pixel shader instead of to a guess. Keyed by PSO.
+static STAGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (bool, bool)>>> = std::sync::Mutex::new(None);
+
+fn note_stages(pso: usize, vs: bool, ps: bool) {
+    let mut g = STAGES.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    if m.len() < 200_000 {
+        m.insert(pso, (vs, ps));
+    }
+}
+
+pub fn stages_of(pso: usize) -> Option<(bool, bool)> {
+    let g = STAGES.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref()?.get(&pso).copied()
+}
+
 pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
     if desc.is_null() || real.is_null() || ppv.is_null() {
         return E_INVALIDARG;
@@ -577,6 +594,20 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
     };
     let hr = unsafe { create_translated_stream(real, &out, riid, ppv) };
     if hr >= 0 && !(*ppv).is_null() {
+        if let Ok(subs) = parse(&out) {
+            let has = |t: u32| subs.iter().any(|(x, _)| *x == t);
+            let (vs, ps) = (has(SUB_VS), has(SUB_PS));
+            note_stages(*ppv as usize, vs, ps);
+            if !ps {
+                static NO_PS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+                let n = NO_PS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if n < 8 {
+                    let pc: Vec<u32> = subs.iter().map(|(t, _)| *t).collect();
+                    let raw: Vec<u32> = parse(raw).map(|r| r.iter().map(|(t, _)| *t).collect()).unwrap_or_default();
+                    record("d3d12_xs", "CreatePipelineState", &format!("pipeline {:#x} accepted by the driver with NO pixel shader: raw console subobjects {raw:?}, PC subobjects {pc:?}; a colour draw on it writes nothing", *ppv as usize));
+                }
+            }
+        }
         if parse(stream).is_ok_and(|s| s.iter().any(|(t, o)| *t == SUB_AS && bytecode(stream, *o).0 != 0)) {
             crate::console_slots_mesh::note_as_pso(*ppv as usize);
         }

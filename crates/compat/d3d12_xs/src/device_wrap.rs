@@ -1464,8 +1464,25 @@ unsafe extern "system" fn real_create_root_signature(real: *mut c_void, mask: u3
     }
     if hr >= 0 && !ppv.is_null() && unsafe { !(*ppv).is_null() } {
         let s = sent.borrow();
-        if !s.is_empty() {
-            crate::pso_lib::note_real_root(unsafe { *ppv } as usize, &s);
+        let created: &[u8] = if !s.is_empty() {
+            &s
+        } else if !blob.is_null() && len != 0 {
+            unsafe { core::slice::from_raw_parts(blob, len) }
+        } else {
+            &[]
+        };
+        if !created.is_empty() {
+            crate::pso_lib::note_real_root(unsafe { *ppv } as usize, created);
+        }
+        // The descriptor-table translator needs each root parameter's table size and range kind
+        // (CBV/SRV/UAV) to host and decode the console heap. Without this the whole table mirrors
+        // to the heap end as KIND_DEFAULT and a table beyond the host ceiling cannot be
+        // page-mapped, which is exactly how a UI table ends up as the null table. The title's own
+        // blob is used because the ABI patches only append parameters: the table parameters keep
+        // their offsets and sizes.
+        let layout_blob = if !blob.is_null() && len != 0 { unsafe { core::slice::from_raw_parts(blob, len) } } else { created };
+        if !layout_blob.is_empty() {
+            crate::title_heap::note_root_signature(unsafe { *ppv } as usize, layout_blob);
         }
     }
     if hr >= 0 && !ppv.is_null() {
@@ -1490,8 +1507,14 @@ unsafe extern "system" fn create_root_signature_abi(this: *mut DeviceWrapper, ma
     let real = unsafe { (*this).real };
     let f: unsafe extern "system" fn(*mut c_void, u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(16)) };
+    let title_blob = blob;
+    let title_len = len;
     if real_orig(16) != 0 {
-        return unsafe { f(real, mask, blob, len, riid, ppv) };
+        let hr = unsafe { f(real, mask, blob, len, riid, ppv) };
+        if hr >= 0 && !ppv.is_null() && unsafe { !(*ppv).is_null() } && !title_blob.is_null() && title_len != 0 {
+            crate::title_heap::note_root_signature(unsafe { *ppv } as usize, unsafe { core::slice::from_raw_parts(title_blob, title_len) });
+        }
+        return hr;
     }
     // Normal mode has no real-device hook, so this is the only place a title-created root is
     // patched. The translated shaders bind the console V# tables as raw SRVs and the
@@ -1516,6 +1539,11 @@ unsafe extern "system" fn create_root_signature_abi(this: *mut DeviceWrapper, ma
         match glob {
             Some((_, idx)) => crate::global_bind::note_root_signature(unsafe { *ppv }, idx),
             None => crate::global_bind::forget(unsafe { *ppv }),
+        }
+        // This is the path title-created roots take, so the descriptor-table translator learns
+        // each root parameter's ranges (size and CBV/SRV/UAV kind) from the title's own blob.
+        if !title_blob.is_null() && title_len != 0 {
+            crate::title_heap::note_root_signature(unsafe { *ppv } as usize, unsafe { core::slice::from_raw_parts(title_blob, title_len) });
         }
     }
     hr
