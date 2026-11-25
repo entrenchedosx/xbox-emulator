@@ -78,15 +78,38 @@ pub(crate) fn start_window_clamp() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         std::thread::spawn(|| unsafe {
+            // The window belongs to the title's own thread, which re-applies its own size after
+            // every SetWindowPos here. Re-fitting on each tick therefore fought a resize the
+            // emulator cannot win: a 1940x1100 request against a 1920x1080 screen produced a
+            // fresh clamp record every 100 ms (291 identical lines in the first 29 s of one
+            // run) while the window never actually settled. Fit each window once, then leave the
+            // title's choice alone unless it lands far enough off screen that presenting would
+            // be visibly lost.
+            let mut fitted: usize = 0;
+            let mut fitted_rect = [0i32; 4];
             for _ in 0..600 {
                 let h = find_title_window();
+                let (sw, sh) = (GetSystemMetrics(0), GetSystemMetrics(1));
                 if h != 0 {
                     let mut r = [0i32; 4];
                     GetWindowRect(h as *mut c_void, &mut r);
-                    let (sw, sh) = (GetSystemMetrics(0), GetSystemMetrics(1));
-                    if r[0] < 0 || r[1] < 0 || r[2] > sw || r[3] > sh {
-                        fit_window_to_aspect(h, 3840, 2160);
-                        record("d3d12_xs", "window", &format!("clamped title window {r:?} to primary screen {sw}x{sh}"));
+                    // Far off screen: the client area would be partly unusable, refit.
+                    let far_off = r[0] < -sw / 2
+                        || r[1] < -sh / 2
+                        || r[2] > sw + sw / 2
+                        || r[3] > sh + sh / 2;
+                    let already_fitted = h == fitted && r == fitted_rect;
+                    if !already_fitted && far_off {
+                        let (cw, ch) = fit_window_to_aspect(h, 3840, 2160);
+                        fitted = h;
+                        fitted_rect = [40, 40, 40 + cw, 40 + ch];
+                        record(
+                            "d3d12_xs",
+                            "window",
+                            &format!(
+                                "clamped title window {r:?} to {cw}x{ch} client on primary screen {sw}x{sh} (fitted once per window)"
+                            ),
+                        );
                     }
                 }
                 Sleep(100);
