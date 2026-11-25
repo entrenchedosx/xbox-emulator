@@ -107,7 +107,28 @@ unsafe extern "system" fn qi(this: *mut DeviceWrapper, riid: *const Guid, ppv: *
         "device.QueryInterface",
         &format!("{} -> hr={hr:#010x}{}", guid_str(g), if hr != S_OK { " (UNHANDLED)" } else { "" }),
     );
-    if hr == S_OK { hr } else { E_NOINTERFACE }
+    if hr == S_OK {
+        return hr;
+    }
+    // Observation only: a refusal is only actionable when the requested interface and the object
+    // that refused it are named. Gated behind TOMBOX_QI_TRACE, capped, and the return value below
+    // is exactly what it was before.
+    if std::env::var_os("TOMBOX_QI_TRACE").is_some() {
+        static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            let vt = unsafe { core::ptr::read_volatile(this as *const usize) };
+            record(
+                "d3d12_xs",
+                "qi.refused",
+                &format!(
+                    "IID={} obj={:p} vt={vt:#x} slot=0 site=device_wrap::qi",
+                    crate::guid_fmt::guid_str(g.d1, g.d2, g.d3, g.d4, Some(0)),
+                    this as *mut c_void
+                ),
+            );
+        }
+    }
+    E_NOINTERFACE
 }
 
 unsafe extern "system" fn addref(this: *mut DeviceWrapper) -> u32 {
