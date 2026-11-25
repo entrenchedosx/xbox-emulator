@@ -12,6 +12,7 @@
 //! base interface — those will be addressed as the RHI exercises them.
 
 mod device_wrap;
+mod guid_fmt;
 mod res3d;
 mod res_pool;
 mod title_gpu;
