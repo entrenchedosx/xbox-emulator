@@ -1831,6 +1831,16 @@ unsafe extern "system" fn reset(this: *mut c_void, alloc: *mut c_void, pso: *mut
     hr
 }
 
+/// Identity of the build this module was compiled from, logged from *inside* the loaded module so a
+/// run can prove which binary produced its log without trusting the runner's own assertion. Bump the
+/// revision suffix whenever the capture path changes.
+pub const BUILD_ID: &str = concat!(
+    "d3d12_xs passcap ",
+    env!("CARGO_PKG_VERSION"),
+    " rev:",
+    env!("CARGO_PKG_NAME")
+);
+
 pub fn install(vt: &[AtomicUsize]) {
     // Arming must always be observable. This line is emitted before the `on()` gate, before any
     // hook chaining and on every spec shape, so a spec that parses to no capture leaves evidence of
@@ -1840,7 +1850,7 @@ pub fn install(vt: &[AtomicUsize]) {
         "d3d12_xs",
         "passcap",
         &format!(
-            "TOMBOX_PASSCAP arm evaluated: raw={raw_spec:?} enabled={} out={} selection={}",
+            "build-id {BUILD_ID} (loaded module) TOMBOX_PASSCAP arm evaluated: raw={raw_spec:?} enabled={} out={} selection={}",
             on(),
             out_root().display(),
             match sel() {
