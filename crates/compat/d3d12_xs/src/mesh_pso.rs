@@ -545,10 +545,16 @@ pub fn stages_of(pso: usize) -> Option<(bool, bool)> {
 
 pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
     if desc.is_null() || real.is_null() || ppv.is_null() {
+        record("d3d12_xs", "mesh_pso.create", &format!(
+            "CreatePipelineStateX refused null argument: desc={desc:p} real={real:p} ppv={ppv:p} -> hr=0x{:08X}",
+            E_INVALIDARG as u32));
         return E_INVALIDARG;
     }
     let [size, ptr] = *desc;
     if ptr == 0 || size == 0 {
+        record("d3d12_xs", "mesh_pso.create", &format!(
+            "CreatePipelineStateX refused stream desc: size={size} bytes={ptr:#x} riid={riid:p} -> hr=0x{:08X}",
+            E_INVALIDARG as u32));
         return E_INVALIDARG;
     }
     let raw = core::slice::from_raw_parts(ptr as *const u8, size as usize);
