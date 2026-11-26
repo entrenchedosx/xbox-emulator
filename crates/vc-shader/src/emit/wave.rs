@@ -737,7 +737,7 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -874,73 +874,81 @@ mod tests {
         assert_eq!(check(&[sop1(EXEC, b32, 0)], false), None);
     }
 
+    /// The compiler's expansion of an exclusive prefix sum of v0 over the console's
+    /// lanes (v2 holds it at the end; the saved EXEC is s0), as DPP rows and
+    /// `v_readlane` steps.
+    pub(crate) fn exclusive_prefix_words(wave64: bool) -> Vec<u32> {
+    let mut w = Vec::new();
+    let save_op = if wave64 { 0x25 } else { 0x3D };
+    let mov_exec = if wave64 { 0x04 } else { 0x03 };
+    let push_exec = |w: &mut Vec<u32>, k: u8| w.push(sop1(EXEC, mov_exec, k));
+    let push_exec_lit = |w: &mut Vec<u32>, lit: u32| {
+        w.push(sop1(EXEC, mov_exec, 255));
+        w.push(lit);
+    };
+
+    w.push(sop1(0, save_op, 193));
+    w.extend(vop3(1, 0x101, 128, 256, 0));
+    for shift in [1u16, 2, 4, 8] {
+        w.push(vop2(1, 0x25, 0xFA, 1));
+        w.push(dpp16(1, 0x110 + shift, 0xF, 0xF, false));
+    }
+    w.extend(vop3(2, 0x360, 257, 128 + 15, 0));
+    push_exec_lit(&mut w, 0xFFFF_0000);
+    w.push(vop2(1, 0x25, 2, 1));
+
+    if wave64 {
+        w.extend(vop3(2, 0x360, 257, 128 + 31, 0));
+        w.push(sop1(EXEC, 0x03, 128));
+        w.push(sop1(EXEC + 1, 0x03, 255));
+        w.push(0x0000_FFFF);
+        w.push(vop2(1, 0x25, 2, 1));
+
+        w.extend(vop3(2, 0x360, 257, 128 + 47, 0));
+        w.push(sop1(EXEC, 0x03, 128));
+        w.push(sop1(EXEC + 1, 0x03, 255));
+        w.push(0xFFFF_0000);
+        w.push(vop2(1, 0x25, 2, 1));
+    }
+
+    push_exec(&mut w, 193);
+    w.push(vop1(3, 0x01, 257));
+    w.push(vop1(3, 0x01, 0xFA));
+    w.push(dpp16(1, 0x111, 0xF, 0xF, false));
+
+    w.extend(vop3(2, 0x360, 257, 128 + 15, 0));
+    push_exec_lit(&mut w, 0x0001_0000);
+    w.push(vop1(3, 0x01, 2));
+
+    if wave64 {
+        w.extend(vop3(2, 0x360, 257, 128 + 31, 0));
+        w.push(sop1(EXEC, 0x03, 128));
+        w.push(sop1(EXEC + 1, 0x03, 129));
+        w.push(vop1(3, 0x01, 2));
+
+        w.extend(vop3(2, 0x360, 257, 128 + 47, 0));
+        w.push(sop1(EXEC, 0x03, 128));
+        w.push(sop1(EXEC + 1, 0x03, 255));
+        w.push(0x0001_0000);
+        w.push(vop1(3, 0x01, 2));
+    }
+
+    push_exec(&mut w, 193);
+    w.push(vop1(2, 0x01, 128));
+    w.push(vop1(5, 0x01, 135));
+    push_exec(&mut w, 194);
+    w.push(vop1(2, 0x01, 259));
+    w.push(vop1(4, 0x01, 0xFA));
+    w.push(dpp16(5, 0xE4, 0xF, 0xF, false));
+    w.push(sop1(EXEC, mov_exec, 0));
+
+    w
+    }
+
     #[test]
     fn exec_minus_two_masks_lane_zero_and_enforces_dpp_guard() {
         for wave64 in [false, true] {
-            let mut w = Vec::new();
-            let save_op = if wave64 { 0x25 } else { 0x3D };
-            let mov_exec = if wave64 { 0x04 } else { 0x03 };
-            let push_exec = |w: &mut Vec<u32>, k: u8| w.push(sop1(EXEC, mov_exec, k));
-            let push_exec_lit = |w: &mut Vec<u32>, lit: u32| {
-                w.push(sop1(EXEC, mov_exec, 255));
-                w.push(lit);
-            };
-
-            w.push(sop1(0, save_op, 193));
-            w.extend(vop3(1, 0x101, 128, 256, 0));
-            for shift in [1u16, 2, 4, 8] {
-                w.push(vop2(1, 0x25, 0xFA, 1));
-                w.push(dpp16(1, 0x110 + shift, 0xF, 0xF, false));
-            }
-            w.extend(vop3(2, 0x360, 257, 128 + 15, 0));
-            push_exec_lit(&mut w, 0xFFFF_0000);
-            w.push(vop2(1, 0x25, 2, 1));
-
-            if wave64 {
-                w.extend(vop3(2, 0x360, 257, 128 + 31, 0));
-                w.push(sop1(EXEC, 0x03, 128));
-                w.push(sop1(EXEC + 1, 0x03, 255));
-                w.push(0x0000_FFFF);
-                w.push(vop2(1, 0x25, 2, 1));
-
-                w.extend(vop3(2, 0x360, 257, 128 + 47, 0));
-                w.push(sop1(EXEC, 0x03, 128));
-                w.push(sop1(EXEC + 1, 0x03, 255));
-                w.push(0xFFFF_0000);
-                w.push(vop2(1, 0x25, 2, 1));
-            }
-
-            push_exec(&mut w, 193);
-            w.push(vop1(3, 0x01, 257));
-            w.push(vop1(3, 0x01, 0xFA));
-            w.push(dpp16(1, 0x111, 0xF, 0xF, false));
-
-            w.extend(vop3(2, 0x360, 257, 128 + 15, 0));
-            push_exec_lit(&mut w, 0x0001_0000);
-            w.push(vop1(3, 0x01, 2));
-
-            if wave64 {
-                w.extend(vop3(2, 0x360, 257, 128 + 31, 0));
-                w.push(sop1(EXEC, 0x03, 128));
-                w.push(sop1(EXEC + 1, 0x03, 129));
-                w.push(vop1(3, 0x01, 2));
-
-                w.extend(vop3(2, 0x360, 257, 128 + 47, 0));
-                w.push(sop1(EXEC, 0x03, 128));
-                w.push(sop1(EXEC + 1, 0x03, 255));
-                w.push(0x0001_0000);
-                w.push(vop1(3, 0x01, 2));
-            }
-
-            push_exec(&mut w, 193);
-            w.push(vop1(2, 0x01, 128));
-            w.push(vop1(5, 0x01, 135));
-            push_exec(&mut w, 194);
-            w.push(vop1(2, 0x01, 259));
-            w.push(vop1(4, 0x01, 0xFA));
-            w.push(dpp16(5, 0xE4, 0xF, 0xF, false));
-            w.push(sop1(EXEC, mov_exec, 0));
-
+            let w = exclusive_prefix_words(wave64);
             let p = build(&w, wave64);
             let insts = &p.blocks[0].insts;
             let saved = insts[0].write(Reg::S(0)).unwrap();

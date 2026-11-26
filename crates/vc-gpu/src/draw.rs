@@ -94,6 +94,9 @@ pub(crate) struct State {
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
+    /// Diagnostics (`VC_ROOT_CONSTANT_ADDRESS`): the pipeline being bound
+    /// takes root view addresses from root constants ([`State::root_address`]).
+    constants_address: bool,
 }
 
 /// Fixed-function state the title set, as it set it.
@@ -111,12 +114,40 @@ struct Fixed {
 impl Drop for State {
     fn drop(&mut self) {
         for &(heap, first, n) in &self.dynamic {
-            match (heap, crate::memory::heap()) {
-                (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
-                _ => crate::descriptor::release_dynamic(heap, first, n),
-            }
+            give_back(heap, first, n);
         }
     }
+}
+
+/// Gives dynamic slots back to the view heap they came from (`heap` is a
+/// title heap's key, or [`MEMORY_HEAP`]).
+fn give_back(heap: usize, first: u32, n: u32) {
+    match (heap, crate::memory::heap()) {
+        (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
+        _ => crate::descriptor::release_dynamic(heap, first, n),
+    }
+}
+
+/// What a list did not use of the run of dynamic slots its root views take
+/// from (`run`: heap, next slot, end): the run's entry in `dynamic` shrinks
+/// to the slots taken, and the rest comes back as (heap, first, count).
+fn trim_run(
+    dynamic: &mut Vec<(usize, u32, u32)>,
+    run: (usize, u32, u32),
+) -> Option<(usize, u32, u32)> {
+    let (heap, next, end) = run;
+    if next >= end {
+        return None;
+    }
+    // The run's entry: the last one of its heap that ends where the run does.
+    let at = dynamic.iter().rposition(|&(h, first, n)| h == heap && first + n == end)?;
+    let first = dynamic[at].1;
+    if next == first {
+        dynamic.remove(at);
+    } else {
+        dynamic[at].2 = next - first;
+    }
+    Some((heap, next, end - next))
 }
 
 /// The key of our own view heap (`crate::memory::heap`) among the title's.
@@ -193,6 +224,31 @@ fn not_run(why: &'static str) {
     let _ = why;
 }
 
+/// Diagnostics, `VC_ROOT_CONSTANT_ADDRESS` (comma-separated pipeline hashes,
+/// or `all`): the listed pipelines take a root view's address from the first
+/// two dwords of root constants ([`State::root_address`] says why that is
+/// off otherwise). Always off in builds without diagnostics.
+fn address_from_constants(name: &dyn std::fmt::Display) -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let list = LIST.get_or_init(|| {
+            let v = std::env::var("VC_ROOT_CONSTANT_ADDRESS").unwrap_or_default();
+            v.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_owned).collect()
+        });
+        if list.is_empty() {
+            return false;
+        }
+        let name = name.to_string();
+        list.iter().any(|h| h == "all" || name.contains(h.as_str()))
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = name;
+        false
+    }
+}
+
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
@@ -245,6 +301,21 @@ impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
+    }
+
+    /// The title closed the list: it takes no more root views, so the rest
+    /// of its run of dynamic slots goes back to the heap now instead of when
+    /// the list is reset. Grand Theft Auto VI's frame closes about 240 lists
+    /// and keeps them for a few frames; each held a whole run of
+    /// [`ROOT_VIEW_RUN`] slots for the few it used, which on a host that
+    /// caps its heap (NVIDIA: 65,536 dynamic slots) exhausted them every
+    /// frame, and every mesh and dispatch after that was dropped
+    /// ("no dynamic slots for root views").
+    pub(crate) fn finish(&mut self) {
+        let run = std::mem::take(&mut self.root_run);
+        if let Some((heap, first, n)) = trim_run(&mut self.dynamic, run) {
+            give_back(heap, first, n);
+        }
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -480,6 +551,27 @@ impl State {
         }
     }
 
+    /// The address of root view `slot`, if the title set one.
+    ///
+    /// Not taken from root constants, though Grand Theft Auto VI sets the
+    /// pointers of some compute programs as 14 constants whose first two
+    /// dwords are the address (`a root view's offset` drops, logged with
+    /// the slot's contents): with that address those dispatches run, and a
+    /// 4,616-command list took 31 s and removed the host device on the RTX
+    /// 5060 (27 November 2026, runs r10 and r11 against r12). The dispatches
+    /// stay dropped until the shader that runs away is understood. A
+    /// diagnostics build takes it for the pipelines `VC_ROOT_CONSTANT_ADDRESS`
+    /// names (see [`address_from_constants`]).
+    fn root_address(&self, compute: bool, slot: usize) -> Option<u64> {
+        match self.roots_ref(compute).get(slot)? {
+            Root::View(address) => Some(*address),
+            Root::Constants(c) if self.constants_address && c.len() >= 2 => {
+                Some(u64::from(c[0]) | u64::from(c[1]) << 32)
+            }
+            _ => None,
+        }
+    }
+
     /// The host addresses of the bound view heap's title-memory page table
     /// and the list's page bitmap for it, set up on first use (the table
     /// names every host copy at each submission).
@@ -703,6 +795,7 @@ impl State {
             }
             crate::bindless::note_draw(writes);
         }
+        self.constants_address = address_from_constants(&p.name);
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
@@ -752,16 +845,15 @@ impl State {
                 for u in &t.host.user_data {
                     if u.root == RootType::Descriptor
                         && u.dword == 0
-                        && let Some(Root::View(address)) =
-                            self.roots_ref(compute).get(usize::from(u.slot))
-                        && let Some(shadow) = crate::shadow::find(*address, 1)
+                        && let Some(address) = self.root_address(compute, usize::from(u.slot))
+                        && let Some(shadow) = crate::shadow::find(address, 1)
                     {
                         let uav = t.used.iter().any(|r| {
                             r.slot == u.slot
                                 && r.root == RootType::Descriptor
                                 && r.kind == ResourceType::Uav
                         });
-                        roots.push((*address, uav.then_some(shadow)));
+                        roots.push((address, uav.then_some(shadow)));
                     }
                     let fresh = made
                         .iter()
@@ -770,14 +862,25 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None if u.dword == vc_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
-                            let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
-                                Some(&Root::View(address)) => crate::shadow::find(address, 1)
-                                    .and_then(|s| u32::try_from(s.offset(address)).ok()),
-                                _ => None,
-                            };
+                            let offset = self.root_address(compute, usize::from(u.slot)).and_then(|address| {
+                                crate::shadow::find(address, 1).and_then(|s| u32::try_from(s.offset(address)).ok())
+                            });
                             match offset {
                                 Some(offset) => offset,
                                 None => {
+                                    // Which of the two, for the log: no root view set at
+                                    // that slot, or an address no copy of a title buffer holds.
+                                    static LOGGED: AtomicU64 = AtomicU64::new(0);
+                                    let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if n <= 8 || n.is_power_of_two() {
+                                        tracing::warn!(
+                                            dropped = n,
+                                            slot = u.slot,
+                                            root = ?self.roots_ref(compute).get(usize::from(u.slot)),
+                                            pipeline = %p.name,
+                                            "a root view's offset: no root view, or outside title buffers"
+                                        );
+                                    }
                                     not_run("a root view's offset: no root view, or outside title buffers");
                                     return false;
                                 }
@@ -828,12 +931,11 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
+                    let Some(address) = self.root_address(compute, usize::from(slot)) else {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, kind == 1, kind == 2) else {
+                    let Some(gpu) = root_view(list, address, kind == 1, kind == 2) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
@@ -920,7 +1022,7 @@ impl State {
     /// shortcut: what shaders write through a root UAV goes back to title
     /// memory for 1 MiB from its address, as before the views.
     fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
-        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+        let Some(address) = self.root_address(compute, usize::from(slot)) else {
             once!(slot, "a shader reads a root view the title did not set: dropped");
             not_run("a root view the title did not set");
             return None;
@@ -962,13 +1064,25 @@ impl State {
         }
         let (run_heap, next, end) = self.root_run;
         if run_heap != key || next >= end {
-            let Some(first) = host.dynamic(ROOT_VIEW_RUN) else {
+            // A whole run if the heap has one free; else the largest it has
+            // (slots lists gave back leave holes of every size).
+            let mut run = ROOT_VIEW_RUN;
+            let taken = loop {
+                if let Some(first) = host.dynamic(run) {
+                    break Some((first, run));
+                }
+                if run == 1 {
+                    break None;
+                }
+                run /= 2;
+            };
+            let Some((first, run)) = taken else {
                 once!("no dynamic slots for root views: dropped");
                 not_run("no dynamic slots for root views");
                 return None;
             };
-            self.dynamic.push((key, first, ROOT_VIEW_RUN));
-            self.root_run = (key, first, first + ROOT_VIEW_RUN);
+            self.dynamic.push((key, first, run));
+            self.root_run = (key, first, first + run);
         }
         let index = self.root_run.1;
         self.root_run.1 += 1;
@@ -2028,6 +2142,37 @@ const QUAD_STRIP: u32 = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A closed list gives back the part of its run of dynamic slots that its
+    /// root views did not take, and keeps what they took.
+    #[test]
+    fn a_closed_list_gives_back_the_unused_tail_of_its_root_view_run() {
+        let run = ROOT_VIEW_RUN;
+        let heap = 0x7000;
+        // Two tables, a run of which 5 slots were taken, then another run
+        // of which none were.
+        let mut dynamic = vec![(heap, 100, 8), (heap, 1000, run), (heap, 5000, run)];
+        let tail = trim_run(&mut dynamic, (heap, 5000, 5000 + run));
+        assert_eq!(tail, Some((heap, 5000, run)), "nothing taken: the whole run");
+        assert_eq!(dynamic, [(heap, 100, 8), (heap, 1000, run)], "its entry is gone");
+        let tail = trim_run(&mut dynamic, (heap, 1005, 1000 + run));
+        assert_eq!(tail, Some((heap, 1005, run - 5)), "5 taken: the rest");
+        assert_eq!(dynamic, [(heap, 100, 8), (heap, 1000, 5)], "its entry keeps what was taken");
+        // A run used up, one never made, and one that is not in the list.
+        let mut used = vec![(heap, 1000, run)];
+        assert_eq!(trim_run(&mut used, (heap, 1000 + run, 1000 + run)), None);
+        assert_eq!(used, [(heap, 1000, run)]);
+        assert_eq!(trim_run(&mut used, (0, 0, 0)), None);
+        assert_eq!(trim_run(&mut used, (heap + 8, 1001, 1000 + run)), None);
+        assert_eq!(used, [(heap, 1000, run)], "another heap's run is not this one's");
+        // A shorter run, taken when the heap had no whole one free: its own
+        // length, not ROOT_VIEW_RUN, locates the entry.
+        let mut short = vec![(heap, 100, 8), (heap, 2000, 32)];
+        assert_eq!(trim_run(&mut short, (heap, 2010, 2032)), Some((heap, 2010, 22)));
+        assert_eq!(short, [(heap, 100, 8), (heap, 2000, 10)]);
+        assert_eq!(trim_run(&mut short, (heap, 2000, 2010)), Some((heap, 2000, 10)));
+        assert_eq!(short, [(heap, 100, 8)], "a run of which nothing was taken is gone");
+    }
 
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title

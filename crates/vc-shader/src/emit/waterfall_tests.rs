@@ -213,11 +213,11 @@ fn lanes_load_from_the_buffer_their_nested_arms_chose() {
     let views = [
         View::Buffer {
             data: &first,
-            stride: Stride::Structured(4),
+            stride: Stride::Mirrored(4),
         },
         View::Buffer {
             data: &second,
-            stride: Stride::Structured(4),
+            stride: Stride::Mirrored(4),
         },
         View::RawUav(32),
     ];

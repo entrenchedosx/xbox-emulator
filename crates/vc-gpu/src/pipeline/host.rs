@@ -619,7 +619,11 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    let waves = stages
+                        .first()
+                        .and_then(|(s, _)| s.translated())
+                        .map_or_else(String::new, |t| declared_waves(&t.host.dxil));
+                    tracing::warn!(error = %e, ?shaders, waves, "host pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -878,6 +882,36 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+/// The wave lane counts a translated DXIL container declares for its
+/// shader, as `"min..max"` (a program that declares none: `"any"`; bytes
+/// that are not a container: empty). Read from the runtime info of its
+/// `PSV0` part, where `emit::container::psv` writes `WaveSize`: a compute
+/// program that requires 64 lanes is refused by a 32-lane adapter.
+fn declared_waves(dxil: &[u8]) -> String {
+    let word = |at: usize| dxil.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap_or_default()));
+    if dxil.get(..4) != Some(b"DXBC") {
+        return String::new();
+    }
+    // Header: magic, 16-byte digest, version (2 x u16), size, part count,
+    // then the part offsets.
+    let Some(count) = word(28) else { return String::new() };
+    for k in 0..count as usize {
+        let Some(part) = word(32 + 4 * k).map(|o| o as usize) else { break };
+        if dxil.get(part..part + 4) != Some(b"PSV0") {
+            continue;
+        }
+        // Part: FourCC, size, then the runtime info: its size, then its
+        // fields (minimum and maximum expected wave lanes at +16 and +20).
+        let info = part + 8 + 4;
+        let (Some(min), Some(max)) = (word(info + 16), word(info + 20)) else { break };
+        return match (min, max) {
+            (0, u32::MAX) => "any".to_owned(),
+            (min, max) => format!("{min}..{max}"),
+        };
+    }
+    String::new()
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
@@ -1041,5 +1075,36 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    /// A container with one `PSV0` part whose runtime info declares the
+    /// given wave lane counts.
+    fn container_declaring(min: u32, max: u32) -> Vec<u8> {
+        let mut info = [0u8; 48];
+        info[16..20].copy_from_slice(&min.to_le_bytes());
+        info[20..24].copy_from_slice(&max.to_le_bytes());
+        let mut part = b"PSV0".to_vec();
+        part.extend(52u32.to_le_bytes());
+        part.extend(48u32.to_le_bytes());
+        part.extend(info);
+        let mut c = b"DXBC".to_vec();
+        c.extend([0u8; 16]);
+        c.extend([1, 0, 1, 0]);
+        let total = 36 + part.len() as u32;
+        c.extend(total.to_le_bytes());
+        c.extend(1u32.to_le_bytes());
+        c.extend(36u32.to_le_bytes());
+        c.extend(part);
+        c
+    }
+
+    #[test]
+    fn declared_waves_read_the_psv_runtime_info() {
+        assert_eq!(declared_waves(&container_declaring(64, 64)), "64..64");
+        assert_eq!(declared_waves(&container_declaring(32, 32)), "32..32");
+        assert_eq!(declared_waves(&container_declaring(0, u32::MAX)), "any");
+        assert_eq!(declared_waves(b""), "");
+        assert_eq!(declared_waves(b"DXBC"), "");
+        assert_eq!(declared_waves(&container_declaring(64, 64)[..40]), "");
     }
 }

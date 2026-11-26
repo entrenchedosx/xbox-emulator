@@ -304,6 +304,15 @@ pub fn run(
             println!("pair {v} + {p}: {made}");
         }
     }
+    // Wave64 compute programs that keep 64 lanes on a 32-lane adapter (a host
+    // that refuses them drops their dispatches), by what stopped the split.
+    if std::env::var_os("VC_SPLIT_REPORT").is_some() {
+        let mut stops = vc_shader::emit::split_stops();
+        stops.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        for (why, n) in stops {
+            println!("  {n:>7}  wave64 program keeps 64 lanes: {why}");
+        }
+    }
     let mut lines = t.lines;
     lines.sort();
     for l in lines {
@@ -569,9 +578,16 @@ fn translate(
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
                     let marks = emit::Options { view_marks: true };
+                    let _ = emit::take_split_stop();
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
+                            // With the list: what kept a wave64 program at 64 lanes.
+                            let kept = emit::take_split_stop();
+                            let label = || match kept {
+                                Some(why) => format!("{} (wave64 keeps 64 lanes: {why})", label()),
+                                None => label(),
+                            };
                             check(shader, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t

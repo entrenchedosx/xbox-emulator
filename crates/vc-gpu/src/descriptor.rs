@@ -178,7 +178,12 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
+        let end_of_mirror = (start + u64::from(host.count()) * step) as usize;
         for (from, to) in written.take(start as usize, usize::MAX) {
+            let to = to.min(end_of_mirror);
+            if from >= to {
+                continue;
+            }
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
             let page_size = crate::watch::PAGE;
@@ -191,9 +196,9 @@ pub(crate) fn sync_heaps() {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(
                     crate::copystat::C::SyncSlots,
-                    last.min(u64::from(heap.desc.count)).saturating_sub(first),
+                    last.saturating_sub(first),
                 );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+                host.sync_slots(first as u32, last as u32, start, step);
             }
         }
     }
@@ -274,6 +279,20 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
             host.evict(textures);
         }
     }
+}
+
+/// Dynamic slots taken and available, summed over the title's view heaps
+/// that have a host heap (the frame line).
+#[cfg(windows)]
+pub(crate) fn dynamic_use() -> (u32, u32) {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    heaps
+        .iter()
+        // SAFETY: registered heaps are live (removed when dropped).
+        .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
+        .filter(|heap| heap.desc.kind == VIEWS_KIND)
+        .filter_map(|heap| heap.host.get()?.as_ref().map(host::HostHeap::dynamic_use))
+        .fold((0, 0), |(taken, total), (t, n)| (taken + t, total + n))
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at

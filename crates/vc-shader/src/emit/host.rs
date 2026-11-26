@@ -1335,9 +1335,9 @@ pub enum View<'a> {
     NullPair,
     /// The second slot of a [`View::Memory`] or [`View::NullPair`].
     Pair,
-    /// Last in the heap, which then has [`super::HEAP_VIEWS`] slots: the
-    /// host's null raw buffer SRV at [`super::NULL_BUFFER_VIEW`] and UAV
-    /// below it.
+    /// Last in the heap, which then has one slot more: the host's null raw
+    /// buffer UAV at this index and SRV at the next. The view-stride table
+    /// names the SRV's index in its word [`super::NULL_VIEW_WORD`].
     NullBuffers,
 }
 
@@ -1361,7 +1361,7 @@ pub fn view_strides(views: &[View]) -> Vec<u32> {
         .map(|v| match *v {
             View::Buffer { stride: Stride::Raw, .. } | View::RawUav(_) => 4,
             View::Buffer { stride: Stride::Typed, .. } => 16,
-            View::Buffer { stride: Stride::Structured(n), .. } => n,
+            View::Buffer { stride: Stride::Structured(n) | Stride::Mirrored(n), .. } => n,
             View::Buffer { stride: Stride::Format(f, n), .. } | View::TypedUav(f, _, n) => n | kind(f),
             View::HalfUav(_) => 8,
             _ => 0,
@@ -1376,8 +1376,14 @@ pub enum Stride {
     Raw,
     /// RGBA32F elements.
     Typed,
-    /// Structured, elements of this many bytes.
+    /// Structured, elements of this many bytes: a structured descriptor, as
+    /// a shader compiled for the host (a reference) declares it.
     Structured(u32),
+    /// A title's structured buffer of elements of this many bytes, as the
+    /// host mirrors it for translated shaders: a raw view of the same bytes
+    /// (a handle's declared kind must be its descriptor's), the element size
+    /// in the view-stride table (`vc_gpu::descriptor`, `raw_srv`).
+    Mirrored(u32),
     /// Typed, elements in this format of this many bytes.
     Format(DXGI_FORMAT, u32),
 }
@@ -1542,7 +1548,7 @@ impl Host {
                 Ok::<_, String>(zeros)
             };
             let slots = match d.views.last() {
-                Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
+                Some(View::NullBuffers) => d.views.len() + 1,
                 _ => d.views.len(),
             };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
@@ -1775,7 +1781,7 @@ impl Host {
                     View::Buffer { data, stride } => {
                         let b = upload(data)?;
                         let (format, elements, stride, flags) = match stride {
-                            Stride::Raw => (
+                            Stride::Raw | Stride::Mirrored(_) => (
                                 DXGI_FORMAT_R32_TYPELESS,
                                 data.len(),
                                 0,
@@ -1878,10 +1884,8 @@ impl Host {
                     }
                     View::Pair => {}
                     View::NullBuffers => {
-                        let null = super::NULL_BUFFER_VIEW as usize;
-                        let (mut srv_at, mut uav_at) = (at, at);
-                        srv_at.ptr += (null - i) * view_size;
-                        uav_at.ptr += (null - 1 - i) * view_size;
+                        let (mut srv_at, uav_at) = (at, at);
+                        srv_at.ptr += view_size;
                         let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
                             Format: DXGI_FORMAT_R32_TYPELESS,
                             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -1936,6 +1940,19 @@ impl Host {
                         list.SetComputeRootDescriptorTable(*param, at);
                     }
                     Root::View { srv, data } => {
+                        // A root view has no bounds, and a program that picks
+                        // views from the heap reads the view-stride table's
+                        // last words (`NULL_VIEW_WORD`): shader resource views
+                        // are as long as the table is on the host, zeros past
+                        // their data.
+                        let mut padded;
+                        let data = if *srv && data.len() < super::HEAP_VIEWS as usize {
+                            padded = data.clone();
+                            padded.resize(super::HEAP_VIEWS as usize, 0);
+                            &padded
+                        } else {
+                            data
+                        };
                         let b = upload(data)?;
                         let va = b.GetGPUVirtualAddress();
                         if *srv {

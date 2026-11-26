@@ -182,7 +182,8 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
                                 }
                             }
                         }
-                        format!(", native {}", list.join(" "))
+                        // The id's hash is the one the VC log names a shader by.
+                        format!(", native {} [{}]", list.join(" "), &id[..16])
                     }
                     Some(Err(e)) => {
                         *t.native_errors.entry(e.to_string()).or_default() += 1;

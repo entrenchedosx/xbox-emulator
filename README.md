@@ -6,7 +6,8 @@ the user supplies.
 The title's x86-64 code runs unchanged inside our process; VC supplies
 the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
-otherwise. See [docs/architecture.md](docs/architecture.md).
+otherwise. See [docs/architecture.md](docs/architecture.md) and the
+[compatibility matrix](docs/compatibility.md).
 
 VC is maintained by [entrenchedosx](https://github.com/entrenchedosx).
 
@@ -200,6 +201,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VC_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VC_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VC_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VC_KEYS_FILE=<path>` | reloads a comma-separated key schedule when the file changes. Times are relative to the reload. |
 | `VC_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VC_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VC_CAPTURE=<dir>` | saves presented frames (powers of two, or `VC_CAPTURE_FRAMES=<list>`) |

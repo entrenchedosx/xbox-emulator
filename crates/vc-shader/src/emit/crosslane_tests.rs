@@ -83,7 +83,7 @@ const fn v_cmpx_ne_u32_imm(imm: u8, vsrc1: u8) -> u32 {
     0x7C00_0000 | (0xD5 << 17) | (vsrc1 as u32) << 9 | (0x80 + imm as u32)
 }
 
-const fn dpp16_word(
+pub(super) const fn dpp16_word(
     vsrc0: u8,
     ctrl: u16,
     row_mask: u8,
@@ -109,7 +109,7 @@ const fn dpp8_word(vsrc0: u8, sel: [u8; 8]) -> u32 {
     (s << 8) | vsrc0 as u32
 }
 
-fn encode_dpp16(vdst: u8, vsrc0: u8, vsrc1: Option<u8>, dpp: Dpp) -> [u32; 2] {
+pub(super) fn encode_dpp16(vdst: u8, vsrc0: u8, vsrc1: Option<u8>, dpp: Dpp) -> [u32; 2] {
     let Dpp::Row {
         ctrl,
         row_mask,
@@ -130,7 +130,7 @@ fn encode_dpp16(vdst: u8, vsrc0: u8, vsrc1: Option<u8>, dpp: Dpp) -> [u32; 2] {
     ]
 }
 
-const fn v_mov_b32_dpp8(vdst: u8, vsrc0: u8, sel: [u8; 8], fi: bool) -> [u32; 2] {
+pub(super) const fn v_mov_b32_dpp8(vdst: u8, vsrc0: u8, sel: [u8; 8], fi: bool) -> [u32; 2] {
     let tag = if fi { 0xEA } else { 0xE9 };
     [
         0x7E00_0000 | (vdst as u32) << 17 | (0x01 << 9) | tag,
@@ -138,7 +138,7 @@ const fn v_mov_b32_dpp8(vdst: u8, vsrc0: u8, sel: [u8; 8], fi: bool) -> [u32; 2]
     ]
 }
 
-const fn v_add_nc_u32_dpp8(vdst: u8, vsrc0: u8, vsrc1: u8, sel: [u8; 8], fi: bool) -> [u32; 2] {
+pub(super) const fn v_add_nc_u32_dpp8(vdst: u8, vsrc0: u8, vsrc1: u8, sel: [u8; 8], fi: bool) -> [u32; 2] {
     let tag = if fi { 0xEA } else { 0xE9 };
     [
         (0x25 << 25) | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | tag,
@@ -146,7 +146,7 @@ const fn v_add_nc_u32_dpp8(vdst: u8, vsrc0: u8, vsrc1: u8, sel: [u8; 8], fi: boo
     ]
 }
 
-const fn ds_swizzle_b32(vdst: u8, vsrc: u8, offset: u16) -> [u32; 2] {
+pub(super) const fn ds_swizzle_b32(vdst: u8, vsrc: u8, offset: u16) -> [u32; 2] {
     [
         (0x36 << 26) | (0x35 << 18) | offset as u32,
         (vdst as u32) << 24 | vsrc as u32,

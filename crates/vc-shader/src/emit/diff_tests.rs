@@ -1377,33 +1377,37 @@ fn translated_compute_matches_pc() {
         })
         .collect();
     let raw_data: Vec<u32> = (0..32u32).map(|i| i.wrapping_mul(0x9E37_79B9)).collect();
-    let views = [
-        View::Texture(1, 1, &dummy),
-        View::Texture(4, 4, &texels),
-        View::Buffer {
-            data: &typed_data,
-            stride: Stride::Typed,
-        },
-        View::Buffer {
-            data: &structured_data,
-            stride: Stride::Structured(16),
-        },
-        View::Buffer {
+    let root_cbv = floats(64, -0.125);
+    let root_srv: Vec<u32> = (0..32u32).map(|i| i * 0x0001_0003 + 7).collect();
+    // The views in heap order. The structured buffer is a structured
+    // descriptor for the reference compiled for the host, and for our
+    // translation the raw view the host mirrors it as. The last is the root
+    // SRV as the view the host makes of it (`emit`, "Root SRVs and root
+    // UAVs").
+    let make_views = |structured: Stride| -> Vec<View> {
+        let typed_view = |format, bytes| View::Buffer {
             data: &raw_data,
-            stride: Stride::Raw,
-        },
-        View::RawUav(1024),
-        View::TextureUav(16, 16),
-        View::UintTextureUav(16, 16),
-        View::HalfUav(256),
-    ];
-    let typed_view = |format, bytes| View::Buffer {
-        data: &raw_data,
-        stride: Stride::Format(format, bytes),
-    };
-    let views: Vec<View> = views
-        .into_iter()
-        .chain([
+            stride: Stride::Format(format, bytes),
+        };
+        let mut views = vec![
+            View::Texture(1, 1, &dummy),
+            View::Texture(4, 4, &texels),
+            View::Buffer {
+                data: &typed_data,
+                stride: Stride::Typed,
+            },
+            View::Buffer {
+                data: &structured_data,
+                stride: structured,
+            },
+            View::Buffer {
+                data: &raw_data,
+                stride: Stride::Raw,
+            },
+            View::RawUav(1024),
+            View::TextureUav(16, 16),
+            View::UintTextureUav(16, 16),
+            View::HalfUav(256),
             typed_view(DXGI_FORMAT_R8G8B8A8_UNORM, 4),
             typed_view(DXGI_FORMAT_R16G16_SNORM, 4),
             typed_view(DXGI_FORMAT_R8G8B8A8_UINT, 4),
@@ -1413,18 +1417,16 @@ fn translated_compute_matches_pc() {
             typed_view(DXGI_FORMAT_R16_FLOAT, 2),
             typed_view(DXGI_FORMAT_R8G8B8A8_SNORM, 4),
             View::Cube(4, &cube_texels),
-        ])
-        .collect();
-    let root_cbv = floats(64, -0.125);
-    let root_srv: Vec<u32> = (0..32u32).map(|i| i * 0x0001_0003 + 7).collect();
-    // The root SRV as the view the host makes of it (`emit`, "Root SRVs and
-    // root UAVs").
-    let mut views = views;
-    assert_eq!(views.len(), ROOT_SRV_AT as usize);
-    views.push(View::Buffer {
-        data: &root_srv,
-        stride: Stride::Raw,
-    });
+        ];
+        assert_eq!(views.len(), ROOT_SRV_AT as usize);
+        views.push(View::Buffer {
+            data: &root_srv,
+            stride: Stride::Raw,
+        });
+        views
+    };
+    let views = make_views(Stride::Structured(16));
+    let views_ours = make_views(Stride::Mirrored(16));
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -1434,12 +1436,18 @@ fn translated_compute_matches_pc() {
         MaxLOD: f32::MAX,
         ..Default::default()
     }; 2];
-    let dispatch = |roots| Dispatch {
-        roots,
-        views: &views,
-        samplers: &samplers,
-        groups: [2, 2, 1],
-    };
+    fn dispatch<'a>(
+        views: &'a [View<'a>],
+        samplers: &'a [D3D12_SAMPLER_DESC],
+        roots: Vec<(u32, Root)>,
+    ) -> Dispatch<'a> {
+        Dispatch {
+            roots,
+            views,
+            samplers,
+            groups: [2, 2, 1],
+        }
+    }
     let mut failures = Vec::new();
     let only = std::env::var("VC_DIFF_ONLY").ok();
     let warp = std::env::var("VC_WARP").is_ok_and(|v| v == "1");
@@ -1488,14 +1496,14 @@ fn translated_compute_matches_pc() {
         root_views.sort_unstable();
         for (n, (slot, srv)) in root_views.into_iter().enumerate() {
             let data = if srv && slot == super::VIEW_STRIDES {
-                super::host::view_strides(&views)
+                super::host::view_strides(&views_ours)
             } else {
                 assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
                 if srv { root_srv.clone() } else { root_cbv.clone() }
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }
-        let ours = host.dispatch(&root_t, &pso_t, &dispatch(roots));
+        let ours = host.dispatch(&root_t, &pso_t, &dispatch(&views_ours, &samplers, roots));
         if name.starts_with("terminates") {
             match ours {
                 Ok(_) => eprintln!("{name}: finished"),
@@ -1512,7 +1520,7 @@ fn translated_compute_matches_pc() {
             .dispatch(
                 &root_p,
                 &pso_p,
-                &dispatch(vec![
+                &dispatch(&views, &samplers, vec![
                     (0, Root::Constants(k.to_vec())),
                     (1, table(false, 1)),
                     (2, table(true, 1)),

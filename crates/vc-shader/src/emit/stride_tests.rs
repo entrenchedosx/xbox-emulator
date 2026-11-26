@@ -9,11 +9,11 @@ use windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC;
 
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16G16B16A16_FLOAT,
-    DXGI_FORMAT_R16G16B16A16_UINT,
+    DXGI_FORMAT_R16G16B16A16_UINT, DXGI_FORMAT_R32_UINT,
 };
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::{HostShader, StaticSampler, VIEW_INTEGER, VIEW_STRIDES, lower, validator};
+use super::{HostShader, NULL_VIEW_WORD, StaticSampler, VIEW_INTEGER, VIEW_STRIDES, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -102,6 +102,29 @@ const HEAP_CONSTANT_WAVE32: &[u32] = &[
     0x3404_0082, // v_lshlrev_b32 v2, 2, v0
     0xE070_1000,
     0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// User data: s0 a table with a structured SRV, s1 a byte offset, s2 a
+/// table with a raw UAV. SMEM loads two dwords starting at s1 + 20.
+const STRUCTURED_SCALAR_LOAD: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF424_0504,
+    0x0200_0014, // s_buffer_load_dwordx2 s[20:21], s[8:11], s1 offset:20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E02_0214, // v_mov_b32 v1, s20
+    0x7E04_0215, // v_mov_b32 v2, s21
+    0x7E06_0280, // v_mov_b32 v3, 0
+    0xE074_1000,
+    0x8004_0103, // buffer_store_dwordx2 v[1:2], v3, s[16:19], 0 offen
     0xBF81_0000, // s_endpgm
 ];
 
@@ -249,7 +272,7 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
         View::RawUav(32),
         View::Buffer {
             data: &data,
-            stride: Stride::Structured(12),
+            stride: Stride::Mirrored(12),
         },
     ];
     let _one = super::valu_tests::ONE_AT_A_TIME
@@ -303,6 +326,93 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+/// A buffer read by element through the resource heap addresses its bytes with
+/// the view's own stride, whatever the stride is: `buffer_load_dword idxen
+/// offset:4` of lane `l` is dword 1 of element `l`. The data of dword `k` of
+/// element `e` is `1000 k + e`, so a read at the wrong element or the wrong
+/// stride shows in the thousands digit and the units.
+#[test]
+fn heap_buffer_reads_by_element_follow_each_strides_layout() {
+    let shader = build(
+        HEAP_ELEMENT_WAVE32,
+        vec![
+            param(RootType::Constants, 0),
+            param(RootType::ResourceHeap, 1),
+            param(RootType::Table, 2),
+        ],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        // The view kinds a heap slot can hold, as `(name, kind, element
+        // bytes, the view-stride table's word)`.
+        type Kind = (String, fn(u32) -> Stride, u32, u32);
+        let mut kinds: Vec<Kind> = [8u32, 12, 16, 20, 24, 32, 48, 64]
+            .into_iter()
+            .map(|s| (format!("structured {s}"), Stride::Mirrored as fn(u32) -> Stride, s, s))
+            .collect();
+        kinds.push(("raw".into(), |_| Stride::Raw, 4, 4));
+        kinds.push(("typed R32_UINT".into(), |_| Stride::Format(DXGI_FORMAT_R32_UINT, 4), 4, 4 | VIEW_INTEGER));
+        // Not a typed view wider than a dword: a raw load from one is a
+        // raw handle on a typed descriptor, which a driver that scales by
+        // the descriptor's element size (NVIDIA's) addresses wrongly, and
+        // the same descriptor's typed loads need it typed. The title reads
+        // typed views with typed loads.
+        for (name, kind, stride, word) in kinds {
+            let dwords = stride / 4;
+            // Elements of `dwords` dwords; dword `k` of element `e` is
+            // `1000 k + e`. 32 elements of every kind.
+            let data: Vec<u32> = (0..32)
+                .flat_map(|e| (0..dwords).map(move |k| 1000 * k + e))
+                .collect();
+            let views = [View::RawUav(32), View::Buffer { data: &data, stride: kind(stride) }];
+            let stride_label = name;
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match u.root {
+                    RootType::Constants => 1,
+                    RootType::Table => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (1, Root::View { srv: true, data: vec![4, word] }),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}, {stride_label}: dispatch failed: {e}"));
+            // Lane `l` reads the dword at byte `l × stride + 4`, or 0 past
+            // the view's end.
+            let want: Vec<u32> = (0..32u32)
+                .map(|l| data.get(((l * stride + 4) / 4) as usize).copied().unwrap_or(0))
+                .collect();
+            assert_eq!(words[0], want, "{label}, {stride_label}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
 /// A buffer read at a heap index from data whose slot holds no buffer view
 /// (the view-stride table holds 0 there; a texture here) reads the host's
 /// null buffer view instead (`emit`, "Buffer views at computed heap
@@ -333,22 +443,32 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        // Heap index 1 holds a texture. 1,500,000 is past a host heap capped
+        // at 10^6 slots and `HEAP_VIEWS + 77` past the shaders' clamp: the
+        // table holds 0 for both too (no view was ever made there).
+        for index in [1, 1_500_000, super::HEAP_VIEWS + 77] {
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
-            // The texture at heap index 1, the UAV's table at 0.
-            ud[u.index as usize] = u32::from(u.root == RootType::Constants);
+            // The heap index of the buffer, the UAV's table at 0.
+            ud[u.index as usize] = if u.root == RootType::Constants { index } else { 0 };
         }
+        // Heap index 1 holds no buffer view: stride 0. The host's null buffer
+        // views are the slots after the texture's and the table's UAV, the
+        // UAV at 2 and the SRV at 3: the table's null word says where.
+        let mut table = vec![0u32; NULL_VIEW_WORD as usize + 1];
+        table[0] = 4;
+        table[NULL_VIEW_WORD as usize] = 3;
         let dispatch = Dispatch {
-            // Heap index 1 holds no buffer view: stride 0.
-            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0] })],
+            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: table.clone() })],
             views: &views,
             samplers: &[],
             groups: [1, 1, 1],
         };
         let words = host
             .dispatch(&root, &pso, &dispatch)
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(words[0], [0; 32], "{label}");
+            .unwrap_or_else(|e| panic!("{label}, heap index {index}: dispatch failed: {e}"));
+        assert_eq!(words[0], [0; 32], "{label}, heap index {index}");
+        }
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
@@ -417,6 +537,57 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn scalar_loads_cross_structured_buffer_elements() {
+    let stride = 24;
+    let shader = build(
+        STRUCTURED_SCALAR_LOAD,
+        vec![
+            param(RootType::Table, 0),
+            param(RootType::Constants, 1),
+            param(RootType::Table, 2),
+        ],
+        vec![
+            UsedResource { stride, ..entry(ResourceType::Srv, 4, 0) },
+            entry(ResourceType::Uav, 4, 2),
+        ],
+        1,
+    );
+    assert!(shader.root_srvs.is_empty());
+    // The bit patterns include a subnormal and a NaN. SMEM reads dwords.
+    let data = [7, 8, 9, 10, 11, 2, 0x7FC0_1234, 13, 14, 15, 16, 17];
+    let views = [
+        View::Buffer { data: &data, stride: Stride::Mirrored(stride) },
+        View::RawUav(2),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = false;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        for (offset, expected) in [(0, [data[5], data[6]]), (24, [data[11], 0])] {
+            let words = host.dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0, offset, 32]))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            ).unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(words[0], expected, "{label}, byte offset {offset}");
+        }
+        ran = true;
+    }
+    assert!(ran, "neither hardware nor WARP SM 6.6 device available");
 }
 
 /// `buffer_load_ushort`: the half at its byte address, zero-extended (the

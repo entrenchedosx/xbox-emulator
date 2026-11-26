@@ -64,7 +64,10 @@ fn build() -> &'static [u8; 32] {
                 "VC_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(vc_shader::SOURCE_HASH, ENCODING, limit)
+        // The diagnostics switch that changes what is translated
+        // (`VC_SPLIT_TRUST_PRIVATE_LDS`) keeps its entries apart.
+        let trust = vc_shader::emit::trust_private_lds();
+        key(vc_shader::SOURCE_HASH, ENCODING, limit ^ u32::from(trust) << 31)
     })
 }
 

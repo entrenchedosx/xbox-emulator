@@ -1277,9 +1277,41 @@ mod host {
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VC_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
+        static SCRIPT: LazyLock<KeySchedule> = LazyLock::new(|| {
+            KeySchedule::new(&std::env::var("VC_KEYS").unwrap_or_default(), Instant::now())
+        });
+        static FILE: LazyLock<Option<Mutex<KeyFile>>> = LazyLock::new(|| {
+            std::env::var_os("VC_KEYS_FILE").filter(|path| !path.is_empty()).map(|path| {
+                let now = Instant::now();
+                Mutex::new(KeyFile {
+                    path: path.into(),
+                    next_read: now,
+                    modified: None,
+                    schedule: KeySchedule::new("", now),
+                })
+            })
+        });
+        let mut held = Vec::new();
+        SCRIPT.held(Instant::now(), &mut held);
+        if let Some(file) = FILE.as_ref() {
+            let mut file = file.lock().unwrap_or_else(PoisonError::into_inner);
+            let now = Instant::now();
+            file.refresh(now);
+            file.schedule.held(now, &mut held);
+        }
+        held
+    }
+
+    #[cfg(feature = "diagnostics")]
+    struct KeySchedule {
+        started: Instant,
+        keys: Vec<(Duration, u8)>,
+    }
+
+    #[cfg(feature = "diagnostics")]
+    impl KeySchedule {
+        fn new(text: &str, started: Instant) -> Self {
+            let keys = text.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
                 let vk = match key.trim() {
                     "Enter" => 0x0D,
@@ -1295,19 +1327,49 @@ mod host {
                     }
                     _ => return None,
                 };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
-        });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+                Some((Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?, vk))
+            }).collect();
+            Self { started, keys }
+        }
+
+        fn held(&self, now: Instant, out: &mut Vec<u8>) {
+            let elapsed = now.saturating_duration_since(self.started);
+            out.extend(self.keys.iter().filter_map(|&(at, key)| {
+                (elapsed.checked_sub(at)? < Duration::from_millis(200)).then_some(key)
+            }));
+        }
+    }
+
+    /// Replace the schedule file during a diagnostics run to send another
+    /// set of key presses. Offsets start when the new schedule is loaded.
+    #[cfg(feature = "diagnostics")]
+    struct KeyFile {
+        path: std::path::PathBuf,
+        next_read: Instant,
+        modified: Option<std::time::SystemTime>,
+        schedule: KeySchedule,
+    }
+
+    #[cfg(feature = "diagnostics")]
+    impl KeyFile {
+        fn refresh(&mut self, now: Instant) {
+            if now < self.next_read {
+                return;
+            }
+            self.next_read = now + Duration::from_millis(100);
+            let Ok(modified) = std::fs::metadata(&self.path).and_then(|file| file.modified()) else {
+                return;
+            };
+            if self.modified == Some(modified) {
+                return;
+            }
+            let Ok(text) = std::fs::read_to_string(&self.path) else {
+                return;
+            };
+            self.schedule = KeySchedule::new(&text, now);
+            self.modified = Some(modified);
+            tracing::info!(keys = self.schedule.keys.len(), "diagnostic key schedule loaded");
+        }
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

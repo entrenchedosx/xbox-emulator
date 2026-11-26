@@ -452,6 +452,10 @@ extern "system" fn close(this: This) -> HRESULT {
     if let Some(host) = host_list(this) {
         host.close();
     }
+    // Nothing more is recorded: the dynamic slots no root view took go back
+    // to the heap (`State::finish`).
+    #[cfg(windows)]
+    with_state(this, |_, state| state.finish());
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {

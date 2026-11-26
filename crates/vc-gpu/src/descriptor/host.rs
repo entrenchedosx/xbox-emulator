@@ -99,6 +99,11 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// Slots a capped heap keeps past the title's and the dynamic ones for the null
+/// buffer views (SRV, and UAV below it): the shaders' own slot lies past the
+/// heap (`vc_shader::emit::NULL_VIEW_WORD`).
+const NULL_SLOTS: u32 = 2;
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -154,14 +159,21 @@ impl HostHeap {
             (heap, count, DYNAMIC)
         } else {
             // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
+            // faults on an index past them, as before the clamp. The null
+            // buffer views take the heap's last two slots, and shaders find
+            // them through the view-stride table.
+            match make(count + MIN_DYNAMIC + NULL_SLOTS) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                Err(e) if count + MIN_DYNAMIC + NULL_SLOTS > PORTABLE_VIEWS => {
+                    let mirrored = PORTABLE_VIEWS - MIN_DYNAMIC - NULL_SLOTS;
+                    tracing::warn!(
+                        error = %e,
+                        requested = count,
+                        mirrored,
+                        unmirrored = count - mirrored,
+                        "host descriptor heap cannot mirror the full guest heap"
+                    );
+                    (make(PORTABLE_VIEWS).ok()?, mirrored, MIN_DYNAMIC)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -187,6 +199,21 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        // What shaders read instead of a slot without a buffer view where
+        // they take one at a computed index (`vc_shader::emit`, "Buffer
+        // views at computed heap indices"): a null raw SRV at this heap
+        // index, and a UAV below it. Where the shaders' own slot is in the
+        // heap past the title's and the dynamic ones, that; else the heap's last.
+        let null = vc_shader::emit::NULL_BUFFER_VIEW;
+        let null = if sampler {
+            None
+        } else if null > count + extra && null < total {
+            Some(null)
+        } else if total > count + extra + 1 {
+            Some(total - 1)
+        } else {
+            None
+        };
         let h = HostHeap {
             heap,
             cpu,
@@ -198,10 +225,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
-            pairs_end: match vc_shader::emit::NULL_BUFFER_VIEW {
-                null if !sampler && null > count + extra && null < total => null - 1,
-                _ => total,
-            },
+            pairs_end: null.map_or(total, |null| null - 1),
             strides,
             marks,
             addresses: std::sync::OnceLock::new(),
@@ -219,13 +243,10 @@ impl HostHeap {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
-        // What shaders read instead of a slot without a buffer view where
-        // they take one at a computed index (`vc_shader::emit`, "Buffer
-        // views at computed heap indices"): a null raw SRV, and UAV below it.
-        let null = vc_shader::emit::NULL_BUFFER_VIEW;
-        if !sampler && null > count + extra && null < total {
+        if let Some(null) = null {
             h.raw_view_at(null, None, 0, 0, false);
             h.raw_view_at(null - 1, None, 0, 0, true);
+            h.write_stride(vc_shader::emit::NULL_VIEW_WORD, null);
         } else if !sampler {
             tracing::warn!(count, total, "no room for the null buffer views: computed indices of slots without a buffer view read what is there");
         }
@@ -399,6 +420,12 @@ impl HostHeap {
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
             slots.fill(false);
         }
+    }
+
+    /// The dynamic slots taken now and the heap has (view heaps; diagnostics).
+    pub(crate) fn dynamic_use(&self) -> (u32, u32) {
+        let guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        (guard.1.iter().filter(|&&taken| taken).count() as u32, self.dynamic)
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -693,6 +720,7 @@ impl HostHeap {
     /// would, with one lock of each kind for them all instead of two per slot
     /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
     pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
+        let last = last.min(self.count);
         let at = |i: u32| start + u64::from(i) * step;
         // SAFETY: records in title heap memory the caller found mapped.
         let records: Vec<[u32; 3]> =
@@ -702,10 +730,9 @@ impl HostHeap {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             (first..last)
                 .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
-                    Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
-                    Some(&m) => m != 0,
-                    None => true,
+                .filter(|&(i, (&[_, view, generation], current))| {
+                    let key = if current { u64::from(generation) << 32 | u64::from(view) } else { 0 };
+                    made[i as usize] != key
                 })
                 .map(|(i, _)| i)
                 .collect()
@@ -721,16 +748,13 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
-                tracing::warn!(
-                    index,
-                    count = self.count,
-                    for_draw,
-                    "title slot past the host heap"
-                );
+            // Heap creation reports the capacity shortfall. Guest writes
+            // still update their own memory, which backs dynamic tables.
+            if for_draw {
+                static FIRST_UNMIRRORED_READ: std::sync::Once = std::sync::Once::new();
+                FIRST_UNMIRRORED_READ.call_once(|| {
+                    tracing::warn!(index, count = self.count, "draw needed a guest slot past the mirrored host heap");
+                });
             }
             return None;
         }
@@ -1251,12 +1275,63 @@ fn buffer_srv(
         return None;
     }
     let host = host()?;
+    raw_srv(&mut desc);
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+}
+
+/// A structured buffer view as the raw view of the same bytes. Translated
+/// shaders address a structured buffer's bytes themselves, the element times
+/// the stride (the view-stride table's, for a view they pick from the heap)
+/// plus the offset, through raw handles: a handle's declared kind has to be
+/// its descriptor's. A structured descriptor read through a raw handle
+/// addresses its elements by the wrong stride on some drivers (D3D12 leaves
+/// it undefined), and the stride of a view picked from the heap cannot be
+/// declared when the program is translated. Views that are not structured, or
+/// that cannot be raw, are left as they are: a stride that is no multiple of
+/// 4, a size past the 2^27 dwords a view holds, a start that is not
+/// `D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT` (16) aligned (NVIDIA removes the device
+/// for a raw view made there; the title places structured views, the 456-byte
+/// culling constants say, at any multiple of their stride).
+fn raw_srv(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    let stride = u64::from(buffer.StructureByteStride);
+    if stride == 0 || !stride.is_multiple_of(4) {
+        return;
+    }
+    let (first, dwords) = (buffer.FirstElement * stride / 4, u64::from(buffer.NumElements) * stride / 4);
+    if dwords > 1 << 27 || !first.is_multiple_of(4) {
+        return;
+    }
+    buffer.FirstElement = first;
+    buffer.NumElements = dwords as u32;
+    buffer.StructureByteStride = 0;
+    buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    desc.Format = DXGI_FORMAT_R32_TYPELESS;
+}
+
+/// [`raw_srv`] for an unordered access view.
+fn raw_uav(desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC) {
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    let stride = u64::from(buffer.StructureByteStride);
+    if stride == 0 || !stride.is_multiple_of(4) {
+        return;
+    }
+    let (first, dwords) = (buffer.FirstElement * stride / 4, u64::from(buffer.NumElements) * stride / 4);
+    if dwords > 1 << 27 || !first.is_multiple_of(4) {
+        return;
+    }
+    buffer.FirstElement = first;
+    buffer.NumElements = dwords as u32;
+    buffer.StructureByteStride = 0;
+    buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    desc.Format = DXGI_FORMAT_R32_TYPELESS;
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
@@ -1311,6 +1386,7 @@ fn buffer_uav(
         return None;
     }
     let host = host()?;
+    raw_uav(&mut desc);
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
@@ -2213,17 +2289,48 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+    /// Shaders find the null buffer views through the view-stride table:
+    /// its word names a slot of the heap that no title or dynamic slot is
+    /// (a heap capped below `HEAP_VIEWS` keeps its last two), and the null
+    /// SRV there and the UAV below it are raw.
+    #[test]
+    fn the_null_buffer_views_are_where_the_stride_table_says() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some((_, data)) = &heap.strides else {
+            return; // no table (no host upload buffer)
+        };
+        // SAFETY: the mapped table has a word for every slot below the larger
+        // of the title's count and `HEAP_VIEWS`.
+        let at = |i: u32| unsafe { (*data as *const u32).add(i as usize).read_volatile() };
+        let null = at(vc_shader::emit::NULL_VIEW_WORD);
+        // SAFETY: a plain query of a live heap.
+        let total = unsafe { heap.heap.GetDesc() }.NumDescriptors;
+        assert!(null < total, "the null SRV {null} is a slot of the heap ({total} slots)");
+        assert!(null - 1 >= heap.count + heap.dynamic, "the null UAV below it is no title or dynamic slot");
+        assert_eq!((at(null), at(null - 1)), (4, 4), "raw views: elements of 4 bytes");
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
+        // Test the layout the adapter actually accepted. The full view
+        // heap covers the shader range. The smaller heap reserves only
+        // the fallback dynamic range after its mirrored slots.
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= vc_shader::emit::HEAP_VIEWS);
+            let total = heap.heap.GetDesc().NumDescriptors;
+            if heap.dynamic == DYNAMIC {
+                assert!(total >= vc_shader::emit::HEAP_VIEWS);
+                assert!(total >= heap.count + DYNAMIC);
+            } else {
+                assert_eq!(heap.dynamic, MIN_DYNAMIC);
+                assert_eq!(total, heap.count + MIN_DYNAMIC + NULL_SLOTS);
+            }
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= vc_shader::emit::HEAP_SAMPLERS);
         }

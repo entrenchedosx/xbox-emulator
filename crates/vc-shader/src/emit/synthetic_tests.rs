@@ -68,7 +68,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
     build_wave(words, false)
 }
 
-fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderError> {
+pub(super) fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderError> {
     let wave = if wave64 { 64 } else { 32 };
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
@@ -126,7 +126,7 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
     })
 }
 
-fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
+pub(super) fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
@@ -214,7 +214,7 @@ fn gathers_at_a_level_match_the_hardware() {
         View::Mipped(24, 16, 4, &texels),
         View::Buffer {
             data: &input,
-            stride: Stride::Structured(16),
+            stride: Stride::Mirrored(16),
         },
         View::RawUav(32 * 12),
     ];
@@ -329,7 +329,7 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Buffer {
             data: &[0; 4],
-            stride: Stride::Structured(16),
+            stride: Stride::Mirrored(16),
         },
         View::RawUav(32),
     ];
@@ -392,7 +392,7 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Buffer {
             data: &[0; 4],
-            stride: Stride::Structured(16),
+            stride: Stride::Mirrored(16),
         },
         View::RawUav(wave),
     ];
@@ -561,7 +561,7 @@ fn a_mask_joined_with_data_at_a_uniform_loop_is_its_number() {
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Buffer {
             data: &[0; 4],
-            stride: Stride::Structured(16),
+            stride: Stride::Mirrored(16),
         },
         View::RawUav(64),
     ];
@@ -632,7 +632,7 @@ fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Buffer {
             data: &[0; 4],
-            stride: Stride::Structured(16),
+            stride: Stride::Mirrored(16),
         },
         View::RawUav(32),
     ];
@@ -739,7 +739,7 @@ fn relative_moves_in_waterfall_loops_reach_each_lane_s_element() {
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Buffer {
             data: &[0; 4],
-            stride: Stride::Structured(16),
+            stride: Stride::Mirrored(16),
         },
         View::RawUav(12 * 32),
     ];

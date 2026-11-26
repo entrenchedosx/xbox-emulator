@@ -37,6 +37,14 @@ pub const HEAP_SAMPLERS: u32 = 2048;
 /// holds no buffer view where a shader reads one at an index it computes
 /// (`emit`, "Buffer views at computed heap indices").
 pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+/// The view-stride table's word that holds the heap index of the null raw
+/// buffer SRV on this host (the null UAV is the index below). It is
+/// [`NULL_BUFFER_VIEW`] where the host heap has room for it, else the heap's
+/// last slot: a host that caps its heap below [`HEAP_VIEWS`] (NVIDIA, 10^6
+/// slots) has no slot at [`NULL_BUFFER_VIEW`], and a shader reading it faults
+/// the device. No slot of the title or the host's dynamic ones is this word's
+/// index, and the null slots' own words are 4 (raw).
+pub const NULL_VIEW_WORD: u32 = HEAP_VIEWS - 4;
 /// The view-mark table's register: `t2` (a raw root SRV) in
 /// [`MEMORY_SPACE`] (`emit`, "Write marks").
 pub const VIEW_MARKS: u32 = 2;
@@ -147,6 +155,7 @@ pub(crate) struct Shader {
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
+    xchg: Option<V>,
     main: V,
     pub entry: usize,
 }
@@ -209,6 +218,7 @@ impl Shader {
             wave_size: None,
             lds_dwords: 0,
             lds: None,
+            xchg: None,
             main,
             entry,
         }
@@ -223,6 +233,19 @@ impl Shader {
         let arr = self.m.array(self.lds_dwords, self.t.i32);
         let g = self.m.global("lds", arr, 3);
         self.lds = Some(g);
+        g
+    }
+
+    /// Group-shared memory the host waves of one console wave exchange
+    /// lane values through (`dwords` of it, made at first use), apart from
+    /// the program's own.
+    pub fn xchg(&mut self, dwords: u32) -> V {
+        if let Some(g) = self.xchg {
+            return g;
+        }
+        let arr = self.m.array(dwords, self.t.i32);
+        let g = self.m.global("xchg", arr, 3);
+        self.xchg = Some(g);
         g
     }
 

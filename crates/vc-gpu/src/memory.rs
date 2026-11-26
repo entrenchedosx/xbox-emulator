@@ -957,8 +957,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     /// Two lists of a submission read title memory through one page table;
     /// the copies' views stay where they are for later lists and
-    /// submissions, also when another copy comes; none takes a per-draw
-    /// dynamic slot.
+    /// submissions, also when another copy comes. Their slots stay disjoint
+    /// from allocations for individual draws.
     #[test]
     fn lists_share_a_table_and_copies_keep_their_views() {
         let _guard = gpu_test_lock();
@@ -1027,7 +1027,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&lists[0], &lists[1]]);
         assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
-        assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
+        assert!(pairs.0.abs_diff(pairs.1) >= 2, "the copy views are disjoint");
+        let dynamic = views.dynamic(2).expect("free draw descriptors");
+        assert!(dynamic.abs_diff(pairs.0) >= 2 && dynamic.abs_diff(pairs.1) >= 2);
+        views.release(dynamic, 2);
         // A second submission, after a third copy came.
         let c = copy(memory[2], 1);
         for list in &lists {

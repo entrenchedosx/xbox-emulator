@@ -2,7 +2,14 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it. A wave of 64 runs
+//! as host waves of 32 where that is exact (`lower::split`, added
+//! 2026-11-26): lane exchanges inside a 32-lane half stay `ds_swizzle`,
+//! `ds_bpermute` and DPP; a `v_readlane_b32` of a constant lane and the
+//! console's LDS order between the halves go through group-shared memory
+//! and group barriers, where every thread of the group arrives. Such a
+//! program declares `WaveSize(32)` (none when it reads no lane); the rest
+//! keep the declaration of 64.
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -93,9 +100,10 @@
 //!   heap itself first looks up the view-stride table (root SRV
 //!   `t`[`VIEW_STRIDES`], which then covers every index below
 //!   [`HEAP_VIEWS`], dynamic slots too); where it holds 0 (no buffer view
-//!   there) the shader reads heap index [`NULL_BUFFER_VIEW`] instead (for
-//!   unordered access the index below), which the host keeps a null raw
-//!   buffer SRV (UAV). The index comes from data, and a texture descriptor
+//!   there) the shader reads the host's null raw buffer SRV instead (for
+//!   unordered access the UAV below it), whose heap index is the table's
+//!   word [`NULL_VIEW_WORD`]: [`NULL_BUFFER_VIEW`] where the host heap has
+//!   that slot, else its last (a heap capped below [`HEAP_VIEWS`] has none). The index comes from data, and a texture descriptor
 //!   read as a buffer one is a wild address (the texture's shifted 8 bits
 //!   down: GPU faults at low addresses).
 //! * **Heap access** ([`HostShader::heap`], [`HostShader::heap_writes`],
@@ -210,6 +218,7 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+pub use lower::{split_stops, take_split_stop, trust_private_lds};
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
@@ -220,6 +229,8 @@ mod semantics_tests;
 mod shader;
 #[cfg(all(test, windows))]
 mod stride_tests;
+#[cfg(all(test, windows))]
+mod split_tests;
 #[cfg(all(test, windows))]
 mod synthetic_tests;
 #[cfg(windows)]
@@ -236,7 +247,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
+    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, NULL_VIEW_WORD, ROOT_CBV_SPACE, SAMPLER_SPACE,
     USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS,
     VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
 };
