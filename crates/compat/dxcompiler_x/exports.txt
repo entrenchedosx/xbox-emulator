@@ -1,2 +1,0 @@
-1 DxcCreateInstance forwarded | official DXC 1.9.2609 (Microsoft-signed dxcompiler.dll + dxil.dll): next to dxcompiler_x, TOMBOX_DXC_DIR, or emulator third_party/dxc; compiles SM 6.0 HLSL to signed DXIL
-2 DxcCreateInstance2 forwarded | as DxcCreateInstance

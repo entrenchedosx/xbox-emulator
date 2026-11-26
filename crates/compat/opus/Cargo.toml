@@ -1,9 +1,0 @@
-[package]
-name = "opusdec"
-version = "0.1.0"
-edition = "2021"
-license = "BSD-3-Clause"
-description = "Opus decoder, a Rust port of the libopus float decoder (CELT, SILK, hybrid)"
-
-[lib]
-path = "src/lib.rs"

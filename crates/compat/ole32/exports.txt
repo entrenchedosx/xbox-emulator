@@ -1,2 +1,0 @@
-1 CoRegisterDeviceCatalog forwarded | PE forwarder to combase.CoRegisterDeviceCatalog; console forwards to api-ms-win-core-com-l1-1-3, which resolves to combase on console and PC (console 22000 body 148 bytes, same as PC combase)
-2 CoRevokeDeviceCatalog forwarded | PE forwarder to combase.CoRevokeDeviceCatalog; console forwards to api-ms-win-core-com-l1-1-3, which resolves to combase on console and PC (console body 32 bytes, same as PC combase)

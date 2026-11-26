@@ -1,5 +1,0 @@
-pub const PAGE_BYTES: usize = 0x1_0000;
-pub const FIRST_TITLE_PAGE: u64 = 0x1000;
-pub const FRAMES_PER_PAGE: u64 = (PAGE_BYTES / 4096) as u64;
-pub const FIRST_TITLE_FRAME: u64 = FIRST_TITLE_PAGE * FRAMES_PER_PAGE;
-pub const TITLE_LAYOUT_19041: [u64; 2] = [FIRST_TITLE_FRAME; 2];

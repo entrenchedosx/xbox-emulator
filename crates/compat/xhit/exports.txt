@@ -1,4 +1,0 @@
-1 XhitInitialize implemented | Xbox One build of XHIT; the export code is byte-identical to xhit_s.dll at the same RVAs, shares the xhit_s implementation: \.\XgsKmd region map and arm IOCTL, returns 0
-2 XhitPerformHangAnalysis implemented | shared with xhit_s: t:\gpuhang-<SYSTEMTIME>.xhit with the Xhit header; E_FAIL without a KMD hang snapshot
-3 XhitPerformHangSummary implemented | shared with xhit_s: KMD mailbox round trip (cmd 0xe ctx, cmd 0xd SQ capture), fence-deadlock report, register-snapshot decode, returns 0; E_UNEXPECTED (host deviation) when no KMD regions are installed
-4 XhitTerminate implemented | shared with xhit_s: clears the active object, returns 0

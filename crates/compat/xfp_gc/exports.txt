@@ -1,8 +1,0 @@
-1 XfpCheckAvailability implemented | console 0x1c00: E_ACCESSDENIED after a refused handshake, S_OK when connected, else opens and closes the XFP pipe and returns HRESULT_FROM_WIN32 of the open failure
-2 XfpCleanup implemented | console 0x1ca0: signals the reader thread to stop and closes its handle, or closes the stop event and pipe when no thread runs
-3 XfpGetKeyState implemented | console 0x1d50: copies the last key state the reader thread received (message 3)
-4 XfpGetLEDState implemented | console 0x1d90: sends message 5, waits 10 s for the reader thread's LED reply, 0x80070102 on timeout, 0xd00000a3 when not connected
-5 XfpSetDisplayBuffer implemented | console 0x2260: message 7 with 0x2000 bytes of 4bpp pixels; format 8 packs 8bpp to 4bpp as the console does, other formats E_INVALIDARG, null E_POINTER
-6 XfpSetDisplayMode implemented | console 0x23c0: message 9, modes >= 12 return 0xd000000d
-7 XfpSetLEDState implemented | console 0x24b0: message 6 with the 16-bit LED state
-8 XfpTryConnect implemented | console 0x2580/0x1f04: opens the pipe in message mode, sends the GameCore handshake, checks the 0x12-byte reply, starts the reader thread; 0x8b08001a/1b/1c and E_ACCESSDENIED as on the console

@@ -1,7 +1,0 @@
-1 DabInitialize forwarded | dab_sys.DabInitialize; console 19041 0x7d00 and PC both build the broker SIDs, start the RPC endpoint and register the broker
-2 DabPowerStateChanged forwarded | dab_sys.DabNotifyPowerEvent; console 19041 0x10350 -> 0x104a4 is the same body as PC DabNotifyPowerEvent -> 0x1668: one DWORD power event, 4-byte work item, threadpool callback (WNF publish, NtSetThreadExecutionState); renamed DabNotifyPowerEvent from 10.0.22000
-3 DabSessionStateChanged forwarded | dab_sys.DabNotifySessionChange; console 19041 0x7390 is instruction-for-instruction the 22000 DabNotifySessionChange (0x6f70): (event, sessionId, data), events 5/6 take *data, others enumerate sessions
-4 DabTerminate forwarded | dab_sys.DabTerminate
-5 DabNotifyPowerEvent forwarded | dab_sys.DabNotifyPowerEvent (console 10.0.22000+ name)
-6 DabNotifySessionChange forwarded | dab_sys.DabNotifySessionChange (console 10.0.22000+ name)
-7 DabNotifyTimeChange forwarded | dab_sys.DabNotifyTimeChange (console 10.0.22000+)

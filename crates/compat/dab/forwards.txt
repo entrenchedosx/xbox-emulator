@@ -1,7 +1,0 @@
-DabInitialize dab_sys.DabInitialize
-DabPowerStateChanged dab_sys.DabNotifyPowerEvent
-DabSessionStateChanged dab_sys.DabNotifySessionChange
-DabTerminate dab_sys.DabTerminate
-DabNotifyPowerEvent dab_sys.DabNotifyPowerEvent
-DabNotifySessionChange dab_sys.DabNotifySessionChange
-DabNotifyTimeChange dab_sys.DabNotifyTimeChange

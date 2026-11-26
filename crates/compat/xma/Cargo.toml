@@ -1,9 +1,0 @@
-[package]
-name = "xma"
-version = "0.1.0"
-edition = "2021"
-license = "LGPL-2.1-or-later"
-description = "XMA2 and WMA Pro decoder, a Rust port of FFmpeg libavcodec/wmaprodec.c"
-
-[lib]
-path = "src/lib.rs"

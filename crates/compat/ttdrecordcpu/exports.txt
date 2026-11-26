@@ -1,2 +1,0 @@
-1 GetRegisterOffsets implemented | architecture 2 (x64) returns the console's 116-entry USHORT register offset table (byte-identical in 1.9.138 and 1.10.41), any other architecture returns NULL
-2 RegisterInstrumentationCallbacks implemented | stores the 10 callback slots; NULL slots get the console defaults (an empty return stub, slot 2 a stub returning a zeroed 16-byte struct)

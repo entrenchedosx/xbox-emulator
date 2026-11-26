@@ -1,0 +1,24 @@
+# Copy to `vc.toml` (git-ignored) and point it at YOUR files.
+# Every path must be OUTSIDE the repository; the tools refuse otherwise.
+# Environment variables (shown below) take precedence over this file.
+# VC_CONFIG selects a different config file.
+
+[paths]
+# Your own dump of Grand Theft Auto VI.     env: VC_GAME_DIR
+game_dir = 'D:\vc-data\game'
+
+# Derived data. Default: %LOCALAPPDATA%\vc\cache.   env: VC_CACHE_DIR
+# cache_dir = 'D:\vc-data\cache'
+
+# What titles save (persistent local storage), kept apart from the cache.
+# Default: %LOCALAPPDATA%\vc\data.   env: VC_DATA_DIR
+# data_dir = 'D:\vc-data\data'
+
+# AMD FidelityFX for PC: the folder with amd_fidelityfx_upscaler_dx12.dll
+# (FidelityFX SDK, Kits/FidelityFX/signedbin). It upscales in place of a
+# title's console build. Unset: the title's own.   env: VC_FIDELITYFX_DIR
+# fidelityfx_dir = 'D:\vc-data\fidelityfx'
+
+# Other Xbox Series titles used to test platform-level code.
+# env: VC_TEST_TITLES (separated by ';')
+test_titles = []

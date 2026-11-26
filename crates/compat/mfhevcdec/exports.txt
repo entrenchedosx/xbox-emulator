@@ -1,5 +1,0 @@
-1 DllGetActivationFactory implemented
-2 DllRegisterServer implemented | console body is mov eax, 0x80004005; ret (E_FAIL) in all four dumps (Fortnite 0x1df0, Terraria/XDefiant 0x2020, Trackmania 0x1fb0): the console registers nothing; console body reproduced exactly; oracle test tests/console_fixed.rs
-3 DllUnregisterServer implemented
-4 DllCanUnloadNow implemented
-5 DllGetClassObject implemented

@@ -1,4 +1,0 @@
-1 CreateXdxrCompiler2
-2 CreateXdxrCompiler
-3 DxcCreateInstance
-4 DxcCreateInstance2

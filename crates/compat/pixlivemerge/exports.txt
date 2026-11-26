@@ -1,7 +1,0 @@
-1 CreateLiveMerger implemented | WRL LiveMergerImpl {6f141e8f}: caller-fed EVENT_RECORDs; ImageLoad v2/v3 -> ImageId+DbgID_RSDS via VBI / loaded-module (GetModuleHandleExW+base/size check) / file PE debug dir with \SystemRoot\, \Device\, \GLOBAL??\ path forms; first FileIo -> volume map (ntpath.rs); callback ref consumed
-2 FindPdbInfo implemented | case-insensitive suffix match over an MSVC vector of 0x58-byte records; -1 when absent
-3 GetVbiRecordsSearched implemented | returns the VBI-loaded flag
-4 ParsePdbInfo implemented | name@{GUID}?age pdb entries, MSVC std::wstring/std::string(0x30C) records, sorted by name length; E_FAIL on a malformed entry
-5 PdbInfoFromVBI implemented | first call loads the first *_vbi value under HKLM\System\Software\Microsoft; HRESULT of the registry error, or 0x80070490 when no record matches
-6 ResetVbiRecordsSearched implemented | clears the VBI-loaded flag, records kept as on console
-7 SetImageFileNameCacheUsage implemented | stores the image file name cache flag (default on); gates the live merger's per-name image cache lookup

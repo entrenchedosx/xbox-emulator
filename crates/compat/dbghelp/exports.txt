@@ -1,3 +1,0 @@
-1 symsrv implemented | !symsrv extension: "close" calls SymbolServerClose of the loaded symsrv.dll and prints "symbol server client has been closed", anything else prints the usage line, both through the WinDbg output routine
-2 WinDbgExtensionDllInit implemented | copies the 0x60-byte WINDBG_EXTENSION_APIS64 block, as console dbghelp does
-3 ExtensionApiVersion implemented | returns the console EXT_API_VERSION {10, 0, 6, 0}

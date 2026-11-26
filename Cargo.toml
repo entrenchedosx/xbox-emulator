@@ -1,139 +1,67 @@
-# TomBox — Xbox Series X|S compatibility runtime (research project)
-# Workspace root.
 [workspace]
-resolver = "2"
-members = [
-    "crates/tombox-pe",
-    "crates/tombox-cli",
-    "crates/tombox-archive",
-    "crates/tombox-rpf",
-    "crates/tombox-disasm",
-    "crates/tombox-probe",
-    "crates/tombox-xshader",
-    "crates/compat/compat-common",
-    "crates/compat/xmem",
-    "crates/compat/d3d12_xs",
-    "crates/compat/xg_xs",
-    "crates/compat/xcrdapi",
-    "crates/compat/dxcompiler_xs",
-    "crates/compat/acphal",
-    "crates/compat/chad",
-    "crates/compat/xapu",
-    "crates/compat/xma",
-    "crates/compat/opus",
-    "crates/compat/mfplat",
-    "crates/compat/mflnmhelp",
-    "crates/compat/xfp_gc",
-    "crates/compat/mfh264dec",
-    "crates/compat/mfhevcdec",
-    "crates/compat/mfh264enc",
-    "crates/compat/xbthunk",
-    "crates/compat/gcxaudioext",
-    "crates/compat/xvmaudioservice",
-    "crates/compat/xcurl",
-    "crates/compat/xone-exports",
-    "crates/compat/d3d12_x",
-    "crates/compat/xg_x",
-    "crates/compat/dxcompiler_x",
-    "crates/compat/xfrontpaneldisplay",
-    "crates/compat/gamingtelemetry",
-    "crates/compat/werxboxgc",
-    "crates/compat/minappmodelx",
-    "crates/compat/minuserx",
-    "crates/compat/audiohalwrapper",
-    "crates/compat/xaudio2_9",
-    "crates/compat/xgs12_umd",
-    "crates/compat/xgs12",
-    "crates/compat/xgs12_d",
-    "crates/compat/xgs12_i",
-    "crates/compat/xgs12_10",
-    "crates/compat/xgs12_10d",
-    "crates/compat/xgs12_10i",
-    "crates/compat/scdxil",
-    "crates/compat/xbtp",
-    "crates/compat/pixevt",
-    "crates/compat/xhit_s",
-    "crates/compat/xhit",
-    "crates/compat/xbsc_xs",
-    "crates/compat/hix_xs",
-    "crates/compat/console-image",
-    "crates/compat/newbe",
-    "crates/compat/newbe_xs",
-    "crates/compat/kerneltracecontrol",
-    "crates/compat/ttdrecordcpu",
-    "crates/compat/dbghelp",
-    "crates/compat/symsrv",
-    "crates/compat/xtfpix",
-    "crates/compat/xtfcommon",
-    "crates/compat/xtfbaseservices",
-    "crates/compat/xtfeventserver",
-    "crates/compat/xtfdiaginfo",
-    "crates/compat/xtfmsg",
-    "crates/compat/xtfdebugmonitor",
-    "crates/compat/xtffileio",
-    "crates/compat/xtfconsolecontrol",
-    "crates/compat/xtfremoterun",
-    "crates/compat/pixlivemerge",
-    "crates/compat/advapi32legacy",
-    "crates/compat/advapi32",
-    "crates/compat/kernel32",
-    "crates/compat/ntdll",
-    "crates/compat/kernelbase",
-    "crates/compat/shcore",
-    "crates/compat/msave64xgs",
-    "crates/compat/ole32",
-    "crates/compat/kernel32legacy",
-    "crates/compat/kernel32legacy_19041",
-    "crates/compat/pixrt",
-    "crates/compat/pixrt10",
-    "crates/compat/opus_native/opus_dll",
-    "crates/compat/opus_native/skp_silk",
-    "crates/compat/remotewinrt",
-    "crates/compat/ndr-proxy",
-    "crates/compat/gamecorecomproxy",
-    "crates/compat/connectedstorageservice_proxystub",
-    "crates/compat/gamecoreclient",
-    "crates/compat/dab",
-    "crates/compat/bootshsvc",
-    "crates/compat/coniosrv",
-    "crates/compat/netprofmsvc_c",
-    "crates/compat/timebrokerserver",
-    "crates/compat/console-sandbox",
-    "crates/compat/lsasrv",
-    "crates/compat/gamehost",
-    "crates/compat/secur32",
-    "crates/compat/fwpuclnt",
-    "crates/compat/sechost",
-    "crates/compat/wldp",
-    "crates/compat/wdbase",
-    "crates/compat/sc_dll",
-    "crates/compat/console-dll",
-    "crates/compat/dxbc2dxil_xs",
-    "crates/compat/xdxr",
-    "crates/compat/xdxr_d",
-    "crates/compat/xdxr_i",
-    "crates/compat/xpal",
-    "crates/tools/xhost",
-    "crates/tools/xreplay",
-    "crates/tools/audio-replay",
-    "crates/tools/compat_smoke",
-    "crates/tests/audio_titles",
-]
+resolver = "3"
+members = ["crates/*", "apps/*", "xtask"]
+# Fixtures are standalone crates built on demand by integration tests.
+exclude = ["tests/fixtures"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+authors = ["entrenchedosx"]
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+vc-core = { path = "crates/vc-core" }
+vc-pe = { path = "crates/vc-pe" }
+vc-loader = { path = "crates/vc-loader" }
+vc-hle = { path = "crates/vc-hle" }
+vc-gpu = { path = "crates/vc-gpu" }
+vc-shader = { path = "crates/vc-shader" }
+vc-formats = { path = "crates/vc-formats" }
+vc-pipeline = { path = "crates/vc-pipeline" }
+vc-game = { path = "crates/vc-game" }
+
+# External crates
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+clap = { version = "4.6.9", features = ["derive"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.2"
+object = { version = "0.41.0", default-features = false, features = ["read_core", "pe", "coff", "archive", "std"] }
+windows-sys = "0.61.2"
+windows = "0.62.2"
+windows-core = "0.62.2"
+blake3 = "1.8.7"
+memchr = "2.8.3"
+miniz_oxide = "0.9.1"
+walkdir = "2.5.1"
+tempfile = "3.27.0"
+# Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).
+opus-pure = "0.2.4"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+
+[profile.dev.package."*"]
+# Dependencies (hashing, parsing) are hot paths when chewing through
+# gigabytes of game data; keep them fast even in debug builds.
+opt-level = 2
 
 [profile.release]
-opt-level = 3
-debug = true
-overflow-checks = true   # keep integer-overflow checks even in release for parser safety
-
-[profile.dev-fast]
-inherits = "release"
-opt-level = 3
 debug = "line-tables-only"
-incremental = true
-codegen-units = 256
-lto = false
 
-[profile.dev-fast.build-override]
-opt-level = 0
-debug = false
-codegen-units = 256
+# The development build: release code generation plus the `diagnostics`
+# feature (`cargo build --profile diag -p vc --features diagnostics`),
+# kept in its own folder so it does not evict the plain release build.
+[profile.diag]
+inherits = "release"

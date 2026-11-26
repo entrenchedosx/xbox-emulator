@@ -1,5 +1,0 @@
-3 GetProxyDllInfo implemented | console 0x1220: *ppProxyFileList = the 2 MIDL proxy files (19 interfaces), *ppClsid = CLSID {B2D2142A-9055-4C37-B3FA-EEFDD4C1DC59}; tables are the console 10.0.19041 .rdata/.data relocated at load (1076 fixups), imports bound to the PC rpcrt4 / midlproxystub / winrt-string exports, MIDL IID lookups ported
-4 DllCanUnloadNow implemented | console 0x1270: NdrDllCanUnloadNow on the module's CStdPSFactoryBuffer
-5 DllGetClassObject implemented | console 0x1240: NdrDllGetClassObject with the console proxy file list, CLSID and factory buffer; other CLSIDs give CLASS_E_CLASSNOTAVAILABLE as on console
-6 DllRegisterServer implemented | console 0x12b0: NdrDllRegisterProxy(module, proxy file list, CLSID)
-7 DllUnregisterServer implemented | console 0x12d0: NdrDllUnregisterProxy(module, proxy file list, CLSID)
